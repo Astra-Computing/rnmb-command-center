@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#111827">
+    <title>RNMB Command Center</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="RNMB navigation">
+        <div class="brand-block">
+          <div class="brand-mark" aria-hidden="true">R</div>
+          <div>
+            <h1>RNMB Command Center</h1>
+            <p>Responsible beverage logistics</p>
+          </div>
+        </div>
+
+        <nav class="nav-tabs" aria-label="Dashboard sections">
+          <button class="tab-button is-active" type="button" data-tab="overview">Overview</button>
+          <button class="tab-button" type="button" data-tab="tonight">Tonight</button>
+          <button class="tab-button" type="button" data-tab="inventory">Inventory</button>
+          <button class="tab-button" type="button" data-tab="ledger">Ledger</button>
+          <button class="tab-button" type="button" data-tab="crew">Crew</button>
+        </nav>
+
+        <div class="sidebar-panel">
+          <span class="eyebrow">Active Night</span>
+          <strong id="activeNightName">No active night</strong>
+          <p id="activeNightMeta">Create a night log to start tracking pours.</p>
+        </div>
+
+        <div class="sidebar-panel compact">
+          <span class="eyebrow">Mode</span>
+          <label class="toggle-row">
+            <input id="responsibleMode" type="checkbox" checked>
+            <span>Hydration reminders</span>
+          </label>
+        </div>
+
+        <div class="sidebar-panel compact">
+          <span class="eyebrow">Data Source</span>
+          <strong id="syncStatus">Checking...</strong>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Field Ops</p>
+            <h2 id="pageTitle">Overview</h2>
+          </div>
+          <div class="topbar-actions">
+            <button class="icon-button" id="exportData" type="button" title="Export data" aria-label="Export data">⇩</button>
+            <label class="icon-button file-button" title="Import data" aria-label="Import data">
+              ⇧
+              <input id="importData" type="file" accept="application/json">
+            </label>
+          </div>
+        </header>
+
+        <section class="tab-panel is-active" id="overview" aria-labelledby="overview-title">
+          <div class="metric-grid">
+            <article class="metric-card">
+              <span class="metric-label">Total Spend</span>
+              <strong id="metricSpend">$0</strong>
+              <small id="metricSpendMeta">No purchases logged.</small>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">Tonight Consumed</span>
+              <strong id="metricConsumed">0.0</strong>
+              <small>standard drinks across the crew</small>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">Inventory</span>
+              <strong id="metricInventory">0</strong>
+              <small id="metricInventoryMeta">bottles ready for duty</small>
+            </article>
+            <article class="metric-card alert-card">
+              <span class="metric-label">Responsible Check</span>
+              <strong id="metricCheck">Green</strong>
+              <small id="metricCheckMeta">No active alerts.</small>
+            </article>
+          </div>
+
+          <div class="dashboard-grid">
+            <section class="panel wide">
+              <div class="panel-heading">
+                <div>
+                  <span class="eyebrow">Spending</span>
+            <h3 id="overview-title">Contribution Board</h3>
+                </div>
+              </div>
+              <div id="spendBars" class="bar-list empty-state">No receipts have entered evidence.</div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-heading">
+                <div>
+                  <span class="eyebrow">Stock</span>
+                  <h3>Low Supply Watch</h3>
+                </div>
+              </div>
+              <div id="lowSupplyList" class="stack-list empty-state">Inventory is quiet.</div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-heading">
+                <div>
+                  <span class="eyebrow">Nights</span>
+                  <h3>Recent Logs</h3>
+                </div>
+              </div>
+              <div id="recentNights" class="stack-list empty-state">No missions logged yet.</div>
+            </section>
+          </div>
+        </section>
+
+        <section class="tab-panel" id="tonight" aria-labelledby="tonight-title">
+          <div class="split-layout">
+            <section class="panel">
+              <div class="panel-heading">
+                <div>
+                  <span class="eyebrow">Night Log</span>
+                  <h3 id="tonight-title">Create or Select</h3>
+                </div>
+              </div>
+              <form id="nightForm" class="form-grid">
+                <label>
+                  Night name
+                  <input name="name" required placeholder="Friday Recon">
+                </label>
+                <label>
+                  Date
+                  <input name="date" type="date" required>
+                </label>
+                <button type="submit">Start Night</button>
+              </form>
+              <div class="field-block">
+                <label for="nightSelect">Active night</label>
+                <select id="nightSelect"></select>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-heading">
+                <div>
+                  <span class="eyebrow">Pour Entry</span>
+                  <h3>Log Consumption</h3>
+                </div>
+              </div>
+              <form id="pourForm" class="form-grid">
+                <label>
+                  Person
+                  <select name="personId" required></select>
+                </label>
+                <label>
+                  Bottle
+                  <select name="bottleId" required></select>
+                </label>
+                <label>
+                  Ounces consumed
+                  <input name="ounces" type="number" min="0.1" step="0.1" value="1.5" required>
+                </label>
+                <button type="submit">Log Pour</button>
+              </form>
+            </section>
+          </div>
+
+          <section class="panel">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">Crew Status</span>
+                <h3>Tonight by Person</h3>
+              </div>
+            </div>
+            <div id="personConsumption" class="person-grid empty-state">No pours logged for the active night.</div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">Timeline</span>
+                <h3>Recent Pour Logs</h3>
+              </div>
+            </div>
+            <div id="pourTimeline" class="timeline empty-state">The logbook is still clean.</div>
+          </section>
+        </section>
+
+        <section class="tab-panel" id="inventory" aria-labelledby="inventory-title">
+          <div class="split-layout inventory-layout">
+            <section class="panel">
+              <div class="panel-heading">
+                <div>
+                  <span class="eyebrow">Beverage Type</span>
+                  <h3 id="inventory-title">Add Type</h3>
+                </div>
+              </div>
+              <form id="typeForm" class="form-grid">
+                <label>
+                  Name
+                  <input name="name" required placeholder="Bourbon">
+                </label>
+                <label>
+                  Category
+                  <select name="category" required>
+                    <option>Beer</option>
+                    <option>Wine</option>
+                    <option>Whiskey</option>
+                    <option>Vodka</option>
+                    <option>Rum</option>
+                    <option>Gin</option>
+                    <option>Tequila</option>
+                    <option>Liqueur</option>
+                    <option>Other</option>
+                  </select>
+                </label>
+                <label>
+                  ABV %
+                  <input name="abv" type="number" min="0.1" max="95" step="0.1" value="40" required>
+                </label>
+                <button type="submit">Add Type</button>
+              </form>
+            </section>
+
+            <section class="panel">
+              <div class="panel-heading">
+                <div>
+                  <span class="eyebrow">Bottle Purchase</span>
+                  <h3>Add Stock</h3>
+                </div>
+              </div>
+              <form id="bottleForm" class="form-grid">
+                <label>
+                  Type
+                  <select name="typeId" required></select>
+                </label>
+                <label>
+                  Nickname
+                  <input name="nickname" placeholder="The Council Bottle">
+                </label>
+                <label>
+                  Size oz
+                  <input name="sizeOz" type="number" min="1" step="0.1" value="25.36" required>
+                </label>
+                <label>
+                  Price
+                  <input name="price" type="number" min="0" step="0.01" value="0" required>
+                </label>
+                <label>
+                  Paid by
+                  <select name="buyerId" required></select>
+                </label>
+                <label>
+                  Purchase date
+                  <input name="date" type="date" required>
+                </label>
+                <button type="submit">Add Bottle</button>
+              </form>
+            </section>
+          </div>
+
+          <section class="panel">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">Current Stock</span>
+                <h3>Inventory Manifest</h3>
+              </div>
+            </div>
+            <div id="inventoryList" class="inventory-grid empty-state">No bottles logged yet.</div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">Library</span>
+                <h3>Beverage Types</h3>
+              </div>
+            </div>
+            <div id="typeList" class="chip-list empty-state">Add beverage types to build the menu.</div>
+          </section>
+        </section>
+
+        <section class="tab-panel" id="ledger" aria-labelledby="ledger-title">
+          <div class="dashboard-grid">
+            <section class="panel wide">
+              <div class="panel-heading">
+                <div>
+                  <span class="eyebrow">Receipts</span>
+                  <h3 id="ledger-title">Purchase Ledger</h3>
+                </div>
+              </div>
+              <div id="ledgerList" class="ledger-list empty-state">No purchases logged yet.</div>
+            </section>
+            <section class="panel">
+              <div class="panel-heading">
+                <div>
+                  <span class="eyebrow">Settle Up</span>
+                  <h3>Equal Share</h3>
+                </div>
+              </div>
+              <div id="settleList" class="stack-list empty-state">Need people and receipts first.</div>
+            </section>
+          </div>
+        </section>
+
+        <section class="tab-panel" id="crew" aria-labelledby="crew-title">
+          <div class="split-layout">
+            <section class="panel">
+              <div class="panel-heading">
+                <div>
+                  <span class="eyebrow">Crew Member</span>
+                  <h3 id="crew-title">Add Person</h3>
+                </div>
+              </div>
+              <form id="personForm" class="form-grid">
+                <label>
+                  Name
+                  <input name="name" required placeholder="New recruit">
+                </label>
+                <label>
+                  Color
+                  <input name="color" type="color" value="#ef4444" required>
+                </label>
+                <button type="submit">Add Person</button>
+              </form>
+            </section>
+
+            <section class="panel">
+              <div class="panel-heading">
+                <div>
+                  <span class="eyebrow">Data</span>
+                  <h3>Command Archive</h3>
+                </div>
+              </div>
+              <div class="archive-actions">
+                <button id="seedData" type="button">Reload Demo Data</button>
+                <button id="clearData" class="danger" type="button">Clear Dashboard</button>
+              </div>
+            </section>
+          </div>
+
+          <section class="panel">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">Roster</span>
+                <h3>RNMB Crew</h3>
+              </div>
+            </div>
+            <div id="personList" class="person-list empty-state">No people added yet.</div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="app.js"></script>
+  </body>
+</html>
