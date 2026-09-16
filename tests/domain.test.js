@@ -251,7 +251,7 @@ test("AE5: availability is false when combined remaining of any ingredient type 
 test("availability is false for an item with no ingredients or an ingredient type with no stock", () => {
   assert.equal(D.menuItemAvailability({ kind: "cocktail", ingredients: [] }, ae1Bottles()).available, false);
   assert.equal(
-    D.menuItemAvailability({ kind: "pour", ingredients: [{ typeId: "t-lager", amount: 1 }] }, ae1Bottles()).available,
+    D.menuItemAvailability({ kind: "straight", ingredients: [{ typeId: "t-lager", amount: 1 }] }, ae1Bottles()).available,
     false
   );
 });
@@ -384,8 +384,8 @@ test("a counted item consumes exactly 1 unit and its standard drinks come from u
   assert.equal(after[0].remaining, 11);
 });
 
-test("a pour item uses only its first ingredient", () => {
-  const item = { kind: "pour", ingredients: [{ typeId: "t-tequila", amount: 1.5 }, { typeId: "t-lime", amount: 1 }] };
+test("a straight pour item uses only its first ingredient", () => {
+  const item = { kind: "straight", ingredients: [{ typeId: "t-tequila", amount: 1.5 }, { typeId: "t-lime", amount: 1 }] };
   assert.deepEqual(D.menuItemIngredients(item), [{ typeId: "t-tequila", amount: 1.5 }]);
   assert.deepEqual(D.menuItemIngredients(margarita), margarita.ingredients);
   assert.deepEqual(D.menuItemIngredients(null), []);

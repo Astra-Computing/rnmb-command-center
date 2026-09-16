@@ -16,7 +16,7 @@
  *   type    { id, name, category, abv, measure: "oz"|"unit", unitOz: number|null }
  *   bottle  { id, typeId, nickname, size, remaining, price (dollars), buyerId, date "YYYY-MM-DD" }
  *   person  { id, name }
- *   menu    { id, name, kind: "cocktail"|"pour"|"counted", ingredients: [{ typeId, amount }] }
+ *   menu    { id, name, kind: "cocktail"|"straight"|"counted", ingredients: [{ typeId, amount }] }
  *   source  { bottleId, amount }                      one stock item an ingredient draws from
  *   line    { bottleId, typeId, amount, costCents, shareCents, buyerId, buyerName, abv }
  *   ringUp  { id, nightId, kind: "guest"|"crew", tabId, personId, personName, menuItemName,
@@ -267,7 +267,7 @@ var RNMBDomain = (function () {
     });
     if (!menuItem) return [];
     if (menuItem.kind === "counted") return mapped.slice(0, 1).map(function (i) { return { typeId: i.typeId, amount: 1 }; });
-    if (menuItem.kind === "pour") return mapped.slice(0, 1);
+    if (menuItem.kind === "straight") return mapped.slice(0, 1);
     return mapped;
   }
 
