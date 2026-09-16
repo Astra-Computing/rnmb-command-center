@@ -112,9 +112,11 @@ async function createRepository() {
 
 function createSupabaseRepository(config) {
   const restBase = `${config.supabaseUrl.replace(/\/$/, "")}/rest/v1`;
+  // apikey only. Supabase's publishable keys (sb_publishable_...) are not JWTs,
+  // and anything sent on Authorization: Bearer is parsed as one and rejected as
+  // "Invalid JWT". apikey alone runs as the anon role for both key formats.
   const baseHeaders = {
     apikey: config.supabaseAnonKey,
-    Authorization: `Bearer ${config.supabaseAnonKey}`,
     "Content-Type": "application/json"
   };
 
