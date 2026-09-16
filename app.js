@@ -1,4 +1,5 @@
 const STORAGE_KEY = "rnmb-command-center-v1";
+const ACCESS_STORAGE_KEY = "rnmb-access-key";
 const STANDARD_DRINK_OZ = 0.6;
 
 // The local calendar date, never the UTC one. toISOString() reports UTC, so
@@ -57,6 +58,7 @@ const demoData = () => {
 let state = emptyState();
 let repository = createLocalRepository();
 let syncMode = "local";
+let accessKey = "";
 let saveInFlight = false;
 let lastSyncedAt = null;
 
@@ -115,16 +117,22 @@ function createSupabaseRepository(config) {
   // apikey only. Supabase's publishable keys (sb_publishable_...) are not JWTs,
   // and anything sent on Authorization: Bearer is parsed as one and rejected as
   // "Invalid JWT". apikey alone runs as the anon role for both key formats.
-  const baseHeaders = {
-    apikey: config.supabaseAnonKey,
-    "Content-Type": "application/json"
-  };
+  // x-rnmb-key carries the shared passphrase that every RLS policy checks
+  // (supabase/rls-passphrase.sql). Built per request rather than captured once,
+  // because the user may type the passphrase after this repository exists.
+  function baseHeaders() {
+    return {
+      apikey: config.supabaseAnonKey,
+      "x-rnmb-key": accessKey,
+      "Content-Type": "application/json"
+    };
+  }
 
   async function request(path, options = {}) {
     const response = await fetch(`${restBase}/${path}`, {
       ...options,
       headers: {
-        ...baseHeaders,
+        ...baseHeaders(),
         ...(options.headers || {})
       }
     });
@@ -191,6 +199,20 @@ function createSupabaseRepository(config) {
   }
 
   return {
+    // "open"   - the passphrase gate is not installed in Postgres (yet)
+    // "ok"     - the passphrase we are holding is the right one
+    // "denied" - a passphrase is required and ours is missing or wrong
+    async checkAccess() {
+      const response = await fetch(`${restBase}/rpc/rnmb_authorized`, {
+        method: "POST",
+        headers: baseHeaders(),
+        body: "{}"
+      });
+      if (response.status === 404) return "open";
+      if (!response.ok) return "denied";
+      return (await response.json()) === true ? "ok" : "denied";
+    },
+
     async load() {
       const [peopleRows, typeRows, bottleRows, nightRows, pourRows, settingsRows] = await Promise.all([
         readTable("rnmb_people", "order=created_at.asc"),
@@ -360,9 +382,41 @@ function createSupabaseRepository(config) {
   };
 }
 
+// The shared passphrase gates every table (supabase/rls-passphrase.sql). Ask for
+// it once and remember it. A wrong passphrase otherwise reads as an empty
+// dashboard, because a denied SELECT returns [] with a 200 rather than an error.
+// "open" means the SQL has not been run yet, so this deploy is safe to ship
+// before the migration - and safe to ship after it too.
+async function unlockSupabase() {
+  accessKey = localStorage.getItem(ACCESS_STORAGE_KEY) || "";
+  let status = await repository.checkAccess();
+  if (status === "open" || status === "ok") return true;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const entry = window.prompt("RNMB passphrase:");
+    if (entry === null) break;
+    accessKey = entry.trim();
+    status = await repository.checkAccess();
+    if (status === "ok") {
+      localStorage.setItem(ACCESS_STORAGE_KEY, accessKey);
+      return true;
+    }
+    showToast("That passphrase was not recognised.");
+  }
+
+  accessKey = "";
+  localStorage.removeItem(ACCESS_STORAGE_KEY);
+  return false;
+}
+
 async function init() {
   try {
     repository = await createRepository();
+    if (syncMode === "supabase" && !(await unlockSupabase())) {
+      repository = createLocalRepository();
+      syncMode = "local";
+      showToast("No passphrase. Using local browser storage.");
+    }
     state = await repository.load();
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     lastSyncedAt = new Date();
