@@ -1,7 +1,18 @@
 const STORAGE_KEY = "rnmb-command-center-v1";
 const STANDARD_DRINK_OZ = 0.6;
 
-const today = () => new Date().toISOString().slice(0, 10);
+// The local calendar date, never the UTC one. toISOString() reports UTC, so
+// slicing it returns tomorrow from 8pm Eastern onward -- which dated every night
+// log and purchase a day ahead for exactly the hours this app is used.
+const today = () => {
+  const now = new Date();
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+};
+
+// Person colours are written straight into a style attribute. From the colour
+// picker that is always #rrggbb; from an imported archive it is arbitrary text.
+const safeColor = (value) => (/^#[0-9a-f]{3,8}$/i.test(String(value || "")) ? value : "#ef4444");
 const uid = () => crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
 const money = (value) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(value || 0);
 const oneDecimal = (value) => Number(value || 0).toFixed(1);
@@ -46,6 +57,8 @@ const demoData = () => {
 let state = emptyState();
 let repository = createLocalRepository();
 let syncMode = "local";
+let saveInFlight = false;
+let lastSyncedAt = null;
 
 function normalizeState(input) {
   return {
@@ -350,7 +363,9 @@ async function init() {
     repository = await createRepository();
     state = await repository.load();
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    lastSyncedAt = new Date();
     render();
+    startAutoRefresh();
     showToast(syncMode === "supabase" ? "Connected to Supabase." : "Using local browser storage.");
   } catch (error) {
     console.error(error);
@@ -363,6 +378,7 @@ async function init() {
 }
 
 async function saveState(message, supabaseOperation) {
+  saveInFlight = true;
   try {
     if (syncMode === "supabase" && supabaseOperation) {
       await supabaseOperation(repository);
@@ -384,8 +400,64 @@ async function saveState(message, supabaseOperation) {
     }
     render();
     showToast("Save failed. Check Supabase settings and policies.");
+  } finally {
+    saveInFlight = false;
+    lastSyncedAt = new Date();
   }
 }
+
+/*
+ * Shared state is read once at boot and never again, so two people on the same
+ * dashboard never saw each other's pours. There is no realtime subscription
+ * here on purpose: the app has no dependencies and adding a websocket client
+ * would be the only one. Polling six small tables every 15s is enough for a
+ * dashboard a handful of people watch for an evening.
+ */
+const REFRESH_MS = 15000;
+let refreshTimer = null;
+
+/** Never redraw the form a user is mid-way through filling in. */
+function isUserBusy() {
+  const el = document.activeElement;
+  return Boolean(el) && ["INPUT", "SELECT", "TEXTAREA"].includes(el.tagName);
+}
+
+async function refreshFromServer() {
+  if (syncMode !== "supabase" || saveInFlight) return;
+  // No "force" escape hatch on purpose: the one caller that wanted it was the
+  // tab regaining focus, which is exactly when a restored cursor sits in a
+  // half-typed field. Waiting one interval costs nothing; eating the draft does.
+  if (isUserBusy() || document.hidden) return;
+
+  try {
+    const incoming = await repository.load();
+    lastSyncedAt = new Date();
+    // render() rebuilds every panel from innerHTML, so redraw only on a real
+    // change: an unconditional repaint every 15s would fight the user's scroll.
+    if (JSON.stringify(incoming) !== JSON.stringify(state)) {
+      state = incoming;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      render();
+      showToast("Updated from the shared dashboard.");
+    } else {
+      renderTopline();
+    }
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+function startAutoRefresh() {
+  if (refreshTimer) window.clearInterval(refreshTimer);
+  if (syncMode !== "supabase") return;
+  refreshTimer = window.setInterval(refreshFromServer, REFRESH_MS);
+}
+
+// A tab left open all evening is the normal case here, so catch up the moment
+// it comes back to the front rather than waiting out the interval.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) refreshFromServer();
+});
 
 function showToast(message) {
   const toast = document.querySelector("#toast");
@@ -456,9 +528,23 @@ function activeNightTotals() {
 function spendByPerson() {
   const totals = new Map(state.people.map((person) => [person.id, 0]));
   state.bottles.forEach((bottle) => {
-    totals.set(bottle.buyerId, (totals.get(bottle.buyerId) || 0) + Number(bottle.price || 0));
+    // Only money with a live buyer lands on a person. A blank buyerId (left
+    // behind when someone is removed) or an id whose person no longer exists
+    // used to create a Map key matching nobody: the money stayed in the total
+    // and in everyone's share, but appeared in no bar and no settle-up row, so
+    // the deltas silently stopped summing to zero.
+    if (!totals.has(bottle.buyerId)) return;
+    totals.set(bottle.buyerId, totals.get(bottle.buyerId) + Number(bottle.price || 0));
   });
   return totals;
+}
+
+/** Money on bottles whose buyer is blank or has been removed. Counted in the total, credited to no one. */
+function unassignedSpend() {
+  const known = new Set(state.people.map((person) => person.id));
+  return state.bottles
+    .filter((bottle) => !known.has(bottle.buyerId))
+    .reduce((sum, bottle) => sum + Number(bottle.price || 0), 0);
 }
 
 function statusForDrinks(drinks) {
@@ -499,7 +585,19 @@ function renderTopline() {
   document.querySelector("#activeNightName").textContent = night?.name || "No active night";
   document.querySelector("#activeNightMeta").textContent = night ? `${night.date} · ${night.pours.length} pours logged` : "Create a night log to start tracking pours.";
   document.querySelector("#responsibleMode").checked = state.responsibleMode;
-  document.querySelector("#syncStatus").textContent = syncMode === "supabase" ? "Supabase shared DB" : "Local browser storage";
+  const syncStatus = document.querySelector("#syncStatus");
+  if (syncMode === "supabase") {
+    const stamp = lastSyncedAt
+      ? lastSyncedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      : "not yet";
+    syncStatus.textContent = "Supabase shared DB";
+    syncStatus.title = `Checks for other people's changes every ${REFRESH_MS / 1000}s`;
+    document.querySelector("#syncMeta").textContent = `Synced ${stamp}`;
+  } else {
+    syncStatus.textContent = "Local browser storage";
+    syncStatus.title = "This browser only. Nothing is shared.";
+    document.querySelector("#syncMeta").textContent = "Private to this browser";
+  }
 }
 
 function renderForms() {
@@ -545,7 +643,8 @@ function renderOverview() {
 function renderSpendBars() {
   const target = document.querySelector("#spendBars");
   const spends = spendByPerson();
-  const max = Math.max(1, ...Array.from(spends.values()));
+  const unassigned = unassignedSpend();
+  const max = Math.max(1, unassigned, ...Array.from(spends.values()));
   target.innerHTML = "";
   target.classList.toggle("empty-state", state.bottles.length === 0);
   if (!state.bottles.length) {
@@ -559,10 +658,20 @@ function renderSpendBars() {
     row.className = "bar-row";
     row.innerHTML = `
       <div class="bar-meta"><strong>${escapeHtml(person.name)}</strong><span>${money(spent)}</span></div>
-      <div class="bar-track"><span class="bar-fill" style="--bar-width: ${(spent / max) * 100}%; --person-color: ${person.color}"></span></div>
+      <div class="bar-track"><span class="bar-fill" style="--bar-width: ${(spent / max) * 100}%; --person-color: ${safeColor(person.color)}"></span></div>
     `;
     target.append(row);
   });
+
+  if (unassigned > 0) {
+    const row = document.createElement("div");
+    row.className = "bar-row";
+    row.innerHTML = `
+      <div class="bar-meta"><strong>Unassigned</strong><span>${money(unassigned)}</span></div>
+      <div class="bar-track"><span class="bar-fill" style="--bar-width: ${(unassigned / max) * 100}%; --person-color: var(--muted)"></span></div>
+    `;
+    target.append(row);
+  }
 }
 
 function renderLowSupply() {
@@ -634,7 +743,7 @@ function renderTonight() {
       card.className = "consumption-card";
       card.innerHTML = `
         <div class="person-card">
-          <span class="avatar" style="--person-color: ${person.color}">${initials(person.name)}</span>
+          <span class="avatar" style="--person-color: ${safeColor(person.color)}">${initials(person.name)}</span>
           <div class="person-copy"><strong>${escapeHtml(person.name)}</strong><small>${oneDecimal(entry.ounces)} oz total</small></div>
         </div>
         <strong>${oneDecimal(entry.drinks)}</strong>
@@ -754,6 +863,17 @@ function renderLedger() {
     item.innerHTML = `<strong>${escapeHtml(person.name)}</strong><br><small>${delta >= 0 ? "is owed" : "owes"} ${money(Math.abs(delta))}</small>`;
     settle.append(item);
   });
+
+  // Without this line the figures above look wrong rather than incomplete: money
+  // on a bottle with no live buyer still inflates everyone's share but credits
+  // no one, so the deltas come to -unassigned instead of zero. Say so on screen.
+  const unassigned = unassignedSpend();
+  if (unassigned > 0) {
+    const note = document.createElement("div");
+    note.className = "stack-item";
+    note.innerHTML = `<strong>Unassigned purchases</strong><br><small>${money(unassigned)} has no buyer on the roster, so nobody is credited for it. Re-add the buyer, or subtract it before settling.</small>`;
+    settle.append(note);
+  }
 }
 
 function renderCrew() {
@@ -770,7 +890,7 @@ function renderCrew() {
     const card = document.createElement("div");
     card.className = "person-card";
     card.innerHTML = `
-      <span class="avatar" style="--person-color: ${person.color}">${initials(person.name)}</span>
+      <span class="avatar" style="--person-color: ${safeColor(person.color)}">${initials(person.name)}</span>
       <div class="person-copy">
         <strong>${escapeHtml(person.name)}</strong>
         <small>${money(spent)} logged · ${pours.length} pours</small>
@@ -956,14 +1076,37 @@ document.body.addEventListener("click", async (event) => {
   }
 });
 
-document.querySelector("#exportData").addEventListener("click", () => {
+function downloadArchive(label) {
   const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `rnmb-command-center-${today()}.json`;
+  link.download = `rnmb-command-center-${label}-${today()}.json`;
   link.click();
   URL.revokeObjectURL(url);
+}
+
+/*
+ * Import, Reload demo and Clear are the only actions that do not write a single
+ * targeted row: they go through saveAll, which deletes every row in all five
+ * tables and re-inserts. Connected to Supabase that is everyone's data, not
+ * this browser's copy -- and Clear's old wording ("from this browser") said the
+ * opposite. Name the real scope, and take a backup on the way out, because the
+ * deletes and inserts are separate requests with no transaction around them.
+ */
+function confirmDestructive(action) {
+  const scope = syncMode === "supabase"
+    ? "This replaces the SHARED Supabase database. Everyone using this dashboard loses the current data."
+    : "This replaces the copy stored in this browser. Nothing shared is affected.";
+  return confirm(`${action}
+
+${scope}
+
+A backup file will download first.`);
+}
+
+document.querySelector("#exportData").addEventListener("click", () => {
+  downloadArchive("export");
   showToast("Dashboard archive exported.");
 });
 
@@ -975,7 +1118,12 @@ document.querySelector("#importData").addEventListener("change", async (event) =
     if (!Array.isArray(imported.people) || !Array.isArray(imported.types) || !Array.isArray(imported.bottles) || !Array.isArray(imported.nights)) {
       throw new Error("Invalid archive");
     }
-    state = { ...imported, responsibleMode: imported.responsibleMode !== false };
+    if (!confirmDestructive(`Import ${file.name}?`)) {
+      event.target.value = "";
+      return;
+    }
+    downloadArchive("backup-before-import");
+    state = normalizeState({ ...imported, responsibleMode: imported.responsibleMode !== false });
     await saveState("Dashboard archive imported.");
   } catch {
     showToast("That archive could not be imported.");
@@ -985,14 +1133,16 @@ document.querySelector("#importData").addEventListener("change", async (event) =
 });
 
 document.querySelector("#seedData").addEventListener("click", async () => {
-  if (!confirm("Reload demo data and replace the current dashboard?")) return;
+  if (!confirmDestructive("Reload demo data and replace the current dashboard?")) return;
+  downloadArchive("backup-before-demo-data");
   state = demoData();
   await saveState("Demo data reloaded.");
 });
 
 document.querySelector("#clearData").addEventListener("click", async () => {
-  if (!confirm("Clear all dashboard data from this browser?")) return;
-  state = { people: [], types: [], bottles: [], nights: [], activeNightId: "", responsibleMode: true };
+  if (!confirmDestructive("Clear all dashboard data?")) return;
+  downloadArchive("backup-before-clear");
+  state = emptyState();
   await saveState("Dashboard cleared.");
 });
 

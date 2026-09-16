@@ -355,6 +355,9 @@ small,
 }
 
 .bar-fill {
+  /* A span is inline by default, which ignores width and height entirely: every
+     fill measured 0x0 and the board rendered as empty tracks. */
+  display: block;
   width: var(--bar-width);
   height: 100%;
   border-radius: inherit;
@@ -499,6 +502,9 @@ small,
 .remove-button {
   min-width: 32px;
   min-height: 32px;
+  /* min-width is a floor, not a cap. Inside .inventory-card (a grid) the button
+     stretched the full column width; justify-self keeps it its own size. */
+  justify-self: end;
   border-radius: 8px;
   background: var(--surface-2);
   color: var(--muted);
