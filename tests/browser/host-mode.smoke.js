@@ -51,6 +51,8 @@ async function openPage(browser, options = {}) {
     document.addEventListener("DOMContentLoaded", () => {
       const toast = document.querySelector("#toast");
       if (!toast) return;
+      // The boot toast can land before this listener runs; record it rather than waiting forever for a change.
+      if (toast.textContent) window.__toasts.push(toast.textContent);
       new MutationObserver(() => window.__toasts.push(toast.textContent)).observe(toast, { childList: true, characterData: true, subtree: true });
     });
   });
@@ -261,6 +263,66 @@ async function addAe1Stock(session) {
   await addPricedStockViaForm(session, { typeId: tripleSec.id, nickname: "Alex's triple sec", size: 25.36, price: 20, buyerName: "Alex" });
   await addPricedStockViaForm(session, { typeId: lime.id, nickname: "Jordan's lime", size: 32, price: 4, buyerName: "Jordan" });
   return { tequila, tripleSec, lime };
+}
+
+// ---------- U6 register helpers ------------------------------------------------------
+
+const HOST_NIGHT_STARTED = "Host night started. Open the register to ring up drinks.";
+const NOT_SAVING_MESSAGE = "This host night belongs to the shared database, and this browser is not connected to it, so nothing was saved. Reload the page to reconnect, then try again.";
+
+/** Start a host night through Tonight's form (kind "host"); returns the confirm dialog's text and the night. */
+async function startHostNightViaForm(session, name = "Smoke host night") {
+  const { page } = session;
+  await page.click('.tab-button[data-tab="tonight"]');
+  await page.fill("#nightForm [name='name']", name);
+  await page.selectOption("#nightForm [name='kind']", "host");
+  let dialogMessage = "";
+  page.once("dialog", (dialog) => { dialogMessage = dialog.message(); });
+  await clickForToast(session, "#nightForm button[type='submit']", HOST_NIGHT_STARTED);
+  const night = await page.evaluate(() => window.__rnmb.state.nights.find((entry) => entry.kind === "host" && !entry.endedAt));
+  assert.ok(night, "the host night was saved");
+  return { dialogMessage, night };
+}
+
+/** Follow Tonight's "Open register" link and wait for the working register. */
+async function openRegister(session) {
+  const { page } = session;
+  await page.click('.tab-button[data-tab="tonight"]');
+  await page.click("#openRegisterLink");
+  await page.waitForSelector("#registerWork", { state: "visible" });
+  assert.equal(await page.isVisible(".app-shell"), false, "the dashboard is hidden behind the register");
+}
+
+/** Open a guest tab from the register's new-tab form. */
+async function openTabViaRegister(session, guestName) {
+  await session.page.fill("#registerTabForm [name='guestName']", guestName);
+  await clickForToast(session, "#registerOpenTab", `Tab opened for ${guestName}.`);
+}
+
+const registerItem = (page, name) => page.locator("#registerMenu [data-register-item]", { hasText: name });
+const registerTab = (page, guestName) => page.locator("#registerTabs [data-register-tab]", { hasText: guestName });
+const registerCrew = (page, name) => page.locator("#registerCrew [data-register-crew]", { hasText: name });
+const tabCard = (page, guestName) => page.locator("#registerTabList .register-tab-card", { hasText: guestName });
+const stockOf = (page, bottleId) => page.evaluate((id) => window.__rnmb.state.bottles.find((bottle) => bottle.id === id).remaining, bottleId);
+
+/** Save a menu item and set stock levels through the repository (the Menu and Inventory UIs have their own scenarios). */
+async function saveMenuItemAndLevels(page, { menuItem, levels = [] }) {
+  const ok = await page.evaluate(async ({ menuItem, levels }) => {
+    const r = window.__rnmb;
+    for (const { bottleId, newRemaining } of levels) {
+      if (!(await r.hostAction("", (db) => db.correctStock({ bottleId, newRemaining })))) return false;
+    }
+    return r.hostAction("", (db) => db.saveMenuItem(menuItem));
+  }, { menuItem, levels });
+  assert.equal(ok, true, "menu item and levels saved");
+}
+
+/** Two tequila bottles priced $30 (Sam) and $60 (Alex), through the forms. */
+async function addTwoTequilas(session) {
+  const tequila = await addTypeViaForm(session, { name: "Tequila", category: "Tequila", abv: 40 });
+  const sams = await addPricedStockViaForm(session, { typeId: tequila.id, nickname: "Sam's tequila", size: 25.36, price: 30, buyerName: "Sam" });
+  const alexs = await addPricedStockViaForm(session, { typeId: tequila.id, nickname: "Alex's tequila", size: 25.36, price: 60, buyerName: "Alex" });
+  return { tequila, sams, alexs };
 }
 
 const scenarios = [
@@ -1057,6 +1119,539 @@ const scenarios = [
         session.assertClean();
       } finally {
         await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U6 local mode: starting a host night asks first (cancel starts nothing), and the red banner shows on the closed and open register",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        // No host night yet: #register is the closed message, still with the banner, and no way to ring up.
+        assert.equal(await page.isVisible("#openRegisterLink"), false, "no register link without a host night");
+        await page.evaluate(() => { location.hash = "#register"; });
+        await page.waitForSelector("#registerClosed", { state: "visible" });
+        assert.equal(await page.isVisible(".app-shell"), false);
+        assert.equal(await page.isVisible("#registerWork"), false, "the register itself is not shown");
+        assert.match(await page.textContent("#registerClosedMessage"), /No host night is running/);
+        assert.equal(await page.isVisible("#registerLocalBanner"), true, "banner on the closed register");
+        assert.match(await page.textContent("#registerLocalBanner"), /This browser only/);
+        await page.click("#registerBack");
+        await page.waitForSelector(".app-shell", { state: "visible" });
+        assert.equal(await page.isVisible("#register"), false);
+
+        // Cancelling the scope confirm starts nothing.
+        page.removeAllListeners("dialog");
+        let cancelled = "";
+        page.once("dialog", (dialog) => { cancelled = dialog.message(); dialog.dismiss(); });
+        await page.click('.tab-button[data-tab="tonight"]');
+        await page.fill("#nightForm [name='name']", "Cancelled party");
+        await page.selectOption("#nightForm [name='kind']", "host");
+        await clickForToast(session, "#nightForm button[type='submit']", "Host night not started.");
+        assert.match(cancelled, /THIS BROWSER ONLY/);
+        assert.equal(await page.evaluate(() => window.__rnmb.state.nights.some((night) => night.kind === "host")), false);
+        page.on("dialog", (dialog) => dialog.accept());
+
+        const { dialogMessage, night } = await startHostNightViaForm(session, "Saturday party");
+        assert.match(dialogMessage, /Saturday party/);
+        assert.match(dialogMessage, /THIS BROWSER ONLY/);
+        assert.match(dialogMessage, /not connected to the shared database/);
+        assert.equal(night.startedLocally, true);
+        assert.equal(await page.evaluate(() => window.__rnmb.state.activeNightId), night.id);
+        assert.equal(await page.inputValue("#nightForm [name='kind']"), "crew", "the form resets");
+        assert.equal(await page.isVisible("#openRegisterLink"), true, "Open register appears while the host night runs");
+        assert.match(await page.textContent("#hostNightNoticeText"), /Saturday party/);
+
+        await openRegister(session);
+        assert.equal(await page.isVisible("#registerLocalBanner"), true, "banner on the open register");
+        assert.equal(await page.isVisible("#registerClosed"), false);
+        assert.match(await page.textContent("#registerNightMeta"), /Saturday party/);
+        assert.equal(await page.isDisabled("#registerConfirm"), true, "nothing chosen, nothing to confirm");
+        await page.click("#exitRegister");
+        await page.waitForSelector(".app-shell", { state: "visible" });
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U6 AE3 switching the preselected tequila to the other bottle and confirming deducts only the chosen bottle",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const { tequila, sams, alexs } = await addTwoTequilas(session);
+        // Sam's bottle has less left, so it is preselected (KTD10); the bartender is pouring from Alex's.
+        await saveMenuItemAndLevels(page, {
+          menuItem: { name: "Tequila Shot", kind: "straight", ingredients: [{ typeId: tequila.id, amount: 2 }] },
+          levels: [{ bottleId: sams.id, newRemaining: 10 }]
+        });
+        await startHostNightViaForm(session);
+        await openRegister(session);
+        await openTabViaRegister(session, "Riley");
+        assert.equal(await registerTab(page, "Riley").getAttribute("aria-pressed"), "true", "a new tab becomes the target");
+
+        await registerItem(page, "Tequila Shot").click();
+        assert.equal(await registerItem(page, "Tequila Shot").getAttribute("aria-pressed"), "true");
+        const select = page.locator("#registerIngredients select[name='sourceBottle']");
+        assert.equal(await select.count(), 1);
+        assert.equal(await select.inputValue(), sams.id, "the least-remaining bottle that covers the pour is preselected");
+        const detail = await page.textContent("#registerIngredients [data-source-detail]");
+        assert.match(detail, /Sam's tequila · Sam · 10\.0 of 25\.4 oz left/, "the preselected source is shown plainly");
+        assert.equal(await page.isEnabled("#registerConfirm"), true);
+
+        await select.selectOption(alexs.id);
+        assert.equal(await page.locator("#registerIngredients select[name='sourceBottle']").inputValue(), alexs.id);
+        assert.equal(await page.inputValue("#registerIngredients input[name='sourceAmount']"), "2");
+        assert.match(await page.textContent("#registerIngredients [data-source-detail]"), /Alex's tequila · Alex/);
+        // 2 oz of a $60, 25.36 oz bottle costs 473 cents: $4.75 at 0% / $0.25.
+        assert.equal((await page.textContent("#registerConfirm")).trim(), "Ring up $4.75 to Riley");
+
+        await clickForToast(session, "#registerConfirm", "Tequila Shot rung up to Riley.");
+        assert.equal(await stockOf(page, sams.id), 10, "the preselected bottle is untouched");
+        assert.equal(await stockOf(page, alexs.id), 23.36, "only the switched-to bottle loses 2 oz");
+        const ringUp = await page.evaluate(() => window.__rnmb.state.ringUps[0]);
+        assert.equal(ringUp.priceCents, 475);
+        assert.deepEqual(ringUp.lines.map(({ bottleId, amount, buyerName, shareCents }) => ({ bottleId, amount, buyerName, shareCents })), [
+          { bottleId: alexs.id, amount: 2, buyerName: "Alex", shareCents: 475 }
+        ]);
+        assert.equal(await page.evaluate(() => window.__rnmb.registerDraft), null, "the draft is cleared after a ring-up");
+        assert.equal((await tabCard(page, "Riley").locator("[data-tab-total]").textContent()).trim(), "$4.75");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U6 AE9 a short tequila keeps confirm disabled until a second bottle makes up 2 oz; A reads 0, B loses 1.5, shares split by cost",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const { tequila, sams, alexs } = await addTwoTequilas(session);
+        // Neither bottle alone covers 2 oz, but together they do.
+        await saveMenuItemAndLevels(page, {
+          menuItem: { name: "Tequila Shot", kind: "straight", ingredients: [{ typeId: tequila.id, amount: 2 }] },
+          levels: [{ bottleId: sams.id, newRemaining: 0.5 }, { bottleId: alexs.id, newRemaining: 1.5 }]
+        });
+        await startHostNightViaForm(session);
+        await openRegister(session);
+        await openTabViaRegister(session, "Riley");
+        await registerItem(page, "Tequila Shot").click();
+
+        const ingredient = page.locator("#registerIngredients [data-ingredient-index='0']");
+        const marker = ingredient.locator("[data-short-marker]");
+        assert.equal(await page.locator("#registerIngredients select[name='sourceBottle']").inputValue(), sams.id);
+        assert.equal(await page.inputValue("#registerIngredients input[name='sourceAmount']"), "0.5");
+        assert.equal(await marker.isVisible(), true, "the tequila line is marked short");
+        assert.equal((await marker.textContent()).trim(), "Short 1.5 oz");
+        assert.equal(await page.isDisabled("#registerConfirm"), true, "confirm is disabled while short");
+        assert.match(await page.textContent("#registerHint"), /Tequila is short 1\.5 oz/);
+        assert.equal(await page.evaluate(() => window.__rnmb.registerDraft.sources[0].length), 1, "the split is never applied without a tap");
+
+        await ingredient.locator("[data-add-source]").click();
+        const amounts = page.locator("#registerIngredients input[name='sourceAmount']");
+        assert.equal(await amounts.count(), 2);
+        assert.equal(await page.locator("#registerIngredients select[name='sourceBottle']").nth(1).inputValue(), alexs.id);
+        assert.equal(await amounts.nth(1).inputValue(), "1.5", "the added bottle offers the shortfall");
+        assert.equal(await marker.isVisible(), false);
+        assert.equal(await page.isEnabled("#registerConfirm"), true);
+
+        // Typing a smaller amount is short again; typing it back enables confirm.
+        await amounts.nth(1).fill("1");
+        assert.equal(await marker.isVisible(), true);
+        assert.equal((await marker.textContent()).trim(), "Short 0.5 oz");
+        assert.equal(await page.isDisabled("#registerConfirm"), true);
+        await amounts.nth(1).fill("1.5");
+        assert.equal(await marker.isVisible(), false);
+        assert.equal(await page.isEnabled("#registerConfirm"), true);
+
+        await clickForToast(session, "#registerConfirm", "Tequila Shot rung up to Riley.");
+        assert.equal(await stockOf(page, sams.id), 0, "A reads 0 oz");
+        assert.equal(await stockOf(page, alexs.id), 0, "B loses 1.5 oz");
+        const result = await page.evaluate(() => {
+          const ringUp = window.__rnmb.state.ringUps[0];
+          return { ringUp, expected: window.RNMBDomain.allocateShares(ringUp.priceCents, ringUp.lines.map((line) => line.costCents)) };
+        });
+        const lines = result.ringUp.lines;
+        assert.deepEqual(lines.map((line) => [line.bottleId, line.amount, line.buyerName]), [[sams.id, 0.5, "Sam"], [alexs.id, 1.5, "Alex"]]);
+        assert.deepEqual(lines.map((line) => line.shareCents), result.expected, "shares follow each bottle's cost");
+        assert.equal(lines[0].shareCents + lines[1].shareCents, result.ringUp.priceCents);
+        assert.ok(lines[0].shareCents > 0 && lines[1].shareCents > lines[0].shareCents, `Sam and Alex both get a share, Alex more (${lines[0].shareCents}/${lines[1].shareCents})`);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U6 opening a tab by name then ringing up two items shows the running total and both items; unavailable items are disabled",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const lowered = await page.evaluate(() => {
+          const r = window.__rnmb;
+          const red = r.state.bottles.find((bottle) => bottle.nickname === "Diplomatic Pouch");
+          return r.hostAction("", (db) => db.correctStock({ bottleId: red.id, newRemaining: 2 }));
+        });
+        assert.equal(lowered, true);
+        await startHostNightViaForm(session);
+        await openRegister(session);
+        const glass = registerItem(page, "Glass of Red");
+        assert.equal(await glass.isDisabled(), true, "Glass of Red (5 oz) is unavailable with 2 oz left");
+        assert.match(await glass.textContent(), /Unavailable/);
+
+        await clickForToast(session, "#registerOpenTab", "Type the guest's name to open a tab.");
+        await openTabViaRegister(session, "Morgan");
+        assert.equal(await page.inputValue("#registerTabForm [name='guestName']"), "", "the name field clears");
+        const tab = await page.evaluate(() => window.__rnmb.state.guestTabs[0]);
+        assert.equal(tab.guestName, "Morgan");
+        assert.equal(tab.status, "open");
+
+        // Boilermaker: 1.5 oz bourbon ($34.99 / 25.36 oz) + 12 oz lager ($22.50 / 144 oz) = 394 cents, $4.00.
+        await registerItem(page, "Boilermaker").click();
+        assert.match(await registerItem(page, "Boilermaker").textContent(), /\$4\.00/, "the menu button shows the price");
+        await clickForToast(session, "#registerConfirm", "Boilermaker rung up to Morgan.");
+        // Bourbon Neat: 2 oz bourbon = 276 cents, $3.00. The target is chosen again after the draft cleared.
+        await registerItem(page, "Bourbon Neat").click();
+        assert.equal(await page.isDisabled("#registerConfirm"), true, "no target yet");
+        assert.match(await page.textContent("#registerHint"), /Pick a guest tab or a crew member/);
+        await registerTab(page, "Morgan").click();
+        await clickForToast(session, "#registerConfirm", "Bourbon Neat rung up to Morgan.");
+
+        const card = tabCard(page, "Morgan");
+        assert.equal((await card.locator("[data-tab-total]").textContent()).trim(), "$7.00");
+        const items = await card.locator(".register-tab-items li").allTextContents();
+        assert.equal(items.length, 2);
+        assert.match(items[0], /Boilermaker\s*\$4\.00/);
+        assert.match(items[1], /Bourbon Neat\s*\$3\.00/);
+        assert.match(await registerTab(page, "Morgan").textContent(), /\$7\.00/, "the target button shows the running total");
+        const ids = await page.evaluate(() => window.__rnmb.state.ringUps.map((ringUp) => ringUp.id));
+        assert.equal(new Set(ids).size, 2, "each draft had its own ring-up id");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U6 AE4 voiding an item asks first, removes its price from the tab and restores every source bottle",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await startHostNightViaForm(session);
+        await openRegister(session);
+        await openTabViaRegister(session, "Riley");
+        const ids = await page.evaluate(() => ({
+          bourbon: window.__rnmb.state.bottles.find((bottle) => bottle.nickname === "The Briefing Bottle").id,
+          lager: window.__rnmb.state.bottles.find((bottle) => bottle.nickname === "Cooler Battalion").id
+        }));
+        await registerItem(page, "Bourbon Neat").click();
+        await clickForToast(session, "#registerConfirm", "Bourbon Neat rung up to Riley.");
+        const before = { bourbon: await stockOf(page, ids.bourbon), lager: await stockOf(page, ids.lager) };
+
+        await registerItem(page, "Boilermaker").click();
+        await registerTab(page, "Riley").click();
+        await clickForToast(session, "#registerConfirm", "Boilermaker rung up to Riley.");
+        assert.equal(await stockOf(page, ids.lager), before.lager - 12);
+        const card = tabCard(page, "Riley");
+        assert.equal((await card.locator("[data-tab-total]").textContent()).trim(), "$7.00");
+
+        const boilermaker = await page.evaluate(() => window.__rnmb.state.ringUps.find((ringUp) => ringUp.menuItemName === "Boilermaker").id);
+        let dialogMessage = "";
+        page.once("dialog", (dialog) => { dialogMessage = dialog.message(); });
+        await clickForToast(session, `#registerTabList [data-void-ring-up="${boilermaker}"]`, "Item voided and its stock restored.");
+        assert.match(dialogMessage, /Void Boilermaker \(\$4\.00\) from Riley's tab\?/);
+
+        assert.equal((await card.locator("[data-tab-total]").textContent()).trim(), "$3.00", "the price leaves the tab");
+        const items = await card.locator(".register-tab-items li").allTextContents();
+        assert.equal(items.length, 1);
+        assert.match(items[0], /Bourbon Neat/);
+        assert.equal(await stockOf(page, ids.bourbon), before.bourbon, "the bourbon comes back");
+        assert.equal(await stockOf(page, ids.lager), before.lager, "the lager comes back");
+        const voided = await page.evaluate((id) => window.__rnmb.state.ringUps.find((ringUp) => ringUp.id === id), boilermaker);
+        assert.ok(voided.voidedAt, "voided, not deleted");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U6 AE7 a crew shot records no price, deducts the bottle and appears in no tab",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await startHostNightViaForm(session);
+        await openRegister(session);
+        await openTabViaRegister(session, "Riley");
+        const bourbon = await page.evaluate(() => window.__rnmb.state.bottles.find((bottle) => bottle.nickname === "The Briefing Bottle").id);
+        const before = await stockOf(page, bourbon);
+
+        await registerItem(page, "Bourbon Neat").click();
+        await registerCrew(page, "Casey").click();
+        assert.equal(await registerCrew(page, "Casey").getAttribute("aria-pressed"), "true");
+        assert.equal(await registerTab(page, "Riley").getAttribute("aria-pressed"), "false", "a crew member replaces the tab as target");
+        assert.equal((await page.textContent("#registerConfirm")).trim(), "Pour for Casey · no charge");
+        await clickForToast(session, "#registerConfirm", "Bourbon Neat poured for Casey. No charge.");
+
+        const result = await page.evaluate(() => {
+          const r = window.__rnmb;
+          const ringUp = r.state.ringUps[0];
+          return { ringUp, drinks: window.RNMBDomain.linesConsumption(ringUp.lines, r.state.types).standardDrinks, stored: JSON.parse(localStorage.getItem("rnmb-command-center-v1")).ringUps.length };
+        });
+        assert.equal(result.ringUp.kind, "crew");
+        assert.equal(result.ringUp.priceCents, null, "no price");
+        assert.equal(result.ringUp.tabId, null, "no tab");
+        assert.equal(result.ringUp.personName, "Casey");
+        assert.ok(result.ringUp.lines.every((line) => line.shareCents === null), "no shares");
+        assert.ok(result.drinks > 0, "the shot counts as consumption");
+        assert.equal(result.stored, 1);
+        assert.equal(await stockOf(page, bourbon), Math.round((before - 2) * 100) / 100, "the bottle is depleted");
+        assert.equal(await page.locator(`#registerTabList [data-ring-up-id="${result.ringUp.id}"]`).count(), 0, "not on any tab");
+        const card = tabCard(page, "Riley");
+        assert.equal((await card.locator("[data-tab-total]").textContent()).trim(), "$0.00");
+        assert.match(await card.textContent(), /No drinks yet/);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U6 a re-render or save during an unfinished draft keeps the selected item and target, and counts as busy",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await startHostNightViaForm(session);
+        await openRegister(session);
+        await openTabViaRegister(session, "Riley");
+        await page.evaluate(() => document.activeElement.blur());
+        assert.equal(await page.evaluate(() => window.__rnmb.isUserBusy()), true, "a chosen target alone is an unfinished draft");
+        await registerItem(page, "Boilermaker").click();
+        await page.evaluate(() => document.activeElement.blur());
+        const draftId = await page.evaluate(() => window.__rnmb.registerDraft.id);
+        assert.equal(await page.evaluate(() => window.__rnmb.isUserBusy()), true, "the refresh is held off");
+
+        // A save elsewhere (another tab opened) re-renders everything, then a bare render as a refresh would.
+        const opened = await page.evaluate(async () => {
+          const r = window.__rnmb;
+          const night = r.state.nights.find((entry) => entry.kind === "host");
+          return r.hostAction("Tab opened.", (db) => db.openTab({ id: crypto.randomUUID(), nightId: night.id, guestName: "Sky" }));
+        });
+        assert.equal(opened, true);
+        await page.evaluate(() => window.__rnmb.render());
+        assert.equal(await registerTab(page, "Sky").count(), 1, "the new tab rendered");
+        assert.equal(await registerItem(page, "Boilermaker").getAttribute("aria-pressed"), "true", "item kept");
+        assert.equal(await registerTab(page, "Riley").getAttribute("aria-pressed"), "true", "target kept");
+        assert.equal(await page.locator("#registerIngredients [data-ingredient-index]").count(), 2, "ingredient panel kept");
+        assert.equal(await page.evaluate(() => window.__rnmb.registerDraft.id), draftId, "same draft id");
+
+        await page.click("#registerClear");
+        assert.equal(await page.evaluate(() => window.__rnmb.isUserBusy()), false, "no draft, not busy");
+        assert.equal(await registerTab(page, "Riley").getAttribute("aria-pressed"), "false");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U6 localStorage holding an open host night not started here: the register shows the not-saving message and cannot ring up",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await page.evaluate(() => {
+          const stored = JSON.parse(localStorage.getItem("rnmb-command-center-v1"));
+          stored.nights.push({ id: crypto.randomUUID(), name: "Shared party", date: "2026-09-16", kind: "host", endedAt: null, pours: [] });
+          localStorage.setItem("rnmb-command-center-v1", JSON.stringify(stored));
+          location.hash = "#register";
+        });
+        await page.reload({ waitUntil: "domcontentloaded" });
+        await page.waitForFunction(() => window.__rnmb && window.__toasts && window.__toasts.length > 0, null, { timeout: 15000 });
+        await page.waitForSelector("#registerNotSaving", { state: "visible" });
+        assert.equal(await page.evaluate(() => window.__rnmb.syncMode), "local");
+        assert.equal((await page.textContent("#registerNotSavingMessage")).trim(), NOT_SAVING_MESSAGE);
+        assert.equal(await page.isVisible("#registerLocalBanner"), true, "banner on the not-saving register");
+        assert.equal(await page.isVisible("#registerRetry"), true);
+        assert.equal(await page.isVisible("#registerWork"), false, "no menu, targets or confirm");
+        assert.equal(await page.isVisible("#registerClosed"), false);
+        assert.equal(await page.isDisabled("#registerConfirm"), true);
+
+        const attempt = await page.evaluate(() => {
+          document.querySelector("#registerConfirm").click();
+          document.querySelector("#registerTabForm").requestSubmit();
+          return new Promise((resolve) => setTimeout(() => resolve({
+            ringUps: window.__rnmb.state.ringUps.length,
+            tabs: window.__rnmb.state.guestTabs.length
+          }), 300));
+        });
+        assert.deepEqual(attempt, { ringUps: 0, tabs: 0 }, "nothing can be rung up or opened");
+
+        // Retry reloads the page.
+        const reloaded = page.waitForEvent("load");
+        await page.click("#registerRetry");
+        await reloaded;
+        await page.waitForSelector("#registerNotSaving", { state: "visible" });
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U6 a second confirm tap while the ring-up is pending creates no second ring-up; a failed ring-up keeps its draft id",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await startHostNightViaForm(session);
+        await openRegister(session);
+        await openTabViaRegister(session, "Riley");
+        await registerItem(page, "Bourbon Neat").click();
+        const bourbon = await page.evaluate(() => window.__rnmb.state.bottles.find((bottle) => bottle.nickname === "The Briefing Bottle").id);
+        const before = await stockOf(page, bourbon);
+        const draftId = await page.evaluate(() => window.__rnmb.registerDraft.id);
+
+        // First attempt fails: the draft, its id and its selections survive and confirm comes back.
+        await page.evaluate(() => {
+          const repo = window.__rnmb.repository;
+          const original = repo.ringUp;
+          window.__ringUpIds = [];
+          repo.ringUp = async (record) => {
+            window.__ringUpIds.push(record.id);
+            if (window.__ringUpIds.length === 1) {
+              const error = new Error("Simulated refusal");
+              error.userMessage = "Simulated refusal";
+              throw error;
+            }
+            await new Promise((resolve) => { window.__releaseRingUp = resolve; });
+            return original(record);
+          };
+        });
+        await clickForToast(session, "#registerConfirm", "Simulated refusal");
+        assert.equal(await page.evaluate(() => window.__rnmb.registerDraft?.id), draftId, "the draft survives a failure");
+        assert.equal(await page.isEnabled("#registerConfirm"), true, "confirm is usable again");
+        assert.equal(await registerItem(page, "Bourbon Neat").getAttribute("aria-pressed"), "true");
+
+        // Second attempt is slow: double tap, then a scripted click while pending.
+        await page.dblclick("#registerConfirm");
+        await page.waitForFunction(() => typeof window.__releaseRingUp === "function");
+        const pending = await page.evaluate(() => {
+          document.querySelector("#registerConfirm").click();
+          return {
+            calls: window.__ringUpIds.length,
+            confirmDisabled: document.querySelector("#registerConfirm").disabled,
+            enabledControls: Array.from(document.querySelectorAll("#registerWork button, #registerWork input, #registerWork select"))
+              .filter((control) => !control.disabled).map((control) => control.outerHTML.slice(0, 60))
+          };
+        });
+        assert.equal(pending.calls, 2, "one failed call and exactly one pending call");
+        assert.equal(pending.confirmDisabled, true);
+        assert.deepEqual(pending.enabledControls, [], "every draft control is disabled while pending");
+        const toastCount = (await session.toasts()).length;
+        await page.evaluate(() => window.__releaseRingUp());
+        await page.waitForFunction((count) => window.__toasts.slice(count).includes("Bourbon Neat rung up to Riley."), toastCount);
+
+        const after = await page.evaluate(() => ({ ringUps: window.__rnmb.state.ringUps.map((ringUp) => ringUp.id), ids: window.__ringUpIds }));
+        assert.deepEqual(after.ringUps, [draftId], "one ring-up, with the draft's id");
+        assert.deepEqual(after.ids, [draftId, draftId], "the resubmit reused the draft id (KTD14)");
+        assert.equal(await stockOf(page, bourbon), Math.round((before - 2) * 100) / 100, "stock deducted once");
+        assert.equal((await tabCard(page, "Riley").locator("[data-tab-total]").textContent()).trim(), "$3.00");
+        // Once the call resolves, nothing stays locked: the next order can start at once.
+        const locked = await page.evaluate(() => Array.from(document.querySelectorAll("#registerWork button, #registerWork input, #registerWork select"))
+          .filter((control) => control.disabled && !["registerConfirm"].includes(control.id) && !control.matches("[data-register-item]"))
+          .map((control) => control.id || control.name || control.outerHTML.slice(0, 60)));
+        assert.deepEqual(locked, [], "every control is usable again after the ring-up");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U6 register controls have non-zero bounding boxes at 1440 and 400 widths, with no horizontal scroll",
+    async run({ browser }) {
+      for (const viewport of [{ width: 1440, height: 1000 }, { width: 400, height: 900 }]) {
+        const session = await openPage(browser, { allowConsole: apiConfig404, viewport });
+        const { page } = session;
+        try {
+          // A second bourbon bottle, so a split (add and remove) can be shown.
+          const bourbonType = await page.evaluate(() => window.__rnmb.state.types.find((type) => type.name === "House Bourbon").id);
+          await addStockViaForm(session, { typeId: bourbonType, nickname: "Backup bourbon" });
+          await startHostNightViaForm(session);
+          await page.click('.tab-button[data-tab="tonight"]');
+          await page.locator("#openRegisterLink").scrollIntoViewIfNeeded();
+          const link = await page.locator("#openRegisterLink").boundingBox();
+          assert.ok(link && link.width > 0 && link.height > 0, `#openRegisterLink has a box at ${viewport.width}px`);
+          await openRegister(session);
+          await openTabViaRegister(session, "Riley");
+          await registerItem(page, "Bourbon Neat").click();
+          await clickForToast(session, "#registerConfirm", "Bourbon Neat rung up to Riley.");
+          await registerItem(page, "Boilermaker").click();
+          await registerTab(page, "Riley").click();
+          await page.locator("#registerIngredients [data-ingredient-index='0'] [data-add-source]").click();
+          assert.equal(await page.locator("#registerIngredients [data-remove-source]").count(), 1);
+
+          const selectors = [
+            "#exitRegister",
+            "#registerLocalBanner",
+            "#registerTabForm [name='guestName']",
+            "#registerOpenTab",
+            "#registerClear",
+            "#registerConfirm",
+            "#registerHint"
+          ];
+          const groups = [
+            "#registerMenu [data-register-item]",
+            "#registerTabs [data-register-tab]",
+            "#registerCrew [data-register-crew]",
+            "#registerIngredients select[name='sourceBottle']",
+            "#registerIngredients input[name='sourceAmount']",
+            "#registerIngredients [data-add-source]",
+            "#registerIngredients [data-remove-source]",
+            "#registerIngredients [data-source-detail]",
+            "#registerTabList [data-tab-total]",
+            "#registerTabList [data-void-ring-up]"
+          ];
+          const checked = [];
+          const check = async (locator, label) => {
+            await locator.scrollIntoViewIfNeeded();
+            const box = await locator.boundingBox();
+            assert.ok(box && box.width > 0 && box.height > 0, `${label} has a non-zero box at ${viewport.width}px (got ${JSON.stringify(box)})`);
+            checked.push(label);
+          };
+          for (const selector of selectors) await check(page.locator(selector), selector);
+          for (const selector of groups) {
+            const count = await page.locator(selector).count();
+            assert.ok(count > 0, `${selector} is present`);
+            for (let index = 0; index < count; index += 1) await check(page.locator(selector).nth(index), `${selector} #${index}`);
+          }
+          assert.ok(checked.length >= 25, `checked ${checked.length} controls`);
+          const widths = await page.evaluate(() => ({ scroll: document.documentElement.scrollWidth, client: document.documentElement.clientWidth }));
+          assert.ok(widths.scroll <= widths.client, `no horizontal scroll at ${viewport.width}px (scrollWidth ${widths.scroll} > ${widths.client})`);
+          session.assertClean();
+        } finally {
+          await session.close();
+        }
       }
     }
   }

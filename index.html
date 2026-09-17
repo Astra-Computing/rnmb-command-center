@@ -138,8 +138,19 @@
                   Date
                   <input name="date" type="date" required>
                 </label>
+                <label>
+                  Kind
+                  <select name="kind">
+                    <option value="crew">Crew night</option>
+                    <option value="host">Host night (guests and bar register)</option>
+                  </select>
+                </label>
                 <button type="submit">Start Night</button>
               </form>
+              <div id="hostNightNotice" class="host-night-notice" hidden>
+                <span id="hostNightNoticeText">A host night is running.</span>
+                <a id="openRegisterLink" class="register-link" href="#register">Open register</a>
+              </div>
               <div class="field-block">
                 <label for="nightSelect">Active night</label>
                 <select id="nightSelect"></select>
@@ -436,6 +447,69 @@
         </section>
       </main>
     </div>
+
+    <!-- The bar register (KTD7): a full-screen view on #register, for one bartender. -->
+    <section id="register" class="register" aria-labelledby="registerTitle" hidden>
+      <header class="register-bar">
+        <div>
+          <p class="eyebrow">Bar Register</p>
+          <h2 id="registerTitle">Register</h2>
+          <small id="registerNightMeta"></small>
+        </div>
+        <a id="exitRegister" class="register-link" href="#">Exit register</a>
+      </header>
+
+      <p id="registerLocalBanner" class="register-banner" role="alert" hidden>This browser only: nothing rung up here is saved to the shared database, and no one else will see it.</p>
+
+      <div id="registerClosed" class="register-message" hidden>
+        <h3>The register is closed</h3>
+        <p id="registerClosedMessage">No host night is running. Start one from Tonight on the dashboard, then open the register.</p>
+        <a id="registerBack" class="register-link" href="#">Back to the dashboard</a>
+      </div>
+
+      <div id="registerNotSaving" class="register-message is-danger" hidden>
+        <h3>Not saving</h3>
+        <p id="registerNotSavingMessage"></p>
+        <button id="registerRetry" class="register-primary" type="button">Retry</button>
+      </div>
+
+      <div id="registerWork" class="register-grid" hidden>
+        <section class="panel register-panel register-menu-panel" aria-labelledby="registerMenuTitle">
+          <h3 id="registerMenuTitle">1. Drink</h3>
+          <div id="registerMenu" class="register-menu-grid"></div>
+        </section>
+
+        <section class="panel register-panel register-target-panel" aria-labelledby="registerTargetTitle">
+          <h3 id="registerTargetTitle">2. For</h3>
+          <span class="field-label">Guest tabs</span>
+          <div id="registerTabs" class="register-choice-grid"></div>
+          <form id="registerTabForm" class="register-tab-form" novalidate>
+            <label>
+              <span class="field-label">New tab</span>
+              <input name="guestName" autocomplete="off" placeholder="Guest name">
+            </label>
+            <button id="registerOpenTab" class="register-secondary" type="submit">Open tab</button>
+          </form>
+          <span class="field-label">Crew (no charge)</span>
+          <div id="registerCrew" class="register-choice-grid"></div>
+        </section>
+
+        <section class="panel register-panel register-pour-panel" aria-labelledby="registerPourTitle">
+          <h3 id="registerPourTitle">3. Pour from</h3>
+          <div id="registerIngredients" class="register-ingredients"></div>
+          <p id="registerHint" class="form-note" role="status"></p>
+          <div class="register-actions">
+            <button id="registerClear" class="register-secondary" type="button">Start over</button>
+            <button id="registerConfirm" class="register-primary" type="button" disabled>Ring up</button>
+          </div>
+        </section>
+
+        <section class="panel register-panel register-tabs-panel" aria-labelledby="registerOpenTabsTitle">
+          <h3 id="registerOpenTabsTitle">Open tabs</h3>
+          <div id="registerTabList" class="register-tab-list"></div>
+        </section>
+      </div>
+    </section>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script src="domain.js"></script>

@@ -47,6 +47,10 @@
  *                    sources[source], costCents|null, priceCents|null } (the price if rung up now)
  *   validateSources(ingredient, sources, bottles) -> { ok, errors[] }
  *   validateRingUpSources(menuItem, sourcesPerIngredient[[source]], bottles) -> { ok, errors[] }
+ *   flattenSources(sourcesPerIngredient[[source]]) -> [source] in recipe order (amounts numeric)
+ *   sourcesShortfall(ingredient, sources) -> amount still uncovered (0 when covered or over)
+ *   suggestExtraSource(ingredient, sources, bottles) -> source | null (next unused item, shortfall capped)
+ *   switchSource(ingredient, sources, index, bottleId, bottles) -> new sources (a lone source takes the recipe amount, capped)
  *   stockDeltasForRingUp(lines) -> [{ bottleId, delta (negative) }]
  *   stockDeltasForVoid(lines) -> [{ bottleId, delta (positive) }]
  *   applyStockDeltas(bottles, deltas) -> new bottles array (throws if out of range)
@@ -465,6 +469,59 @@ var RNMBDomain = (function () {
     return { ok: errors.length === 0, errors: errors };
   }
 
+  // ---------- register draft helpers (1.7.3, 1.7.7) ----------------------------
+
+  /** The register draft keeps sources per ingredient; a ring-up takes them as one list, in recipe order. */
+  function flattenSources(sourcesPerIngredient) {
+    var flat = [];
+    (sourcesPerIngredient || []).forEach(function (sources) {
+      (sources || []).forEach(function (source) {
+        flat.push({ bottleId: source.bottleId, amount: Number(source.amount) });
+      });
+    });
+    return flat;
+  }
+
+  /** How much of the recipe amount the sources leave uncovered: 0 when covered or over. Bad amounts count as nothing. */
+  function sourcesShortfall(ingredient, sources) {
+    var total = (sources || []).reduce(function (sum, source) {
+      var amount = Number(source && source.amount);
+      return Number.isFinite(amount) && amount > 0 ? sum + amount : sum;
+    }, 0);
+    var left = round6(Number(ingredient && ingredient.amount) - total);
+    return left > AMOUNT_EPSILON ? left : 0;
+  }
+
+  /**
+   * The source the register's "add a bottle" control offers: the first item of the
+   * ingredient's type, in preselection order, that the sources do not already use,
+   * with the shortfall or all it holds if that is less (0 when nothing is short).
+   * null when no other item of the type has stock. Never applied without a tap (KTD10).
+   */
+  function suggestExtraSource(ingredient, sources, bottles) {
+    var used = new Set((sources || []).map(function (source) { return source.bottleId; }));
+    var next = candidatesFor(bottles, ingredient.typeId).find(function (bottle) { return !used.has(bottle.id); });
+    if (!next) return null;
+    return { bottleId: next.id, amount: round6(Math.min(remainingOf(next), sourcesShortfall(ingredient, sources))) };
+  }
+
+  /**
+   * Point source `index` at another stock item; returns a new list. A lone source
+   * takes the recipe amount, capped at what the new item holds, so switching a short
+   * pick to a fuller bottle covers the drink; one of several keeps the amount typed.
+   */
+  function switchSource(ingredient, sources, index, bottleId, bottles) {
+    var list = (sources || []).map(function (source) { return { bottleId: source.bottleId, amount: source.amount }; });
+    if (!list[index]) return list;
+    var bottle = byId(bottles).get(bottleId);
+    list[index].bottleId = bottleId;
+    if (list.length === 1) {
+      var amount = Number(ingredient.amount);
+      list[index].amount = bottle ? round6(Math.min(amount, Math.max(0, remainingOf(bottle)))) : amount;
+    }
+    return list;
+  }
+
   // ---------- stock deltas (1.3.3) ---------------------------------------------
 
   function totalsByBottle(lines) {
@@ -792,6 +849,10 @@ var RNMBDomain = (function () {
     quoteMenuItem: quoteMenuItem,
     validateSources: validateSources,
     validateRingUpSources: validateRingUpSources,
+    flattenSources: flattenSources,
+    sourcesShortfall: sourcesShortfall,
+    suggestExtraSource: suggestExtraSource,
+    switchSource: switchSource,
     stockDeltasForRingUp: stockDeltasForRingUp,
     stockDeltasForVoid: stockDeltasForVoid,
     applyStockDeltas: applyStockDeltas,

@@ -77,6 +77,18 @@ const HOST_MODE_SQL_MESSAGE = "Host mode is not set up on the shared database ye
 const NOT_SAVING_MESSAGE = "This host night belongs to the shared database, and this browser is not connected to it, so nothing was saved. Reload the page to reconnect, then try again.";
 const SOLD_BOTTLE_MESSAGE = "Drinks have been sold from this stock item, so it cannot be deleted. Set its remaining level to empty instead.";
 
+// The bar register (KTD7): the order being built is this one object, never the
+// DOM, so every render rebuilds the register from it. See renderRegister().
+//   { id, menuItemId, target, sources }
+//   id       the ring-up id, made with the draft and reused on every resubmit (KTD14)
+//   target   { kind: "guest", tabId } | { kind: "crew", personId } | null
+//   sources  one list per recipe ingredient, in RNMBDomain.menuItemIngredients order: [{ bottleId, amount }]
+const REGISTER_HASH = "#register";
+const REGISTER_CLOSED_MESSAGE = "No host night is running. Start one from Tonight on the dashboard, then open the register.";
+let registerDraft = null;
+// True from the confirm tap until the ring-up call resolves; every draft control is disabled meanwhile.
+let registerPending = false;
+
 function normalizeState(input) {
   return RNMBDomain.normalizeState(input);
 }
@@ -1132,8 +1144,9 @@ async function commitSave(message, write) {
 const REFRESH_MS = 15000;
 let refreshTimer = null;
 
-/** Never redraw the form a user is mid-way through filling in. */
+/** Never redraw the form a user is mid-way through filling in, or swap state under a half-built register order. */
 function isUserBusy() {
+  if (registerDraftUnfinished()) return true;
   const el = document.activeElement;
   return Boolean(el) && ["INPUT", "SELECT", "TEXTAREA"].includes(el.tagName);
 }
@@ -1320,6 +1333,7 @@ function render() {
   renderMenu();
   renderLedger();
   renderCrew();
+  renderRegister();
 }
 
 function renderTopline() {
@@ -1843,6 +1857,379 @@ function renderMenu() {
   });
 }
 
+/*
+ * Bar register (3.7.1, 3.7.2, 1.7.3, 1.7.7, 2.7.4, 2.7.5, 4.7.6; KTD7, KTD9, KTD10,
+ * KTD14). A full-screen view on #register while a host night is open. Every render
+ * rebuilds it from `registerDraft`, so a save elsewhere or a background refresh
+ * cannot lose a half-built order, and isUserBusy() holds refreshes off meanwhile.
+ * Writes go through hostAction: the repository validates and applies.
+ */
+function isRegisterRoute() {
+  return location.hash === REGISTER_HASH;
+}
+
+/** The one open host night (the database allows at most one), or null. */
+function openHostNight() {
+  return state.nights.find((night) => night.kind === "host" && !night.endedAt) || null;
+}
+
+/** KTD9: in local mode, a host night this browser did not start belongs to the shared database. */
+function hostNightNotSaving(night) {
+  return Boolean(night) && syncMode !== "supabase" && night.startedLocally !== true;
+}
+
+function openTabsFor(night) {
+  return night ? state.guestTabs.filter((tab) => tab.nightId === night.id && tab.status === "open") : [];
+}
+
+/** Items still on a tab (voided ones are gone from it). Crew ring-ups never have a tab. */
+function tabItems(tabId) {
+  return state.ringUps.filter((ringUp) => ringUp.kind === "guest" && ringUp.tabId === tabId && !ringUp.voidedAt);
+}
+
+function registerDraftUnfinished() {
+  return Boolean(registerDraft && (registerDraft.menuItemId || registerDraft.target));
+}
+
+function ensureRegisterDraft() {
+  if (!registerDraft) registerDraft = { id: uid(), menuItemId: null, target: null, sources: [] };
+  return registerDraft;
+}
+
+function registerMenuItem() {
+  return registerDraft?.menuItemId ? state.menuItems.find((item) => item.id === registerDraft.menuItemId) || null : null;
+}
+
+/** "0.25 oz" rather than amountText's one decimal, for shortfalls where the hundredths matter. */
+function exactAmountText(type, amount) {
+  return isCounted(type) ? amountText(type, amount) : `${Math.round(Number(amount) * 100) / 100} oz`;
+}
+
+/** What the bartender needs to tell two bottles apart: nickname, buyer, what is left. */
+function registerSourceText(bottle) {
+  if (!bottle) return "Unknown stock item";
+  const type = typeById(bottle.typeId);
+  const buyer = personById(bottle.buyerId);
+  return `${bottle.nickname || type?.name || "Stock"} · ${buyer?.name || "no buyer"} · ${levelText(type, bottle.remaining, bottle.size)} left`;
+}
+
+/** Drop references a save or refresh has made stale: a removed menu item, a closed tab, a removed person. */
+function reconcileRegisterDraft(night) {
+  if (!registerDraft) return;
+  const item = registerMenuItem();
+  if (!item) {
+    registerDraft.menuItemId = null;
+    registerDraft.sources = [];
+  } else if (registerDraft.sources.length !== RNMBDomain.menuItemIngredients(item).length) {
+    // The recipe changed under the draft; start its sources over.
+    registerDraft.sources = RNMBDomain.preselectSources(item, state.bottles).map((pick) => pick.sources.map((source) => ({ ...source })));
+  }
+  const target = registerDraft.target;
+  if (target?.kind === "guest" && !openTabsFor(night).some((tab) => tab.id === target.tabId)) registerDraft.target = null;
+  if (target?.kind === "crew" && !personById(target.personId)) registerDraft.target = null;
+}
+
+/** Whether the draft can be rung up now: { ok, reason } or { ok, night, menuItem, target, priced }. */
+function registerDraftCheck() {
+  const night = openHostNight();
+  if (!night) return { ok: false, reason: REGISTER_CLOSED_MESSAGE };
+  if (hostNightNotSaving(night)) return { ok: false, reason: NOT_SAVING_MESSAGE };
+  const menuItem = registerMenuItem();
+  if (!menuItem) return { ok: false, reason: "Pick a drink." };
+  const ingredients = RNMBDomain.menuItemIngredients(menuItem);
+  const sources = registerDraft.sources;
+  const shortIndex = ingredients.findIndex((ingredient, index) => RNMBDomain.sourcesShortfall(ingredient, sources[index]) > 0);
+  if (shortIndex >= 0) {
+    const ingredient = ingredients[shortIndex];
+    const type = typeById(ingredient.typeId);
+    const shortfall = RNMBDomain.sourcesShortfall(ingredient, sources[shortIndex]);
+    return { ok: false, reason: `${type?.name || "An ingredient"} is short ${exactAmountText(type, shortfall)}. Add a bottle to make up the rest.` };
+  }
+  const validation = RNMBDomain.validateRingUpSources(menuItem, sources, state.bottles);
+  if (!validation.ok) return { ok: false, reason: validation.errors[0] };
+  const target = registerDraft.target;
+  if (!target) return { ok: false, reason: "Pick a guest tab or a crew member." };
+  let priced;
+  try {
+    priced = RNMBDomain.priceRingUp(RNMBDomain.flattenSources(sources), {
+      bottles: state.bottles,
+      types: state.types,
+      people: state.people,
+      markupPercent: state.markupPercent,
+      roundingIncrementCents: state.roundingIncrementCents,
+      kind: target.kind
+    });
+  } catch (error) {
+    return { ok: false, reason: error.message };
+  }
+  return { ok: true, night, menuItem, target, priced };
+}
+
+function renderRegister() {
+  const night = openHostNight();
+
+  // Tonight: the way in, while a host night runs.
+  document.querySelector("#hostNightNotice").hidden = !night;
+  if (night) document.querySelector("#hostNightNoticeText").textContent = `Host night running: ${night.name}.`;
+
+  const shown = isRegisterRoute();
+  document.body.classList.toggle("is-register", shown);
+  document.querySelector("#register").hidden = !shown;
+  if (!shown) return;
+
+  const notSaving = hostNightNotSaving(night);
+  // 4.7.6: unmistakable, at every register state, whenever nothing is shared.
+  document.querySelector("#registerLocalBanner").hidden = syncMode === "supabase";
+  document.querySelector("#registerNightMeta").textContent = night ? `${night.name} · ${night.date}` : "No host night running";
+  document.querySelector("#registerClosed").hidden = Boolean(night);
+  document.querySelector("#registerClosedMessage").textContent = hostModeAvailable ? REGISTER_CLOSED_MESSAGE : HOST_MODE_SQL_MESSAGE;
+  document.querySelector("#registerNotSaving").hidden = !notSaving;
+  document.querySelector("#registerNotSavingMessage").textContent = notSaving ? NOT_SAVING_MESSAGE : "";
+  const work = document.querySelector("#registerWork");
+  work.hidden = !night || notSaving;
+  if (!night || notSaving) {
+    document.querySelector("#registerConfirm").disabled = true;
+    return;
+  }
+
+  // The static controls are not rebuilt below, so unlock them explicitly once a ring-up resolves.
+  work.querySelectorAll("#registerTabForm input, #registerOpenTab, #registerClear").forEach((control) => {
+    control.disabled = registerPending;
+  });
+  reconcileRegisterDraft(night);
+  renderRegisterMenu();
+  renderRegisterTargets(night);
+  renderRegisterIngredients();
+  renderRegisterTabList(night);
+  updateRegisterSummary();
+  if (registerPending) {
+    work.querySelectorAll("button, input, select").forEach((control) => {
+      control.disabled = true;
+    });
+  }
+}
+
+function renderRegisterMenu() {
+  const target = document.querySelector("#registerMenu");
+  target.innerHTML = "";
+  if (!state.menuItems.length) {
+    target.innerHTML = `<p class="empty-state">No menu items yet. Add them in the Menu tab.</p>`;
+    return;
+  }
+  state.menuItems.forEach((item) => {
+    const quote = menuItemQuote(item);
+    const available = Boolean(quote?.available);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "register-choice";
+    button.dataset.registerItem = item.id;
+    button.setAttribute("aria-pressed", String(registerDraft?.menuItemId === item.id));
+    button.disabled = !available;
+    button.innerHTML = `<strong>${escapeHtml(item.name)}</strong><span data-register-price>${available ? money(quote.priceCents / 100) : "Unavailable"}</span>`;
+    target.append(button);
+  });
+}
+
+function renderRegisterTargets(night) {
+  const tabsTarget = document.querySelector("#registerTabs");
+  const tabs = openTabsFor(night);
+  tabsTarget.innerHTML = tabs.length ? "" : `<p class="empty-state">No open tabs. Open one by name below.</p>`;
+  tabs.forEach((tab) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "register-choice";
+    button.dataset.registerTab = tab.id;
+    button.setAttribute("aria-pressed", String(registerDraft?.target?.kind === "guest" && registerDraft.target.tabId === tab.id));
+    button.innerHTML = `<strong>${escapeHtml(tab.guestName)}</strong><span>${money(RNMBDomain.tabTotalCents(tab.id, state.ringUps) / 100)}</span>`;
+    tabsTarget.append(button);
+  });
+
+  const crewTarget = document.querySelector("#registerCrew");
+  crewTarget.innerHTML = state.people.length ? "" : `<p class="empty-state">No crew on the roster.</p>`;
+  state.people.forEach((person) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "register-choice register-crew";
+    button.dataset.registerCrew = person.id;
+    button.setAttribute("aria-pressed", String(registerDraft?.target?.kind === "crew" && registerDraft.target.personId === person.id));
+    button.style.setProperty("--person-color", safeColor(person.color));
+    button.innerHTML = `<strong>${escapeHtml(person.name)}</strong><span>Crew · no charge</span>`;
+    crewTarget.append(button);
+  });
+}
+
+function renderRegisterIngredients() {
+  const container = document.querySelector("#registerIngredients");
+  container.innerHTML = "";
+  const menuItem = registerMenuItem();
+  if (!menuItem) {
+    container.innerHTML = `<p class="empty-state">Pick a drink to see which bottles it pours from.</p>`;
+    return;
+  }
+  RNMBDomain.menuItemIngredients(menuItem).forEach((ingredient, index) => {
+    const type = typeById(ingredient.typeId);
+    const counted = isCounted(type);
+    const sources = registerDraft.sources[index] || [];
+    const stocked = state.bottles.filter((bottle) => bottle.typeId === ingredient.typeId && Number(bottle.remaining) > RNMBDomain.AMOUNT_EPSILON);
+    const rows = sources.map((source, sourceIndex) => {
+      const bottle = bottleById(source.bottleId);
+      // Keep the chosen item listed even if it has since run dry, so the select shows the truth.
+      const choices = bottle && !stocked.includes(bottle) ? [bottle, ...stocked] : stocked;
+      const options = choices.map((choice) => (
+        `<option value="${escapeHtml(choice.id)}"${choice.id === source.bottleId ? " selected" : ""}>${escapeHtml(registerSourceText(choice))}</option>`
+      )).join("");
+      const amount = Number(source.amount);
+      const refs = `data-ingredient="${index}" data-source="${sourceIndex}"`;
+      return `
+        <div class="register-source" ${refs}>
+          <label>
+            <span class="field-label">Bottle</span>
+            <select name="sourceBottle" ${refs}>${options}</select>
+          </label>
+          <label>
+            <span class="field-label">${counted ? "Units" : "Oz"}</span>
+            <input name="sourceAmount" type="number" inputmode="decimal" min="${counted ? "1" : "0.01"}" step="${counted ? "1" : "0.01"}" value="${Number.isFinite(amount) ? escapeHtml(String(amount)) : ""}" ${refs}>
+          </label>
+          ${sourceIndex > 0 ? `<button class="register-secondary register-remove" type="button" data-remove-source ${refs} aria-label="Remove this bottle">Remove</button>` : ""}
+          <small class="register-source-detail" data-source-detail>${escapeHtml(bottle ? `${type?.name || "Stock"}: ${registerSourceText(bottle)}` : "Unknown stock item")}</small>
+        </div>`;
+    }).join("");
+    const extra = RNMBDomain.suggestExtraSource(ingredient, sources, state.bottles);
+    const block = document.createElement("div");
+    block.className = "register-ingredient";
+    block.dataset.ingredientIndex = String(index);
+    block.innerHTML = `
+      <div class="register-ingredient-head">
+        <strong>${escapeHtml(type?.name || "Unknown type")}</strong>
+        <span>${amountText(type, ingredient.amount)}</span>
+        <span class="pill hot" data-short-marker hidden></span>
+      </div>
+      ${rows}
+      <button class="register-secondary register-add-source" type="button" data-add-source data-ingredient="${index}"${extra ? "" : " disabled"}>Add a bottle</button>
+      <small class="register-error" data-ingredient-error></small>
+    `;
+    container.append(block);
+  });
+}
+
+/** Short markers, per-ingredient errors and the confirm button; cheap enough to run on every keystroke. */
+function updateRegisterSummary() {
+  const menuItem = registerMenuItem();
+  if (menuItem) {
+    RNMBDomain.menuItemIngredients(menuItem).forEach((ingredient, index) => {
+      const block = document.querySelector(`#registerIngredients [data-ingredient-index="${index}"]`);
+      if (!block) return;
+      const type = typeById(ingredient.typeId);
+      const sources = registerDraft.sources[index] || [];
+      const shortfall = RNMBDomain.sourcesShortfall(ingredient, sources);
+      const marker = block.querySelector("[data-short-marker]");
+      marker.hidden = shortfall <= 0;
+      marker.textContent = shortfall > 0 ? `Short ${exactAmountText(type, shortfall)}` : "";
+      block.classList.toggle("is-short", shortfall > 0);
+      const errors = shortfall > 0 ? [] : RNMBDomain.validateSources(ingredient, sources, state.bottles).errors;
+      block.querySelector("[data-ingredient-error]").textContent = errors[0] || "";
+    });
+  }
+
+  const check = registerDraftCheck();
+  const confirmButton = document.querySelector("#registerConfirm");
+  confirmButton.disabled = registerPending || !check.ok;
+  let label = "Ring up";
+  if (registerPending) {
+    label = "Ringing up…";
+  } else if (check.ok && check.target.kind === "guest") {
+    const tab = state.guestTabs.find((entry) => entry.id === check.target.tabId);
+    label = `Ring up ${money(check.priced.priceCents / 100)} to ${tab?.guestName || "the tab"}`;
+  } else if (check.ok) {
+    label = `Pour for ${personById(check.target.personId)?.name || "crew"} · no charge`;
+  }
+  confirmButton.textContent = label;
+  document.querySelector("#registerHint").textContent = registerPending ? "Saving…" : check.ok ? "" : check.reason;
+}
+
+function renderRegisterTabList(night) {
+  const list = document.querySelector("#registerTabList");
+  const tabs = openTabsFor(night);
+  list.innerHTML = tabs.length ? "" : `<p class="empty-state">No open tabs.</p>`;
+  tabs.forEach((tab) => {
+    const items = tabItems(tab.id);
+    const card = document.createElement("article");
+    card.className = "register-tab-card";
+    card.dataset.tabId = tab.id;
+    const lines = items.map((item) => `
+      <li data-ring-up-id="${escapeHtml(item.id)}">
+        <span>${escapeHtml(item.menuItemName || "Drink")}</span>
+        <span>${money((Number(item.priceCents) || 0) / 100)}</span>
+        <button class="register-secondary register-void" type="button" data-void-ring-up="${escapeHtml(item.id)}" aria-label="Void ${escapeHtml(item.menuItemName || "this drink")}">Void</button>
+      </li>`).join("");
+    card.innerHTML = `
+      <header>
+        <strong>${escapeHtml(tab.guestName)}</strong>
+        <span class="pill price-pill" data-tab-total>${money(RNMBDomain.tabTotalCents(tab.id, state.ringUps) / 100)}</span>
+      </header>
+      ${items.length ? `<ul class="register-tab-items">${lines}</ul>` : "<small>No drinks yet.</small>"}
+    `;
+    list.append(card);
+  });
+}
+
+/** Ring up the draft once (KTD14): every draft control is disabled until the call resolves, and the id is the draft's. */
+async function confirmRegisterRingUp() {
+  if (registerPending) return;
+  const check = registerDraftCheck();
+  if (!check.ok) {
+    showToast(check.reason);
+    return;
+  }
+  const draft = registerDraft;
+  const { night, menuItem, target } = check;
+  const message = target.kind === "guest"
+    ? `${menuItem.name} rung up to ${state.guestTabs.find((tab) => tab.id === target.tabId)?.guestName || "the tab"}.`
+    : `${menuItem.name} poured for ${personById(target.personId)?.name || "crew"}. No charge.`;
+  registerPending = true;
+  renderRegister();
+  let saved = false;
+  try {
+    saved = await hostAction(message, (db) => db.ringUp(buildRingUp({
+      id: draft.id,
+      nightId: night.id,
+      kind: target.kind,
+      tabId: target.tabId,
+      personId: target.personId,
+      menuItemId: menuItem.id,
+      sources: RNMBDomain.flattenSources(draft.sources)
+    })));
+  } finally {
+    registerPending = false;
+  }
+  // Success starts a fresh draft (a new id next time); a failure keeps this one to fix and resubmit.
+  if (saved && registerDraft === draft) registerDraft = null;
+  renderRegister();
+}
+
+/** KTD9: starting a host night in local mode names the scope first. */
+async function startHostNightFromForm(form, name, date) {
+  if (!name) {
+    showToast("A host night needs a name.");
+    return;
+  }
+  if (!hostModeAvailable) {
+    showToast(HOST_MODE_SQL_MESSAGE);
+    return;
+  }
+  if (syncMode !== "supabase" && !confirm(`Start "${name}" as a host night in THIS BROWSER ONLY?
+
+This dashboard is not connected to the shared database. Tabs, drinks and stock changes rung up on the register are saved only in this browser, and no other device will see them.`)) {
+    showToast("Host night not started.");
+    return;
+  }
+  const started = await hostAction("Host night started. Open the register to ring up drinks.", (db) => db.startHostNight({ id: uid(), name, date: date || today() }));
+  if (started) {
+    form.reset();
+    form.date.value = today();
+  }
+}
+
 function renderLedger() {
   const ledger = document.querySelector("#ledgerList");
   const settle = document.querySelector("#settleList");
@@ -2051,6 +2438,10 @@ document.querySelector("#bottleForm").addEventListener("submit", async (event) =
 document.querySelector("#nightForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const data = new FormData(event.currentTarget);
+  if (data.get("kind") === "host") {
+    await startHostNightFromForm(event.currentTarget, data.get("name").trim(), data.get("date"));
+    return;
+  }
   const night = { id: uid(), name: data.get("name").trim(), date: data.get("date"), kind: "crew", endedAt: null, pours: [] };
   state.nights.push(night);
   state.activeNightId = night.id;
@@ -2282,6 +2673,134 @@ document.querySelector("#menuList").addEventListener("click", async (event) => {
 
 resetMenuItemForm();
 
+// ---- Bar register ----
+window.addEventListener("hashchange", () => {
+  // Leaving the register drops an unfinished order, so the dashboard's refresh is not held off by it.
+  if (!isRegisterRoute() && !registerPending) registerDraft = null;
+  renderRegister();
+  window.scrollTo(0, 0);
+});
+
+document.querySelector("#register").addEventListener("click", async (event) => {
+  const control = event.target.closest("button");
+  if (!control || control.disabled) return;
+  if (control.id === "registerRetry") {
+    location.reload();
+    return;
+  }
+  if (control.id === "registerConfirm") {
+    await confirmRegisterRingUp();
+    return;
+  }
+  if (registerPending) return;
+
+  if (control.id === "registerClear") {
+    registerDraft = null;
+    renderRegister();
+    return;
+  }
+
+  if (control.dataset.registerItem) {
+    const item = state.menuItems.find((entry) => entry.id === control.dataset.registerItem);
+    if (!item) return;
+    // KTD10: start from the preselected sources; the chosen target stays.
+    const draft = ensureRegisterDraft();
+    draft.menuItemId = item.id;
+    draft.sources = RNMBDomain.preselectSources(item, state.bottles).map((pick) => pick.sources.map((source) => ({ ...source })));
+    renderRegister();
+    return;
+  }
+  if (control.dataset.registerTab) {
+    ensureRegisterDraft().target = { kind: "guest", tabId: control.dataset.registerTab };
+    renderRegister();
+    return;
+  }
+  if (control.dataset.registerCrew) {
+    ensureRegisterDraft().target = { kind: "crew", personId: control.dataset.registerCrew };
+    renderRegister();
+    return;
+  }
+
+  const item = registerMenuItem();
+  const index = Number(control.dataset.ingredient);
+  const ingredient = item ? RNMBDomain.menuItemIngredients(item)[index] : null;
+  if (ingredient && control.hasAttribute("data-add-source")) {
+    const sources = registerDraft.sources[index] || [];
+    const extra = RNMBDomain.suggestExtraSource(ingredient, sources, state.bottles);
+    if (!extra) {
+      showToast(`No other ${typeById(ingredient.typeId)?.name || "stock"} has any left.`);
+      return;
+    }
+    registerDraft.sources[index] = [...sources, extra];
+    renderRegister();
+    return;
+  }
+  if (ingredient && control.hasAttribute("data-remove-source")) {
+    registerDraft.sources[index] = (registerDraft.sources[index] || []).filter((_, sourceIndex) => sourceIndex !== Number(control.dataset.source));
+    renderRegister();
+    return;
+  }
+
+  const ringUpId = control.dataset.voidRingUp;
+  if (ringUpId) {
+    const ringUp = state.ringUps.find((entry) => entry.id === ringUpId);
+    const tab = state.guestTabs.find((entry) => entry.id === ringUp?.tabId);
+    if (!ringUp || !tab) return;
+    if (!confirm(`Void ${ringUp.menuItemName || "this drink"} (${money((Number(ringUp.priceCents) || 0) / 100)}) from ${tab.guestName}'s tab? What it poured goes back into stock.`)) return;
+    await hostAction("Item voided and its stock restored.", (db) => db.voidRingUp(ringUp.id));
+  }
+});
+
+document.querySelector("#register").addEventListener("change", (event) => {
+  if (registerPending || !event.target.matches("select[name='sourceBottle']")) return;
+  const item = registerMenuItem();
+  const index = Number(event.target.dataset.ingredient);
+  const ingredient = item ? RNMBDomain.menuItemIngredients(item)[index] : null;
+  if (!ingredient) return;
+  registerDraft.sources[index] = RNMBDomain.switchSource(
+    ingredient,
+    registerDraft.sources[index] || [],
+    Number(event.target.dataset.source),
+    event.target.value,
+    state.bottles
+  );
+  renderRegister();
+});
+
+// Typing an amount updates the draft and the summary only, so the field keeps focus.
+document.querySelector("#register").addEventListener("input", (event) => {
+  if (registerPending || !event.target.matches("input[name='sourceAmount']") || !registerDraft) return;
+  const source = registerDraft.sources[Number(event.target.dataset.ingredient)]?.[Number(event.target.dataset.source)];
+  if (!source) return;
+  source.amount = event.target.value.trim() === "" ? Number.NaN : Number(event.target.value);
+  updateRegisterSummary();
+});
+
+document.querySelector("#registerTabForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (registerPending) return;
+  const night = openHostNight();
+  if (!night || hostNightNotSaving(night)) {
+    showToast(night ? NOT_SAVING_MESSAGE : REGISTER_CLOSED_MESSAGE);
+    return;
+  }
+  const input = event.currentTarget.querySelector("[name='guestName']");
+  const guestName = input.value.trim();
+  if (!guestName) {
+    showToast("Type the guest's name to open a tab.");
+    return;
+  }
+  const tabId = uid();
+  const opened = await hostAction(`Tab opened for ${guestName}.`, (db) => db.openTab({ id: tabId, nightId: night.id, guestName }));
+  if (!opened) return;
+  input.value = "";
+  // The new tab is who the next drink is for.
+  if (state.guestTabs.some((tab) => tab.id === tabId && tab.status === "open")) {
+    ensureRegisterDraft().target = { kind: "guest", tabId };
+  }
+  renderRegister();
+});
+
 function bottleHasSales(bottleId) {
   return state.ringUps.some((ringUp) => ringUp.lines.some((line) => line.bottleId === bottleId));
 }
@@ -2380,9 +2899,12 @@ window.__rnmb = Object.freeze({
   get repository() { return repository; },
   get syncMode() { return syncMode; },
   get hostModeAvailable() { return hostModeAvailable; },
+  get registerDraft() { return registerDraft; },
   archiveData,
   buildRingUp,
-  hostAction
+  hostAction,
+  isUserBusy,
+  render
 });
 
 init();
