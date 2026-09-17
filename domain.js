@@ -57,6 +57,8 @@
  *   tabTotalCents(tabId, ringUps) -> integer cents of unvoided guest items
  *   summarizeHostNight({ tabs, ringUps }) -> { collectors[{ collectorId, collectorName, totalCents,
  *               byBuyer[{ buyerId, buyerName, cents }] }], writtenOff{ totalCents, byBuyer[] }, openTabCount }
+ *   crewConsumption(ringUps, types, nightId?) -> { ounces, standardDrinks, count, byPerson[{ personId, personName,
+ *               ounces, standardDrinks, count }] } over unvoided crew ring-ups (guest ring-ups never count)
  *   normalizeNight / normalizeMenuItem / normalizeTab / normalizeRingUp / normalizeAdjustment(record)
  *               -> the record with every field present in a fixed order (nulls, numbers, defaults)
  *   normalizeState(input) -> full browser state: people, types, bottles, nights (kind, endedAt, pours,
@@ -635,6 +637,37 @@ var RNMBDomain = (function () {
     };
   }
 
+  // ---------- crew consumption from the register (0.4.1, KTD4) -----------------
+
+  /**
+   * A crew ring-up is a crew pour: every unvoided one counts toward that person's
+   * consumption, measured through linesConsumption. Guest ring-ups never count.
+   * nightId limits it to one night; leave it out to count every night. A person
+   * removed since keeps their share under the name snapshot (null personId).
+   */
+  function crewConsumption(ringUps, types, nightId) {
+    var result = { ounces: 0, standardDrinks: 0, count: 0, byPerson: [] };
+    var index = new Map();
+    (ringUps || []).forEach(function (ringUp) {
+      if (!ringUp || ringUp.kind !== "crew" || ringUp.voidedAt) return;
+      if (nightId !== undefined && nightId !== null && ringUp.nightId !== nightId) return;
+      var measured = linesConsumption(ringUp.lines, types);
+      var key = ringUp.personId ? "id:" + ringUp.personId : "name:" + (ringUp.personName || "");
+      var entry = index.get(key);
+      if (!entry) {
+        entry = { personId: ringUp.personId || null, personName: ringUp.personName || "", ounces: 0, standardDrinks: 0, count: 0 };
+        index.set(key, entry);
+        result.byPerson.push(entry);
+      }
+      [entry, result].forEach(function (total) {
+        total.ounces += measured.ounces;
+        total.standardDrinks += measured.standardDrinks;
+        total.count += 1;
+      });
+    });
+    return result;
+  }
+
   // ---------- whole-state normalizer (archives, localStorage, database loads) ---
 
   var MENU_KINDS = ["cocktail", "straight", "counted"];
@@ -858,6 +891,7 @@ var RNMBDomain = (function () {
     applyStockDeltas: applyStockDeltas,
     tabTotalCents: tabTotalCents,
     summarizeHostNight: summarizeHostNight,
+    crewConsumption: crewConsumption,
     normalizeNight: normalizeNight,
     normalizeMenuItem: normalizeMenuItem,
     normalizeTab: normalizeTab,

@@ -839,6 +839,97 @@ body.is-register .app-shell {
   align-items: center;
 }
 
+.register-tabs-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+/* Close-out on an open tab: who collected, then Paid or Write off. */
+.register-close {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: end;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.register-close label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+/* Ledger: host nights, kept visibly apart from Settle Up. */
+.host-nights-note {
+  margin: -6px 0 14px;
+}
+
+.host-night-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr));
+  gap: 12px;
+}
+
+.host-night-card {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--blue);
+  border-radius: 8px;
+  background: #11161b;
+  overflow-wrap: anywhere;
+}
+
+.host-night-card header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.host-night-card header small {
+  display: block;
+  color: var(--muted);
+}
+
+.host-night-section,
+.host-night-group {
+  display: grid;
+  gap: 6px;
+}
+
+.host-night-section small {
+  color: var(--muted);
+}
+
+.host-night-row,
+.host-night-buyers li {
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.host-night-buyers {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0 0 0 12px;
+  border-left: 2px solid var(--line);
+  color: var(--muted);
+  list-style: none;
+}
+
+.host-night-buyers strong {
+  color: var(--text);
+}
+
 .progress {
   overflow: hidden;
   height: 12px;
@@ -1044,6 +1135,14 @@ body.is-register .app-shell {
   }
 
   .register-source .register-remove {
+    grid-column: 1 / -1;
+  }
+
+  .register-close {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .register-close label {
     grid-column: 1 / -1;
   }
 }

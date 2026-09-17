@@ -88,6 +88,8 @@ const REGISTER_CLOSED_MESSAGE = "No host night is running. Start one from Tonigh
 let registerDraft = null;
 // True from the confirm tap until the ring-up call resolves; every draft control is disabled meanwhile.
 let registerPending = false;
+// Close-out: the collector picked on each open tab card (tab id -> person id), kept across re-renders.
+const registerCollectors = new Map();
 
 function normalizeState(input) {
   return RNMBDomain.normalizeState(input);
@@ -1276,7 +1278,32 @@ function activeNightTotals() {
     allOunces += measured.ounces;
   });
 
+  // 0.4.1, KTD4: a crew drink rung up on the register is a crew pour. A person
+  // removed since still counts toward the night's total, under nobody's card.
+  const crew = crewConsumptionOn(night);
+  crew.byPerson.forEach((entry) => {
+    if (!entry.personId) return;
+    const current = totals.get(entry.personId) || { ounces: 0, drinks: 0 };
+    current.ounces += entry.ounces;
+    current.drinks += entry.standardDrinks;
+    totals.set(entry.personId, current);
+  });
+  allDrinks += crew.standardDrinks;
+  allOunces += crew.ounces;
+
   return { byPerson: totals, allDrinks, allOunces };
+}
+
+/** Unvoided crew ring-ups on one night, measured (0.4.1). Guest ring-ups never count. */
+function crewConsumptionOn(night) {
+  return night
+    ? RNMBDomain.crewConsumption(state.ringUps, state.types, night.id)
+    : RNMBDomain.crewConsumption([], state.types);
+}
+
+/** Pours logged on a night: dashboard pours plus crew drinks rung up on the register. */
+function nightPourCount(night) {
+  return night ? (night.pours || []).length + crewConsumptionOn(night).count : 0;
 }
 
 function spendByPerson() {
@@ -1332,6 +1359,7 @@ function render() {
   renderInventory();
   renderMenu();
   renderLedger();
+  renderHostNights();
   renderCrew();
   renderRegister();
 }
@@ -1339,7 +1367,7 @@ function render() {
 function renderTopline() {
   const night = activeNight();
   document.querySelector("#activeNightName").textContent = night?.name || "No active night";
-  document.querySelector("#activeNightMeta").textContent = night ? `${night.date} · ${night.pours.length} pours logged` : "Create a night log to start tracking pours.";
+  document.querySelector("#activeNightMeta").textContent = night ? `${night.date} · ${nightPourCount(night)} pours logged` : "Create a night log to start tracking pours.";
   document.querySelector("#responsibleMode").checked = state.responsibleMode;
   const syncStatus = document.querySelector("#syncStatus");
   if (syncMode === "supabase") {
@@ -1515,7 +1543,7 @@ function renderRecentNights() {
   }
 
   nights.forEach((night) => {
-    const drinks = night.pours.reduce((sum, pour) => sum + measurePour(pour).standardDrinks, 0);
+    const drinks = night.pours.reduce((sum, pour) => sum + measurePour(pour).standardDrinks, 0) + crewConsumptionOn(night).standardDrinks;
     const item = document.createElement("button");
     item.type = "button";
     item.className = "stack-item";
@@ -1535,9 +1563,10 @@ function renderTonight() {
   const night = activeNight();
   const totals = activeNightTotals();
 
+  const anyPours = nightPourCount(night) > 0;
   target.innerHTML = "";
-  target.classList.toggle("empty-state", state.people.length === 0 || !night?.pours?.length);
-  if (!state.people.length || !night?.pours?.length) {
+  target.classList.toggle("empty-state", state.people.length === 0 || !anyPours);
+  if (!state.people.length || !anyPours) {
     target.textContent = "No pours logged for the active night.";
   } else {
     state.people.forEach((person) => {
@@ -1559,8 +1588,12 @@ function renderTonight() {
 
   timeline.innerHTML = "";
   const pours = [...(night?.pours || [])].reverse().slice(0, 12);
-  timeline.classList.toggle("empty-state", pours.length === 0);
-  if (!pours.length) {
+  // Crew drinks rung up on the register, newest first. They are voided on the register, not removed here.
+  const registerDrinks = night
+    ? state.ringUps.filter((ringUp) => ringUp.kind === "crew" && ringUp.nightId === night.id && !ringUp.voidedAt).reverse().slice(0, 12)
+    : [];
+  timeline.classList.toggle("empty-state", pours.length === 0 && registerDrinks.length === 0);
+  if (!pours.length && !registerDrinks.length) {
     timeline.textContent = "The logbook is still clean.";
     return;
   }
@@ -1577,6 +1610,20 @@ function renderTonight() {
         <small>${escapeHtml(type?.name || "Unknown")} · ${oneDecimal(measurePour(pour).standardDrinks)} standard drinks</small>
       </div>
       <button class="remove-button" type="button" data-remove-pour="${pour.id}" aria-label="Remove pour">×</button>
+    `;
+    timeline.append(item);
+  });
+
+  registerDrinks.forEach((ringUp) => {
+    const person = personById(ringUp.personId);
+    const item = document.createElement("div");
+    item.className = "timeline-item";
+    item.dataset.registerDrink = ringUp.id;
+    item.innerHTML = `
+      <div>
+        <strong>${escapeHtml(person?.name || ringUp.personName || "Unknown")} had ${escapeHtml(ringUp.menuItemName || "a drink")}</strong>
+        <small>Bar register · ${oneDecimal(RNMBDomain.linesConsumption(ringUp.lines, state.types).standardDrinks)} standard drinks</small>
+      </div>
     `;
     timeline.append(item);
   });
@@ -1993,10 +2040,15 @@ function renderRegister() {
   }
 
   // The static controls are not rebuilt below, so unlock them explicitly once a ring-up resolves.
-  work.querySelectorAll("#registerTabForm input, #registerOpenTab, #registerClear").forEach((control) => {
+  work.querySelectorAll("#registerTabForm input, #registerOpenTab, #registerClear, #registerEndNight").forEach((control) => {
     control.disabled = registerPending;
   });
   reconcileRegisterDraft(night);
+  // Forget collectors picked for tabs that have since closed (here or on another device).
+  const openIds = new Set(openTabsFor(night).map((tab) => tab.id));
+  Array.from(registerCollectors.keys()).forEach((tabId) => {
+    if (!openIds.has(tabId)) registerCollectors.delete(tabId);
+  });
   renderRegisterMenu();
   renderRegisterTargets(night);
   renderRegisterIngredients();
@@ -2162,15 +2214,82 @@ function renderRegisterTabList(night) {
         <span>${money((Number(item.priceCents) || 0) / 100)}</span>
         <button class="register-secondary register-void" type="button" data-void-ring-up="${escapeHtml(item.id)}" aria-label="Void ${escapeHtml(item.menuItemName || "this drink")}">Void</button>
       </li>`).join("");
+    const total = money(RNMBDomain.tabTotalCents(tab.id, state.ringUps) / 100);
+    // The chosen collector survives a re-render (a save elsewhere, a refresh) until the tab closes.
+    const chosen = personById(registerCollectors.get(tab.id)) ? registerCollectors.get(tab.id) : "";
+    const collectors = state.people.map((person) => (
+      `<option value="${escapeHtml(person.id)}"${person.id === chosen ? " selected" : ""}>${escapeHtml(person.name)}</option>`
+    )).join("");
     card.innerHTML = `
       <header>
         <strong>${escapeHtml(tab.guestName)}</strong>
-        <span class="pill price-pill" data-tab-total>${money(RNMBDomain.tabTotalCents(tab.id, state.ringUps) / 100)}</span>
+        <span class="pill price-pill" data-tab-total>${total}</span>
       </header>
       ${items.length ? `<ul class="register-tab-items">${lines}</ul>` : "<small>No drinks yet.</small>"}
+      <div class="register-close">
+        <label>
+          <span class="field-label">Collected by</span>
+          <select name="collectorId" data-collector-for="${escapeHtml(tab.id)}">
+            <option value=""${chosen ? "" : " selected"}>Pick a crew member</option>
+            ${collectors}
+          </select>
+        </label>
+        <button class="register-primary register-pay" type="button" data-pay-tab="${escapeHtml(tab.id)}">Paid ${total}</button>
+        <button class="register-secondary register-write-off" type="button" data-write-off-tab="${escapeHtml(tab.id)}">Write off</button>
+      </div>
     `;
     list.append(card);
   });
+}
+
+/** 2.8.3: close a tab as paid (the amount is the tab total, KTD assumption) by the chosen collector, after a confirm. */
+async function payRegisterTab(tabId) {
+  const tab = state.guestTabs.find((entry) => entry.id === tabId && entry.status === "open");
+  if (!tab) return;
+  const collector = personById(registerCollectors.get(tabId));
+  if (!collector) {
+    showToast(`Pick who collected the money for ${tab.guestName}'s tab.`);
+    return;
+  }
+  const amountCents = RNMBDomain.tabTotalCents(tab.id, state.ringUps);
+  const amount = money(amountCents / 100);
+  if (!confirm(`Close ${tab.guestName}'s tab as paid: ${amount} collected by ${collector.name}?`)) return;
+  const closed = await hostAction(
+    `${tab.guestName}'s tab paid: ${amount} collected by ${collector.name}.`,
+    (db) => db.closeTab({ id: tab.id, status: "paid", collectorId: collector.id, amountCents })
+  );
+  if (closed) registerCollectors.delete(tabId);
+}
+
+/** 2.8.3: write a tab off, after a confirm. Its drinks stay on record, valued against their buyers. */
+async function writeOffRegisterTab(tabId) {
+  const tab = state.guestTabs.find((entry) => entry.id === tabId && entry.status === "open");
+  if (!tab) return;
+  const amount = money(RNMBDomain.tabTotalCents(tab.id, state.ringUps) / 100);
+  if (!confirm(`Write off ${tab.guestName}'s tab (${amount})? Nobody collects it, and it cannot be reopened.`)) return;
+  const closed = await hostAction(`${tab.guestName}'s tab written off.`, (db) => db.closeTab({ id: tab.id, status: "written_off" }));
+  if (closed) registerCollectors.delete(tabId);
+}
+
+/** 2.8.4: a host night ends only once every tab is closed; the refusal names the guests still open. */
+async function endRegisterNight() {
+  const night = openHostNight();
+  if (!night || hostNightNotSaving(night)) {
+    showToast(night ? NOT_SAVING_MESSAGE : REGISTER_CLOSED_MESSAGE);
+    return;
+  }
+  const open = openTabsFor(night);
+  if (open.length) {
+    showToast(`Close every tab before ending the night. Still open: ${open.map((tab) => tab.guestName).join(", ")}.`);
+    return;
+  }
+  if (!confirm(`End "${night.name}"? The register closes and nothing more can be rung up or voided on this night.`)) return;
+  const ended = await hostAction(`${night.name} ended. Its summary is under Host nights in Ledger.`, (db) => db.endHostNight(night.id));
+  if (ended) {
+    registerDraft = null;
+    registerCollectors.clear();
+    renderRegister();
+  }
 }
 
 /** Ring up the draft once (KTD14): every draft control is disabled until the call resolves, and the id is the draft's. */
@@ -2282,6 +2401,85 @@ function renderLedger() {
   }
 }
 
+/*
+ * Host nights in Ledger (2.8.5, 2.8.6, 0.5.1): per host night, running or ended,
+ * who holds the money guests paid and whose stock it belongs to (margin included),
+ * and the value written off per buyer. Separate from Settle Up, which it never touches.
+ */
+function renderHostNights() {
+  const target = document.querySelector("#hostNightList");
+  const nights = state.nights
+    .filter((night) => night.kind === "host")
+    // Newest first: by date, then a running night before ended ones, then the latest ending.
+    .sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")) ||
+      Number(Boolean(a.endedAt)) - Number(Boolean(b.endedAt)) ||
+      String(b.endedAt || "").localeCompare(String(a.endedAt || "")));
+  target.innerHTML = "";
+  target.classList.toggle("empty-state", nights.length === 0);
+  if (!nights.length) {
+    target.textContent = "No host nights yet.";
+    return;
+  }
+
+  const buyerName = (entry) => personById(entry.buyerId)?.name || entry.buyerName || "No buyer";
+  const buyerRows = (byBuyer, label) => byBuyer.map((entry) => `
+    <li data-buyer="${escapeHtml(buyerName(entry))}">
+      <span>${escapeHtml(label(buyerName(entry)))}</span>
+      <strong>${money(entry.cents / 100)}</strong>
+    </li>`).join("");
+
+  nights.forEach((night) => {
+    const tabs = state.guestTabs.filter((tab) => tab.nightId === night.id);
+    const summary = RNMBDomain.summarizeHostNight({
+      tabs,
+      ringUps: state.ringUps.filter((ringUp) => ringUp.nightId === night.id)
+    });
+    const status = night.endedAt
+      ? "Ended"
+      : `Running · ${summary.openTabCount} open ${summary.openTabCount === 1 ? "tab" : "tabs"}`;
+    const closedCount = tabs.filter((tab) => tab.status !== "open").length;
+    const collected = summary.collectors.length
+      ? summary.collectors.map((group) => {
+        const name = personById(group.collectorId)?.name || group.collectorName || "Unknown";
+        return `
+          <div class="host-night-group" data-collector="${escapeHtml(name)}">
+            <div class="host-night-row"><strong>${escapeHtml(name)} holds</strong><strong data-collector-total>${money(group.totalCents / 100)}</strong></div>
+            <ul class="host-night-buyers">${buyerRows(group.byBuyer, (buyer) => `for ${buyer}`)}</ul>
+          </div>`;
+      }).join("")
+      : "<small>No tabs paid yet.</small>";
+    const writtenOff = summary.writtenOff.byBuyer.length
+      ? `
+          <div class="host-night-group" data-written-off-group>
+            <div class="host-night-row"><strong>Value of drinks</strong><strong data-written-off-total>${money(summary.writtenOff.totalCents / 100)}</strong></div>
+            <ul class="host-night-buyers">${buyerRows(summary.writtenOff.byBuyer, (buyer) => `from ${buyer}'s stock`)}</ul>
+          </div>`
+      : "<small>Nothing written off.</small>";
+
+    const card = document.createElement("article");
+    card.className = "host-night-card";
+    card.dataset.hostNightId = night.id;
+    card.innerHTML = `
+      <header>
+        <div>
+          <strong>${escapeHtml(night.name)}</strong>
+          <small>${escapeHtml(night.date || "")} · ${closedCount} of ${tabs.length} ${tabs.length === 1 ? "tab" : "tabs"} closed</small>
+        </div>
+        <span class="pill${night.endedAt ? "" : " warn"}" data-host-night-status>${status}</span>
+      </header>
+      <div class="host-night-section" data-collected>
+        <span class="field-label">Collected</span>
+        ${collected}
+      </div>
+      <div class="host-night-section" data-written-off>
+        <span class="field-label">Written off</span>
+        ${writtenOff}
+      </div>
+    `;
+    target.append(card);
+  });
+}
+
 function renderCrew() {
   const target = document.querySelector("#personList");
   target.innerHTML = "";
@@ -2290,8 +2488,11 @@ function renderCrew() {
     target.textContent = "No people added yet.";
     return;
   }
+  // A crew drink rung up on the register counts as one pour, on every night (0.4.1).
+  const registerPours = new Map(RNMBDomain.crewConsumption(state.ringUps, state.types).byPerson.map((entry) => [entry.personId, entry.count]));
   state.people.forEach((person) => {
     const pours = state.nights.flatMap((night) => night.pours || []).filter((pour) => pour.personId === person.id);
+    const pourCount = pours.length + (registerPours.get(person.id) || 0);
     const spent = spendByPerson().get(person.id) || 0;
     const card = document.createElement("div");
     card.className = "person-card";
@@ -2299,7 +2500,7 @@ function renderCrew() {
       <span class="avatar" style="--person-color: ${safeColor(person.color)}">${initials(person.name)}</span>
       <div class="person-copy">
         <strong>${escapeHtml(person.name)}</strong>
-        <small>${money(spent)} logged · ${pours.length} pours</small>
+        <small>${money(spent)} logged · ${pourCount} pours</small>
       </div>
       <button class="remove-button" type="button" data-remove-person="${person.id}" aria-label="Remove person">×</button>
     `;
@@ -2741,6 +2942,19 @@ document.querySelector("#register").addEventListener("click", async (event) => {
     return;
   }
 
+  if (control.id === "registerEndNight") {
+    await endRegisterNight();
+    return;
+  }
+  if (control.dataset.payTab) {
+    await payRegisterTab(control.dataset.payTab);
+    return;
+  }
+  if (control.dataset.writeOffTab) {
+    await writeOffRegisterTab(control.dataset.writeOffTab);
+    return;
+  }
+
   const ringUpId = control.dataset.voidRingUp;
   if (ringUpId) {
     const ringUp = state.ringUps.find((entry) => entry.id === ringUpId);
@@ -2752,6 +2966,12 @@ document.querySelector("#register").addEventListener("click", async (event) => {
 });
 
 document.querySelector("#register").addEventListener("change", (event) => {
+  if (event.target.matches("select[data-collector-for]")) {
+    // Remembered only; nothing is saved until Paid is confirmed.
+    if (event.target.value) registerCollectors.set(event.target.dataset.collectorFor, event.target.value);
+    else registerCollectors.delete(event.target.dataset.collectorFor);
+    return;
+  }
   if (registerPending || !event.target.matches("select[name='sourceBottle']")) return;
   const item = registerMenuItem();
   const index = Number(event.target.dataset.ingredient);

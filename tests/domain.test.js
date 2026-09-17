@@ -681,6 +681,55 @@ test("tabTotalCents sums unvoided guest items on a tab", () => {
   assert.equal(D.tabTotalCents("none", ringUps), 0);
 });
 
+// ---------- crew consumption from the register (0.4.1, KTD4) ------------------
+
+const crewLine = (typeId, amount, abv) => ({ bottleId: `b-${typeId}`, typeId, amount, abv, costCents: 0, shareCents: null, buyerId: null, buyerName: "" });
+
+test("0.4.1: crew consumption counts unvoided crew ring-ups on the night, per person; guest and voided ring-ups count nothing", () => {
+  const ringUps = [
+    // A tequila shot for Sam: 1.5 oz at 40% = 1.0 standard drink.
+    { id: "c1", nightId: "n1", kind: "crew", personId: "p-sam", personName: "Sam", priceCents: null, voidedAt: null, lines: [crewLine("t-tequila", 1.5, 40)] },
+    // A margarita for Sam: 2 oz at 40% + 1 oz at 30% + 1 oz lime at 0% = (0.8 + 0.3) / 0.6 standard drinks, 4 oz.
+    { id: "c2", nightId: "n1", kind: "crew", personId: "p-sam", personName: "Sam", priceCents: null, voidedAt: null, lines: [crewLine("t-tequila", 2, 40), crewLine("t-triple", 1, 30), crewLine("t-lime", 1, 0)] },
+    // A lager for Alex: 1 unit of 12 oz at 5% = 1.0 standard drink.
+    { id: "c3", nightId: "n1", kind: "crew", personId: "p-alex", personName: "Alex", priceCents: null, voidedAt: null, lines: [crewLine("t-lager", 1, 5)] },
+    { id: "c-void", nightId: "n1", kind: "crew", personId: "p-alex", personName: "Alex", priceCents: null, voidedAt: "2026-09-16T22:00:00Z", lines: [crewLine("t-tequila", 3, 40)] },
+    { id: "g1", nightId: "n1", kind: "guest", tabId: "tab-1", personId: null, priceCents: 500, voidedAt: null, lines: [{ ...crewLine("t-tequila", 2, 40), shareCents: 500 }] },
+    { id: "c-other", nightId: "n2", kind: "crew", personId: "p-sam", personName: "Sam", priceCents: null, voidedAt: null, lines: [crewLine("t-tequila", 1.5, 40)] }
+  ];
+  const result = D.crewConsumption(ringUps, types, "n1");
+  const close = (actual, expected, label) => assert.ok(Math.abs(actual - expected) < 1e-9, `${label}: ${actual} vs ${expected}`);
+
+  assert.equal(result.count, 3);
+  close(result.ounces, 1.5 + 4 + 12, "night ounces");
+  close(result.standardDrinks, 1 + 1.1 / 0.6 + 1, "night standard drinks");
+  assert.deepEqual(result.byPerson.map(({ personId, personName, count }) => ({ personId, personName, count })), [
+    { personId: "p-sam", personName: "Sam", count: 2 },
+    { personId: "p-alex", personName: "Alex", count: 1 }
+  ]);
+  close(result.byPerson[0].standardDrinks, 1 + 1.1 / 0.6, "Sam's standard drinks");
+  close(result.byPerson[0].ounces, 5.5, "Sam's ounces");
+  close(result.byPerson[1].standardDrinks, 1, "Alex's standard drinks (voided shot excluded)");
+  close(result.byPerson[1].ounces, 12, "Alex's ounces");
+});
+
+test("crew consumption across every night, with a removed person kept by name, and an empty input", () => {
+  const ringUps = [
+    { id: "c1", nightId: "n1", kind: "crew", personId: "p-sam", personName: "Sam", voidedAt: null, lines: [crewLine("t-tequila", 1.5, 40)] },
+    { id: "c2", nightId: "n2", kind: "crew", personId: "p-sam", personName: "Sam", voidedAt: null, lines: [crewLine("t-tequila", 1.5, 40)] },
+    { id: "c3", nightId: "n2", kind: "crew", personId: null, personName: "Drew", voidedAt: null, lines: [crewLine("t-tequila", 3, 40)] }
+  ];
+  const all = D.crewConsumption(ringUps, types);
+  assert.equal(all.count, 3);
+  assert.ok(Math.abs(all.standardDrinks - 4) < 1e-9);
+  assert.deepEqual(all.byPerson.map(({ personId, personName, count }) => ({ personId, personName, count })), [
+    { personId: "p-sam", personName: "Sam", count: 2 },
+    { personId: null, personName: "Drew", count: 1 }
+  ]);
+  assert.deepEqual(D.crewConsumption([], types, "n1"), { ounces: 0, standardDrinks: 0, count: 0, byPerson: [] });
+  assert.deepEqual(D.crewConsumption(undefined, types), { ounces: 0, standardDrinks: 0, count: 0, byPerson: [] });
+});
+
 // ---------- KTD8 payload builders ---------------------------------------------
 
 test("with host mode unavailable, type, night and settings rows contain exactly today's keys", () => {

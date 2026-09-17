@@ -397,6 +397,18 @@
               <div id="settleList" class="stack-list empty-state">Need people and receipts first.</div>
             </section>
           </div>
+
+          <!-- Host nights (2.8.6, 0.5.1): guest money, kept apart from Settle Up, which it never changes. -->
+          <section class="panel host-nights-panel" aria-labelledby="hostNightsTitle">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">Host Nights</span>
+                <h3 id="hostNightsTitle">Guest Money</h3>
+              </div>
+            </div>
+            <p class="form-note host-nights-note">Who holds the money guests paid, and which crew member's stock each part paid for, margin included. For reference only: Equal Share above does not change.</p>
+            <div id="hostNightList" class="host-night-list empty-state">No host nights yet.</div>
+          </section>
         </section>
 
         <section class="tab-panel" id="crew" aria-labelledby="crew-title">
@@ -505,7 +517,10 @@
         </section>
 
         <section class="panel register-panel register-tabs-panel" aria-labelledby="registerOpenTabsTitle">
-          <h3 id="registerOpenTabsTitle">Open tabs</h3>
+          <div class="register-tabs-head">
+            <h3 id="registerOpenTabsTitle">Open tabs</h3>
+            <button id="registerEndNight" class="register-secondary" type="button">End night</button>
+          </div>
           <div id="registerTabList" class="register-tab-list"></div>
         </section>
       </div>
