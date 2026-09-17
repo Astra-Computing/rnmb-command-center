@@ -88,6 +88,8 @@ const REGISTER_CLOSED_MESSAGE = "No host night is running. Start one from Tonigh
 let registerDraft = null;
 // True from the confirm tap until the ring-up call resolves; every draft control is disabled meanwhile.
 let registerPending = false;
+// True from the Open tab submit until that call resolves; the new-tab form is locked meanwhile, so one tap opens one tab.
+let openTabPending = false;
 // Close-out: the collector picked on each open tab card (tab id -> person id), kept across re-renders.
 const registerCollectors = new Map();
 
@@ -412,6 +414,11 @@ function preparePricing({ markupPercent, roundingIncrementCents }) {
   const markup = Number(markupPercent);
   const increment = Number(roundingIncrementCents);
   if (!Number.isFinite(markup) || markup < 0) throw refusal("The markup must be a percentage of 0 or more.");
+  // The column is numeric(6, 2): anything finer would be rounded by the database
+  // while this browser kept pricing with the unrounded value, and 10000 overflows it.
+  if (!hasAtMostTwoDecimals(markup)) throw refusal(`The markup is kept to two decimal places, and ${markup} has more.`);
+  if (markup >= 10000) throw refusal("The markup must be below 10000%.");
+  // A whole number of cents already, so nothing can be rounded away here.
   if (!Number.isInteger(increment) || increment <= 0) throw refusal("The rounding increment must be a whole number of cents above 0.");
   return { markupPercent: markup, roundingIncrementCents: increment };
 }
@@ -610,6 +617,16 @@ function createSupabaseRepository(config) {
     await insertRows(table, [row]);
   }
 
+  /** Insert rows, or update the ones whose id already exists (the primary key). */
+  async function upsertRows(table, rows) {
+    if (!rows.length) return;
+    await request(`${table}?on_conflict=id`, {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify(rows)
+    });
+  }
+
   async function patchWhere(table, filter, row) {
     await request(`${table}?${filter}`, {
       method: "PATCH",
@@ -625,12 +642,35 @@ function createSupabaseRepository(config) {
     });
   }
 
+  /** The whole settings row from nextState. Only saveAll (which replaces everything) and a missing row use it. */
   async function saveSettings(nextState) {
     await request("rnmb_settings?on_conflict=id", {
       method: "POST",
       headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
       body: JSON.stringify([RNMBDomain.settingsRow(nextState, hostModeAvailable)])
     });
+  }
+
+  /*
+   * Write only the named settings columns. Every device holds its own copy of
+   * the settings row, and the copy is often stale (refresh waits while a field
+   * is focused or the tab is hidden), so writing the whole row would put back
+   * whatever another device changed since: switching the night would reset
+   * the markup, and saving the markup would reset the active night.
+   * settingsRow already leaves the pricing columns out when host mode is not set
+   * up (KTD8), so asking for them then sends nothing for them.
+   */
+  async function saveSettingsColumns(nextState, columns) {
+    const row = RNMBDomain.settingsRow(nextState, hostModeAvailable);
+    const patch = Object.fromEntries(columns.filter((column) => column in row).map((column) => [column, row[column]]));
+    if (!Object.keys(patch).length) return;
+    const updated = await request("rnmb_settings?id=eq.true", {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify(patch)
+    });
+    // A database that has never saved settings has no row to update: create it.
+    if (Array.isArray(updated) && updated.length === 0) await saveSettings(nextState);
   }
 
   const repositoryApi = {
@@ -884,8 +924,8 @@ function createSupabaseRepository(config) {
       }
       await saveSettings(nextState);
     },
-    async updateSettings(nextState) {
-      await saveSettings(nextState);
+    async updateSettings(nextState, columns = ["active_night_id", "responsible_mode"]) {
+      await saveSettingsColumns(nextState, columns.filter((column) => ["active_night_id", "responsible_mode"].includes(column)));
     },
     async addPerson(person) {
       await insertRow("rnmb_people", {
@@ -902,7 +942,7 @@ function createSupabaseRepository(config) {
     },
     async addNight(night, nextState) {
       await insertRow("rnmb_nights", RNMBDomain.nightRow(night, hostModeAvailable));
-      await saveSettings(nextState);
+      await saveSettingsColumns(nextState, ["active_night_id"]);
     },
     async addPour(night, pour, remaining) {
       if (hostModeAvailable) {
@@ -991,7 +1031,7 @@ function createSupabaseRepository(config) {
       const started = await mirror("startHostNight", night);
       // The function does not touch settings; making the new night active is ours.
       state.activeNightId = night.id;
-      await saveSettings(state);
+      await saveSettingsColumns(state, ["active_night_id"]);
       return started;
     },
     async endHostNight(nightId) {
@@ -1004,18 +1044,33 @@ function createSupabaseRepository(config) {
       return mirror("correctStock", withId);
     },
     // Menu items and recipes are plain table writes; the gated policies allow them.
+    // They are separate requests with no transaction, so order them so that a
+    // failure part-way never leaves an item with no recipe in the shared database:
+    // an item with no ingredients would ring up for nothing and draw no stock.
     async saveMenuItem(menuItem) {
       requireHostMode();
       const exists = state.menuItems.some((entry) => entry.id === menuItem.id);
-      // Validate and fill ids first, so the rows sent are the rows kept.
+      // Validate and fill ids first, so the rows sent are the rows kept. An edit
+      // keeps each surviving ingredient's id, so the upsert below updates it in place.
       const saved = prepareMenuItem(menuItem);
+      const rows = ingredientRows(saved);
       if (exists) {
+        // Write the new recipe over the old one first, then drop only the lines it
+        // no longer has, then rename: a failure at any step leaves a whole recipe.
+        await upsertRows("rnmb_recipe_ingredients", rows);
+        const kept = rows.map((row) => row.id).join(",");
+        await deleteWhere("rnmb_recipe_ingredients", `menu_item_id=eq.${saved.id}&id=not.in.(${kept})`);
         await patchWhere("rnmb_menu_items", `id=eq.${saved.id}`, { name: saved.name, kind: saved.kind });
-        await deleteWhere("rnmb_recipe_ingredients", `menu_item_id=eq.${saved.id}`);
       } else {
         await insertRow("rnmb_menu_items", menuItemRow(saved));
+        try {
+          await insertRows("rnmb_recipe_ingredients", rows);
+        } catch (error) {
+          // Take the new, recipe-less item back out (its ingredients cascade), then report the failure.
+          await deleteWhere("rnmb_menu_items", `id=eq.${saved.id}`).catch(() => undefined);
+          throw error;
+        }
       }
-      await insertRows("rnmb_recipe_ingredients", ingredientRows(saved));
       return mirror("saveMenuItem", saved);
     },
     async removeMenuItem(menuItemId) {
@@ -1025,7 +1080,7 @@ function createSupabaseRepository(config) {
     },
     async updatePricing(pricing) {
       requireHostMode();
-      await saveSettings({ ...state, ...preparePricing(pricing) });
+      await saveSettingsColumns({ ...state, ...preparePricing(pricing) }, ["markup_percent", "rounding_increment_cents"]);
       return mirror("updatePricing", pricing);
     }
   };
@@ -1550,7 +1605,7 @@ function renderRecentNights() {
     item.innerHTML = `<strong>${escapeHtml(night.name)}</strong><br><small>${night.date} · ${oneDecimal(drinks)} standard drinks</small>`;
     item.addEventListener("click", async () => {
       state.activeNightId = night.id;
-      await saveState("Active night switched.", (db) => db.updateSettings(state));
+      await saveState("Active night switched.", (db) => db.updateSettings(state, ["active_night_id"]));
       activateTab("tonight");
     });
     target.append(item);
@@ -1588,7 +1643,7 @@ function renderTonight() {
 
   timeline.innerHTML = "";
   const pours = [...(night?.pours || [])].reverse().slice(0, 12);
-  // Crew drinks rung up on the register, newest first. They are voided on the register, not removed here.
+  // Crew drinks rung up on the register, newest first. They are voided on the register (Crew drinks), not removed here.
   const registerDrinks = night
     ? state.ringUps.filter((ringUp) => ringUp.kind === "crew" && ringUp.nightId === night.id && !ringUp.voidedAt).reverse().slice(0, 12)
     : [];
@@ -2040,8 +2095,11 @@ function renderRegister() {
   }
 
   // The static controls are not rebuilt below, so unlock them explicitly once a ring-up resolves.
-  work.querySelectorAll("#registerTabForm input, #registerOpenTab, #registerClear, #registerEndNight").forEach((control) => {
+  work.querySelectorAll("#registerClear, #registerEndNight").forEach((control) => {
     control.disabled = registerPending;
+  });
+  work.querySelectorAll("#registerTabForm input, #registerOpenTab").forEach((control) => {
+    control.disabled = registerPending || openTabPending;
   });
   reconcileRegisterDraft(night);
   // Forget collectors picked for tabs that have since closed (here or on another device).
@@ -2053,6 +2111,7 @@ function renderRegister() {
   renderRegisterTargets(night);
   renderRegisterIngredients();
   renderRegisterTabList(night);
+  renderRegisterCrewDrinks(night);
   updateRegisterSummary();
   if (registerPending) {
     work.querySelectorAll("button, input, select").forEach((control) => {
@@ -2240,6 +2299,25 @@ function renderRegisterTabList(night) {
     `;
     list.append(card);
   });
+}
+
+/** Crew drinks still standing on this night, newest first, each with a Void control (a wrong person or drink is undone here). */
+function renderRegisterCrewDrinks(night) {
+  const list = document.querySelector("#registerCrewDrinkList");
+  const drinks = night
+    ? state.ringUps.filter((ringUp) => ringUp.kind === "crew" && ringUp.nightId === night.id && !ringUp.voidedAt).reverse()
+    : [];
+  if (!drinks.length) {
+    list.innerHTML = `<p class="empty-state">No crew drinks yet.</p>`;
+    return;
+  }
+  const lines = drinks.map((drink) => `
+    <li data-ring-up-id="${escapeHtml(drink.id)}">
+      <span>${escapeHtml(drink.menuItemName || "Drink")}</span>
+      <span>${escapeHtml(drink.personName || personById(drink.personId)?.name || "Crew")}</span>
+      <button class="register-secondary register-void" type="button" data-void-ring-up="${escapeHtml(drink.id)}" aria-label="Void ${escapeHtml(drink.menuItemName || "this drink")} for ${escapeHtml(drink.personName || "crew")}">Void</button>
+    </li>`).join("");
+  list.innerHTML = `<ul class="register-tab-items">${lines}</ul>`;
 }
 
 /** 2.8.3: close a tab as paid (the amount is the tab total, KTD assumption) by the chosen collector, after a confirm. */
@@ -2539,7 +2617,7 @@ document.querySelector("#responsibleMode").addEventListener("change", async (eve
   state.responsibleMode = event.target.checked;
   await saveState(
     event.target.checked ? "Hydration reminders on." : "Hydration reminders muted.",
-    (db) => db.updateSettings(state)
+    (db) => db.updateSettings(state, ["responsible_mode"])
   );
 });
 
@@ -2653,7 +2731,7 @@ document.querySelector("#nightForm").addEventListener("submit", async (event) =>
 
 document.querySelector("#nightSelect").addEventListener("change", async (event) => {
   state.activeNightId = event.target.value;
-  await saveState("Active night switched.", (db) => db.updateSettings(state));
+  await saveState("Active night switched.", (db) => db.updateSettings(state, ["active_night_id"]));
 });
 
 document.querySelector("#pourForm").addEventListener("submit", async (event) => {
@@ -2958,9 +3036,18 @@ document.querySelector("#register").addEventListener("click", async (event) => {
   const ringUpId = control.dataset.voidRingUp;
   if (ringUpId) {
     const ringUp = state.ringUps.find((entry) => entry.id === ringUpId);
-    const tab = state.guestTabs.find((entry) => entry.id === ringUp?.tabId);
-    if (!ringUp || !tab) return;
-    if (!confirm(`Void ${ringUp.menuItemName || "this drink"} (${money((Number(ringUp.priceCents) || 0) / 100)}) from ${tab.guestName}'s tab? What it poured goes back into stock.`)) return;
+    if (!ringUp) return;
+    let question;
+    if (ringUp.kind === "crew") {
+      // A crew drink has no tab; name the person so the right mistake is undone.
+      const name = ringUp.personName || personById(ringUp.personId)?.name || "crew";
+      question = `Void ${ringUp.menuItemName || "this drink"} poured for ${name}? What it poured goes back into stock, and it no longer counts toward ${name}'s drinks.`;
+    } else {
+      const tab = state.guestTabs.find((entry) => entry.id === ringUp.tabId);
+      if (!tab) return;
+      question = `Void ${ringUp.menuItemName || "this drink"} (${money((Number(ringUp.priceCents) || 0) / 100)}) from ${tab.guestName}'s tab? What it poured goes back into stock.`;
+    }
+    if (!confirm(question)) return;
     await hostAction("Item voided and its stock restored.", (db) => db.voidRingUp(ringUp.id));
   }
 });
@@ -2998,7 +3085,8 @@ document.querySelector("#register").addEventListener("input", (event) => {
 
 document.querySelector("#registerTabForm").addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (registerPending) return;
+  // Each submit makes a new tab id, so a second tap (or Enter then a tap) during a slow call would open a second tab.
+  if (registerPending || openTabPending) return;
   const night = openHostNight();
   if (!night || hostNightNotSaving(night)) {
     showToast(night ? NOT_SAVING_MESSAGE : REGISTER_CLOSED_MESSAGE);
@@ -3011,13 +3099,22 @@ document.querySelector("#registerTabForm").addEventListener("submit", async (eve
     return;
   }
   const tabId = uid();
-  const opened = await hostAction(`Tab opened for ${guestName}.`, (db) => db.openTab({ id: tabId, nightId: night.id, guestName }));
-  if (!opened) return;
-  input.value = "";
-  // The new tab is who the next drink is for.
-  if (state.guestTabs.some((tab) => tab.id === tabId && tab.status === "open")) {
-    ensureRegisterDraft().target = { kind: "guest", tabId };
+  openTabPending = true;
+  renderRegister();
+  let opened = false;
+  try {
+    opened = await hostAction(`Tab opened for ${guestName}.`, (db) => db.openTab({ id: tabId, nightId: night.id, guestName }));
+  } finally {
+    openTabPending = false;
   }
+  if (opened) {
+    input.value = "";
+    // The new tab is who the next drink is for.
+    if (state.guestTabs.some((tab) => tab.id === tabId && tab.status === "open")) {
+      ensureRegisterDraft().target = { kind: "guest", tabId };
+    }
+  }
+  // Unlock the form whether or not the tab opened.
   renderRegister();
 });
 
