@@ -313,6 +313,7 @@ const registerTab = (page, guestName) => page.locator("#registerTabs [data-regis
 const registerCrew = (page, name) => page.locator("#registerCrew [data-register-crew]", { hasText: name });
 const tabCard = (page, guestName) => page.locator("#registerTabList .register-tab-card", { hasText: guestName });
 const stockOf = (page, bottleId) => page.evaluate((id) => window.__rnmb.state.bottles.find((bottle) => bottle.id === id).remaining, bottleId);
+const bottleIdOf = (page, nickname) => page.evaluate((name) => window.__rnmb.state.bottles.find((bottle) => bottle.nickname === name).id, nickname);
 
 /** Save a menu item and set stock levels through the repository (the Menu and Inventory UIs have their own scenarios). */
 async function saveMenuItemAndLevels(page, { menuItem, levels = [] }) {
@@ -463,6 +464,45 @@ async function quickLog(session, personName, itemName, toastText) {
   await page.click('.tab-button[data-tab="tonight"]');
   await page.click(`#quickLogPeople [data-quick-person="${await personIdOf(page, personName)}"]`);
   await clickForToast(session, `#quickLogItems button:has-text("${itemName}")`, toastText);
+}
+
+// ---------- end-of-night recap helpers (U6) -----------------------------------------------
+
+/** End the active crew night from Tonight's Wrap Up panel; returns the confirm text. */
+async function endCrewNightViaRecap(session, nightName = "Friday Recon") {
+  const { page } = session;
+  await page.click('.tab-button[data-tab="tonight"]');
+  let dialogMessage = "";
+  page.once("dialog", (dialog) => { dialogMessage = dialog.message(); });
+  await clickForToast(session, "#endCrewNight", `${nightName} ended. Check the recap for anything missed.`);
+  return dialogMessage;
+}
+
+/** Every recap card as it reads on screen, in order. */
+async function recapCards(page) {
+  await page.click('.tab-button[data-tab="tonight"]');
+  return page.locator("#nightRecapList .recap-card").evaluateAll((cards) => cards.map((card) => ({
+    person: card.querySelector(".person-copy strong").textContent,
+    total: card.querySelector("[data-recap-cost]").textContent,
+    meta: card.querySelector("[data-recap-meta]").textContent,
+    drinks: [...card.querySelectorAll(".recap-drink")].map((drink) => `${drink.querySelector("strong").textContent} — ${drink.querySelector("small").textContent}`)
+  })));
+}
+
+const recapCard = (page, personId) => page.locator(`#nightRecapList .recap-card[data-recap-person="${personId}"]`);
+
+/** Void one drink from a person's recap card; returns the confirm text. */
+async function voidFromRecap(session, personId, index = 0) {
+  const { page } = session;
+  await page.click('.tab-button[data-tab="tonight"]');
+  let dialogMessage = "";
+  page.once("dialog", (dialog) => { dialogMessage = dialog.message(); });
+  await clickForToast(
+    session,
+    `#nightRecapList .recap-card[data-recap-person="${personId}"] [data-recap-void] >> nth=${index}`,
+    "Drink voided. Stock and balances are back to where they were."
+  );
+  return dialogMessage;
 }
 
 /** Leave the register for a dashboard tab. */
@@ -2170,7 +2210,9 @@ const scenarios = [
         assert.match(after.recent, /1\.5 standard drinks/, "Recent Logs night total");
         assert.match(after.crew, /· 1 pours/, "one register drink is one pour");
         assert.match(after.meta, /1 pours logged/);
-        assert.match(after.timeline, /Casey had Bourbon Neat Bar register · 1\.5 standard drinks/);
+        // The timeline names the stock a crew drink drew, not where it was rung up:
+        // nothing records whether a drink came from the register or from quick log.
+        assert.match(after.timeline, /Casey had Bourbon Neat The Briefing Bottle · 1\.5 standard drinks/);
 
         // A second crew shot, voided, contributes nothing.
         const second = await page.evaluate(async () => {
@@ -3377,6 +3419,173 @@ const scenarios = [
         session.assertClean();
       } finally {
         await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Crew U6 ending a crew night shows each person's drinks and cost totals, and the balances never waited on it",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await quickLog(session, "Sam", "The Briefing Bottle", "Logged 1.5 oz of The Briefing Bottle for Sam · $2.07 at cost.");
+        await quickLog(session, "Jordan", "Glass of Red", "Logged Glass of Red for Jordan · $3.74 at cost.");
+        // Sam drank Alex's bourbon; Jordan drank Sam's red. Both balances moved on the tap.
+        const before = await balanceCents(page);
+        assert.deepEqual(before, { Alex: 207, Jordan: -374, Sam: 167, Casey: 0 });
+
+        await page.click('.tab-button[data-tab="tonight"]');
+        assert.equal(await page.locator("#nightRecapPanel").isVisible(), true, "a crew night gets the Wrap Up panel");
+        // Computed display, not isVisible: an empty grid has no box either way.
+        assert.equal(await page.locator("#nightRecapList").evaluate((list) => getComputedStyle(list).display), "none", "and no recap until it ends");
+        assert.match(await page.textContent("#nightRecapNote"), /Ending Friday Recon opens the recap/);
+
+        const confirmText = await endCrewNightViaRecap(session);
+        assert.match(confirmText, /^End Friday Recon\? The recap opens so you can add a missed drink or void a wrong one/);
+        assert.equal(await page.locator("#endCrewNight").evaluate((button) => getComputedStyle(button).display), "none", "an ended night has nothing left to end");
+        assert.equal(await page.evaluate(() => Boolean(window.__rnmb.state.nights.find((night) => night.name === "Friday Recon").endedAt)), true);
+
+        assert.deepEqual(await recapCards(page), [
+          { person: "Jordan", total: "$3.74", meta: "1 drink · 5.0 oz · 1.1 standard drinks", drinks: ["Glass of Red — 5.0 oz · $3.74 at cost"] },
+          { person: "Sam", total: "$2.07", meta: "1 drink · 1.5 oz · 1.1 standard drinks", drinks: ["The Briefing Bottle — 1.5 oz · $2.07 at cost"] }
+        ], "one card per person who drank, in roster order; Alex and Casey drank nothing and get none");
+
+        assert.deepEqual(await balanceCents(page), before, "ending a night moves no money: nothing waited on the recap (KTD7)");
+
+        // A host night keeps its own end-night flow in the register, so it gets no Wrap Up panel.
+        await startHostNightViaForm(session, "Smoke host night");
+        await page.click('.tab-button[data-tab="tonight"]');
+        assert.equal(await page.locator("#nightRecapPanel").evaluate((panel) => getComputedStyle(panel).display), "none");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Crew U6 adding a missed drink from the recap lands it on that night and moves the balance straight away",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404, viewport: { width: 400, height: 900 } });
+      const { page } = session;
+      try {
+        const bourbon = await bottleIdOf(page, "The Briefing Bottle");
+        await quickLog(session, "Sam", "The Briefing Bottle", "Logged 1.5 oz of The Briefing Bottle for Sam · $2.07 at cost.");
+        await endCrewNightViaRecap(session);
+        const samId = await personIdOf(page, "Sam");
+
+        await clickForToast(
+          session,
+          `#nightRecapList .recap-card[data-recap-person="${samId}"] [data-recap-add]`,
+          "Quick log is ready for Sam. Tap what they had and it lands on Friday Recon."
+        );
+        assert.equal(await page.getAttribute(`#quickLogPeople [data-quick-person="${samId}"]`, "aria-pressed"), "true", "quick log is pointed at Sam");
+        assert.match(await page.textContent("#quickLogNight"), /Logging to Friday Recon \(ended\)\./);
+
+        await clickForToast(session, `#quickLogItems [data-quick-bottle="${bourbon}"]`, "Logged 1.5 oz of The Briefing Bottle for Sam · $2.07 at cost.");
+
+        const logged = await page.evaluate(() => {
+          const night = window.__rnmb.state.nights.find((entry) => entry.name === "Friday Recon");
+          return { pours: night.pours.length, ended: Boolean(night.endedAt) };
+        });
+        assert.equal(logged.pours, 2, "the missed drink landed on the night the recap was showing");
+        assert.equal(logged.ended, true, "which is still ended: the recap fixes a night up, it does not reopen it");
+        assert.equal(await stockOf(page, bourbon), 16.2, "and it drew from stock like any other drink");
+        assert.deepEqual(await balanceCents(page), { Alex: 414, Jordan: 0, Sam: -414, Casey: 0 }, "the balance moved on the tap, with nothing left to confirm");
+
+        assert.deepEqual(await recapCards(page), [{
+          person: "Sam",
+          total: "$4.14",
+          meta: "2 drinks · 3.0 oz · 2.3 standard drinks",
+          drinks: ["The Briefing Bottle — 1.5 oz · $2.07 at cost", "The Briefing Bottle — 1.5 oz · $2.07 at cost"]
+        }], "the recap redraws with the missed drink on it");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Crew U6 voiding a drink from the recap puts the stock and the balances back, whether it was a pour or a crew ring-up",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const bourbon = await bottleIdOf(page, "The Briefing Bottle");
+        const red = await bottleIdOf(page, "Diplomatic Pouch");
+        await quickLog(session, "Sam", "The Briefing Bottle", "Logged 1.5 oz of The Briefing Bottle for Sam · $2.07 at cost.");
+        await quickLog(session, "Jordan", "Glass of Red", "Logged Glass of Red for Jordan · $3.74 at cost.");
+        await endCrewNightViaRecap(session);
+        const samId = await personIdOf(page, "Sam");
+        const jordanId = await personIdOf(page, "Jordan");
+
+        // A pour goes back through removePour.
+        const pourConfirm = await voidFromRecap(session, samId);
+        assert.match(pourConfirm, /^Void 1\.5 oz of The Briefing Bottle for Sam\? It goes back into stock, and Sam's balance goes back to where it was\./);
+        assert.equal(await stockOf(page, bourbon), 19.2, "the bourbon is back where it started");
+        assert.equal(await page.evaluate(() => window.__rnmb.state.nights.find((night) => night.name === "Friday Recon").pours.length), 0);
+        assert.equal(await recapCard(page, samId).count(), 0, "with nothing left of theirs, Sam's card goes");
+        assert.deepEqual(await balanceCents(page), { Alex: 0, Jordan: -374, Sam: 374, Casey: 0 }, "Alex is square again");
+
+        // A crew ring-up goes back through voidRingUp.
+        const ringUpConfirm = await voidFromRecap(session, jordanId);
+        assert.match(ringUpConfirm, /^Void Glass of Red for Jordan\? What it poured goes back into stock, and Jordan's balance goes back to where it was\./);
+        assert.equal(await stockOf(page, red), 25.36, "the red blend is back where it started");
+        assert.equal(await page.evaluate(() => Boolean(window.__rnmb.state.ringUps[0].voidedAt)), true, "money history is voided, never deleted");
+        assert.deepEqual(await balanceCents(page), { Alex: 0, Jordan: 0, Sam: 0, Casey: 0 });
+        assert.match(await page.textContent("#nightRecapList"), /Nobody logged a drink on this night\./);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Crew U6 the end-night control and the recap have non-zero bounding boxes at 1440 and 400 widths, with no horizontal scroll",
+    async run({ browser }) {
+      for (const viewport of [{ width: 1440, height: 1000 }, { width: 400, height: 900 }]) {
+        const session = await openPage(browser, { allowConsole: apiConfig404, viewport });
+        const { page } = session;
+        try {
+          const boxes = async (selectors) => {
+            for (const selector of selectors) {
+              const count = await page.locator(selector).count();
+              assert.ok(count > 0, `${selector} is present at ${viewport.width}px`);
+              for (let index = 0; index < count; index += 1) {
+                const locator = page.locator(selector).nth(index);
+                await locator.scrollIntoViewIfNeeded();
+                const box = await locator.boundingBox();
+                assert.ok(box && box.width > 0 && box.height > 0, `${selector} #${index} has a non-zero box at ${viewport.width}px (got ${JSON.stringify(box)})`);
+                if (selector.includes("button") || selector.includes("recap-void") || selector.includes("recap-add")) {
+                  assert.ok(box.height >= 44, `${selector} #${index} is a thumb-sized target at ${viewport.width}px (height ${box.height})`);
+                }
+              }
+            }
+            const widths = await page.evaluate(() => ({ scroll: document.documentElement.scrollWidth, client: document.documentElement.clientWidth }));
+            assert.ok(widths.scroll <= widths.client, `no horizontal scroll on Tonight at ${viewport.width}px (scrollWidth ${widths.scroll} > ${widths.client})`);
+          };
+
+          await page.click('.tab-button[data-tab="tonight"]');
+          await boxes(["#nightRecapPanel button#endCrewNight", "#nightRecapNote"]);
+
+          await quickLog(session, "Sam", "The Briefing Bottle", "Logged 1.5 oz of The Briefing Bottle for Sam · $2.07 at cost.");
+          await quickLog(session, "Jordan", "Glass of Red", "Logged Glass of Red for Jordan · $3.74 at cost.");
+          await endCrewNightViaRecap(session);
+          await boxes([
+            "#nightRecapList .recap-card",
+            "#nightRecapList [data-recap-meta]",
+            "#nightRecapList [data-recap-cost]",
+            "#nightRecapList .recap-drink",
+            "#nightRecapList [data-recap-void]",
+            "#nightRecapList [data-recap-add]"
+          ]);
+          session.assertClean();
+        } finally {
+          await session.close();
+        }
       }
     }
   }

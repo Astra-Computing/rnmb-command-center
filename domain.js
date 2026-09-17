@@ -96,6 +96,10 @@
  *               are set null and keep their name snapshots)
  *   dollarsToCents(value) -> whole cents for a typed dollar amount ("3.20", "$12", ".5"), else null
  *   quickLogAmount(type) -> 1.5 (oz) for poured stock, 1 (unit) for counted stock
+ *   nightRecap(state, nightId) -> [{ personId, name, drinks, ounces, standardDrinks, costCents }]: one night's
+ *               crew pours and unvoided crew ring-ups grouped by drinker, oldest first, each drink
+ *               { kind: "pour"|"ringUp", id, bottleId, typeId, menuItemId, name, amount, ounces, standardDrinks,
+ *               costCents (null = charges nobody), at }; roster order first, then anyone removed since
  *   recentLogItems(state, personId, limit = 8) -> [{ kind: "bottle"|"menu", id }]: the distinct stock items a
  *               person poured and menu items they had as unvoided crew ring-ups, newest first
  *   normalizeNight / normalizeMenuItem / normalizeTab / normalizeRingUp / normalizeAdjustment /
@@ -1060,6 +1064,127 @@ var RNMBDomain = (function () {
       .filter(function (entry) { return entry.beforeCents !== entry.afterCents; });
   }
 
+  /**
+   * One night's drinks grouped by who drank them (0.4.3): every crew pour on the
+   * night plus every unvoided crew ring-up on it, oldest first, each carrying what
+   * it drew and the whole cents it charges — exactly the cents crewBalances debits.
+   * `costCents` is null when a drink charges nobody (stock nobody bought, or a pour
+   * logged before the cost columns existed), so the recap can say so instead of
+   * showing $0.00. People who drank nothing are left out; the roster comes first in
+   * its own order, then anyone removed since, by name then id.
+   */
+  function nightRecap(state, nightId) {
+    var source = state || {};
+    var bottles = byId(source.bottles);
+    var typeList = listOf(source.types);
+    var typeMap = byId(typeList);
+    var rank = new Map();
+    var entries = new Map();
+    var list = [];
+
+    listOf(source.people).forEach(function (person) {
+      var key = person ? partyKey(person.id, person.name) : null;
+      if (key === null || rank.has(key)) return;
+      rank.set(key, rank.size);
+    });
+
+    function entryFor(personId, personName) {
+      var key = partyKey(personId, personName);
+      if (key === null) key = "nobody";
+      var entry = entries.get(key);
+      if (!entry) {
+        entry = {
+          personId: personId === undefined || personId === "" ? null : personId,
+          name: personName || "",
+          drinks: [],
+          ounces: 0,
+          standardDrinks: 0,
+          costCents: 0,
+          rank: rank.has(key) ? rank.get(key) : Infinity
+        };
+        entries.set(key, entry);
+        list.push(entry);
+      }
+      if (!entry.name && personName) entry.name = personName;
+      return entry;
+    }
+
+    function add(personId, personName, drink) {
+      var entry = entryFor(personId, personName);
+      entry.drinks.push(drink);
+      entry.ounces = round6(entry.ounces + drink.ounces);
+      entry.standardDrinks += drink.standardDrinks;
+      if (drink.costCents !== null) entry.costCents += drink.costCents;
+    }
+
+    var nameOf = new Map();
+    listOf(source.people).forEach(function (person) {
+      if (person && person.id) nameOf.set(person.id, person.name || "");
+    });
+
+    var night = null;
+    listOf(source.nights).forEach(function (entry) {
+      if (!night && entry && entry.id === nightId) night = entry;
+    });
+    if (!night) return [];
+
+    listOf(night.pours).forEach(function (pour) {
+      if (!pour) return;
+      var bottle = bottles.get(pour.bottleId);
+      var typeId = bottle ? bottle.typeId : null;
+      var measured = measureAmount(typeMap.get(typeId), pour.ounces, Number(pour.abv) > 0 ? pour.abv : undefined);
+      var cents = wholeCentsOrNull(pour.costCents);
+      var charged = partyKey(pour.buyerId, pour.buyerName) !== null;
+      add(pour.personId, nameOf.get(pour.personId) || "", {
+        kind: "pour",
+        id: pour.id,
+        bottleId: pour.bottleId,
+        typeId: typeId,
+        menuItemId: null,
+        name: "",
+        amount: Number(pour.ounces) || 0,
+        ounces: measured.ounces,
+        standardDrinks: measured.standardDrinks,
+        costCents: charged && cents !== null && cents > 0 ? cents : null,
+        at: pour.timestamp || ""
+      });
+    });
+
+    listOf(source.ringUps).forEach(function (ringUp) {
+      if (!ringUp || ringUp.kind !== "crew" || ringUp.voidedAt || ringUp.nightId !== nightId) return;
+      var measured = linesConsumption(ringUp.lines, typeList);
+      var charge = crewCharge(ringUp.lines);
+      add(ringUp.personId, ringUp.personName || nameOf.get(ringUp.personId) || "", {
+        kind: "ringUp",
+        id: ringUp.id,
+        bottleId: null,
+        typeId: null,
+        menuItemId: ringUp.menuItemId === undefined ? null : ringUp.menuItemId,
+        name: ringUp.menuItemName || "",
+        amount: null,
+        ounces: measured.ounces,
+        standardDrinks: measured.standardDrinks,
+        costCents: charge.owned.length ? charge.totalCents : null,
+        at: ringUp.rungAt || ""
+      });
+    });
+
+    list.forEach(function (entry) {
+      entry.drinks.sort(function (a, b) {
+        var timeA = timeOf(a.at);
+        var timeB = timeOf(b.at);
+        return timeA === timeB ? 0 : timeA - timeB;
+      });
+    });
+    list.sort(function (a, b) {
+      if (a.rank !== b.rank) return a.rank - b.rank;
+      return compareParties(a, b);
+    });
+    return list.map(function (entry) {
+      return { personId: entry.personId, name: entry.name, drinks: entry.drinks, ounces: entry.ounces, standardDrinks: entry.standardDrinks, costCents: entry.costCents };
+    });
+  }
+
   // ---------- settle-up form and quick log (0.4.2, 0.5.4, KTD8) -----------------
 
   var DOLLAR_AMOUNT = /^\$?(?:(\d+)(?:\.(\d{1,2}))?|\.(\d{1,2}))$/;
@@ -1462,6 +1587,7 @@ var RNMBDomain = (function () {
     dollarsToCents: dollarsToCents,
     quickLogAmount: quickLogAmount,
     recentLogItems: recentLogItems,
+    nightRecap: nightRecap,
     normalizeNight: normalizeNight,
     normalizePour: normalizePour,
     normalizeMenuItem: normalizeMenuItem,
