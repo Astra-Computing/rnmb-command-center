@@ -121,8 +121,8 @@ function refusal(message) {
 }
 
 const nowIso = () => new Date().toISOString();
-const round6 = (value) => Math.round(value * 1e6) / 1e6 + 0;
-const hasAtMostTwoDecimals = (value) => Math.abs(value * 100 - Math.round(value * 100)) < 1e-6;
+const round6 = RNMBDomain.round6;
+const hasAtMostTwoDecimals = (value) => Math.abs(value * 100 - Math.round(value * 100)) < RNMBDomain.AMOUNT_EPSILON;
 
 function stockLabel(bottle) {
   const type = typeById(bottle.typeId);
@@ -1722,7 +1722,7 @@ function menuItemFormField(name) {
   return document.querySelector(`#menuItemForm [name='${name}']`);
 }
 
-function ingredientRows() {
+function ingredientRowElements() {
   return Array.from(document.querySelectorAll("#ingredientRows [data-ingredient-row]"));
 }
 
@@ -1809,7 +1809,7 @@ function loadMenuItemIntoForm(menuItem) {
 function menuItemDraftFromForm() {
   const name = menuItemFormField("name").value.trim();
   const kind = menuItemFormField("kind").value;
-  const rows = ingredientRows();
+  const rows = ingredientRowElements();
   if (!name) return { error: "A menu item needs a name." };
   if (!MENU_KIND_LABELS[kind]) return { error: "A menu item is a cocktail, a straight pour or a counted item." };
   if (!rows.length) return { error: "Add at least one ingredient." };
@@ -1838,7 +1838,7 @@ function renderMenu() {
   notice.hidden = !locked;
   notice.textContent = locked ? HOST_MODE_SQL_MESSAGE : "";
 
-  ingredientRows().forEach((row) => {
+  ingredientRowElements().forEach((row) => {
     fillIngredientTypeOptions(row);
     syncIngredientRow(row);
   });
@@ -2783,7 +2783,7 @@ document.body.addEventListener("submit", async (event) => {
 
 // ---- Menu tab ----
 document.querySelector("#menuItemForm [name='kind']").addEventListener("change", () => {
-  ingredientRows().forEach(syncIngredientRow);
+  ingredientRowElements().forEach(syncIngredientRow);
 });
 
 document.querySelector("#ingredientRows").addEventListener("change", (event) => {
@@ -2799,7 +2799,7 @@ document.querySelector("#ingredientRows").addEventListener("click", (event) => {
 document.querySelector("#addIngredientRow").addEventListener("click", () => {
   const kind = menuItemFormField("kind").value;
   // 2.6.1: only a cocktail has more than one ingredient.
-  if (kind !== "cocktail" && ingredientRows().length >= 1) {
+  if (kind !== "cocktail" && ingredientRowElements().length >= 1) {
     showToast(ONE_INGREDIENT_MESSAGES[kind]);
     return;
   }

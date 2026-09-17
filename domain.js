@@ -29,6 +29,7 @@
  *              DEFAULT_MARKUP_PERCENT (0), DEFAULT_ROUNDING_INCREMENT_CENTS (25)
  *   normalizeType(type) -> type with numeric abv, measure "oz"|"unit", unitOz number|null
  *   normalizeBottle(bottle) -> bottle with size/remaining (legacy sizeOz/remainingOz mapped and removed)
+ *   round6(value) -> value rounded to 6 decimals, with -0 as 0 (collapses float noise on amounts)
  *   standardDrinks(ounces, abv) -> number of US standard drinks
  *   measureAmount(type, amount, abvSnapshot?) -> { ounces, standardDrinks }
  *   linesConsumption(lines, types) -> { ounces, standardDrinks } summed over lines
@@ -38,7 +39,7 @@
  *   allocateShares(priceCents, weights[]) -> integer cents[] summing to priceCents
  *   priceRingUp(draftLines[{bottleId, amount}], { bottles, types, people, markupPercent,
  *               roundingIncrementCents, kind? }) -> { costCents, priceCents|null, lines[line] }
- *   menuItemIngredients(menuItem) -> [{ typeId, amount }] (counted = 1 unit, pour = first ingredient)
+ *   menuItemIngredients(menuItem) -> [{ typeId, amount }] (counted = 1 unit, straight = first ingredient)
  *   combinedRemaining(bottles, typeId) -> number
  *   menuItemAvailability(menuItem, bottles) -> { available, shortTypeIds[] }
  *   preselectSources(menuItem, bottles) -> [{ typeId, amount, sources[source], short, available }]
@@ -327,20 +328,24 @@ var RNMBDomain = (function () {
    * If only the combined stock covers it, the least-remaining item with all it holds, marked short.
    * If even the combined stock cannot, no sources and available false.
    */
+  function preselectIngredient(ingredient, bottles) {
+    var candidates = candidatesFor(bottles, ingredient.typeId);
+    var covering = candidates.find(function (bottle) { return remainingOf(bottle) + AMOUNT_EPSILON >= ingredient.amount; });
+    var result = { typeId: ingredient.typeId, amount: ingredient.amount, sources: [], short: false, available: false };
+    if (covering) {
+      result.sources = [{ bottleId: covering.id, amount: ingredient.amount }];
+      result.available = true;
+    } else if (candidates.length && combinedRemaining(candidates, ingredient.typeId) + AMOUNT_EPSILON >= ingredient.amount) {
+      result.sources = [{ bottleId: candidates[0].id, amount: round6(Math.min(remainingOf(candidates[0]), ingredient.amount)) }];
+      result.short = true;
+      result.available = true;
+    }
+    return result;
+  }
+
   function preselectSources(menuItem, bottles) {
     return menuItemIngredients(menuItem).map(function (ingredient) {
-      var candidates = candidatesFor(bottles, ingredient.typeId);
-      var covering = candidates.find(function (bottle) { return remainingOf(bottle) + AMOUNT_EPSILON >= ingredient.amount; });
-      var result = { typeId: ingredient.typeId, amount: ingredient.amount, sources: [], short: false, available: false };
-      if (covering) {
-        result.sources = [{ bottleId: covering.id, amount: ingredient.amount }];
-        result.available = true;
-      } else if (candidates.length && combinedRemaining(candidates, ingredient.typeId) + AMOUNT_EPSILON >= ingredient.amount) {
-        result.sources = [{ bottleId: candidates[0].id, amount: round6(Math.min(remainingOf(candidates[0]), ingredient.amount)) }];
-        result.short = true;
-        result.available = true;
-      }
-      return result;
+      return preselectIngredient(ingredient, bottles);
     });
   }
 
@@ -370,7 +375,7 @@ var RNMBDomain = (function () {
     var workingById = byId(working);
     var ingredients = [];
     var covered = menuItemIngredients(menuItem).every(function (ingredient) {
-      var pick = preselectSources({ kind: "cocktail", ingredients: [ingredient] }, working)[0];
+      var pick = preselectIngredient(ingredient, working);
       if (!pick.available) return false;
       var sources = pick.sources.slice();
       if (pick.short) {
@@ -859,6 +864,7 @@ var RNMBDomain = (function () {
   }
 
   return Object.freeze({
+    round6: round6,
     STANDARD_DRINK_OZ: STANDARD_DRINK_OZ,
     MEASURE_OZ: MEASURE_OZ,
     MEASURE_UNIT: MEASURE_UNIT,
