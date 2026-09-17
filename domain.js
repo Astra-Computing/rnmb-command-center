@@ -50,6 +50,11 @@
  *   tabTotalCents(tabId, ringUps) -> integer cents of unvoided guest items
  *   summarizeHostNight({ tabs, ringUps }) -> { collectors[{ collectorId, collectorName, totalCents,
  *               byBuyer[{ buyerId, buyerName, cents }] }], writtenOff{ totalCents, byBuyer[] }, openTabCount }
+ *   normalizeNight / normalizeMenuItem / normalizeTab / normalizeRingUp / normalizeAdjustment(record)
+ *               -> the record with every field present in a fixed order (nulls, numbers, defaults)
+ *   normalizeState(input) -> full browser state: people, types, bottles, nights (kind, endedAt, pours,
+ *               startedLocally only when true), menuItems, guestTabs, ringUps, stockAdjustments,
+ *               activeNightId, responsibleMode, markupPercent, roundingIncrementCents
  *   typeRow(type, hostModeAvailable) -> rnmb_beverage_types row (snake_case)
  *   nightRow(night, hostModeAvailable) -> rnmb_nights row
  *   settingsRow(settings, hostModeAvailable) -> rnmb_settings row
@@ -501,6 +506,142 @@ var RNMBDomain = (function () {
     };
   }
 
+  // ---------- whole-state normalizer (archives, localStorage, database loads) ---
+
+  var MENU_KINDS = ["cocktail", "straight", "counted"];
+  var TAB_STATUSES = ["open", "paid", "written_off"];
+
+  function listOf(value) {
+    return Array.isArray(value) ? value : [];
+  }
+
+  function orNull(value) {
+    return value === undefined || value === null || value === "" ? null : value;
+  }
+
+  function numberOrNull(value) {
+    if (value === undefined || value === null || value === "") return null;
+    var number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+
+  function numberOrZero(value) {
+    var number = Number(value);
+    return Number.isFinite(number) ? number : 0;
+  }
+
+  /** startedLocally is a browser-only mark (KTD9): kept only when literally true, never sent to the database. */
+  function normalizeNight(night) {
+    var source = night || {};
+    var kind = source.kind === "host" ? "host" : "crew";
+    var result = {
+      id: source.id,
+      name: source.name,
+      date: source.date,
+      kind: kind,
+      endedAt: kind === "host" ? orNull(source.endedAt) : null,
+      pours: listOf(source.pours)
+    };
+    if (source.startedLocally === true) result.startedLocally = true;
+    return result;
+  }
+
+  function normalizeMenuItem(menuItem) {
+    var source = menuItem || {};
+    return {
+      id: source.id,
+      name: source.name,
+      kind: MENU_KINDS.indexOf(source.kind) >= 0 ? source.kind : "cocktail",
+      ingredients: listOf(source.ingredients).map(function (ingredient) {
+        return { id: orNull(ingredient.id), typeId: ingredient.typeId, amount: numberOrZero(ingredient.amount) };
+      })
+    };
+  }
+
+  function normalizeTab(tab) {
+    var source = tab || {};
+    return {
+      id: source.id,
+      nightId: source.nightId,
+      guestName: source.guestName,
+      status: TAB_STATUSES.indexOf(source.status) >= 0 ? source.status : "open",
+      collectorId: orNull(source.collectorId),
+      collectorName: orNull(source.collectorName),
+      amountCents: numberOrNull(source.amountCents),
+      openedAt: orNull(source.openedAt),
+      closedAt: orNull(source.closedAt)
+    };
+  }
+
+  function normalizeLine(line) {
+    var source = line || {};
+    return {
+      id: orNull(source.id),
+      bottleId: source.bottleId,
+      typeId: source.typeId,
+      amount: numberOrZero(source.amount),
+      costCents: numberOrZero(source.costCents),
+      shareCents: numberOrNull(source.shareCents),
+      buyerId: orNull(source.buyerId),
+      buyerName: source.buyerName || "",
+      abv: numberOrZero(source.abv)
+    };
+  }
+
+  function normalizeRingUp(ringUp) {
+    var source = ringUp || {};
+    return {
+      id: source.id,
+      nightId: source.nightId,
+      kind: source.kind === "crew" ? "crew" : "guest",
+      tabId: orNull(source.tabId),
+      personId: orNull(source.personId),
+      personName: orNull(source.personName),
+      menuItemId: orNull(source.menuItemId),
+      menuItemName: source.menuItemName || "",
+      priceCents: numberOrNull(source.priceCents),
+      rungAt: orNull(source.rungAt),
+      voidedAt: orNull(source.voidedAt),
+      lines: listOf(source.lines).map(normalizeLine)
+    };
+  }
+
+  function normalizeAdjustment(adjustment) {
+    var source = adjustment || {};
+    return {
+      id: source.id,
+      bottleId: source.bottleId,
+      previousRemaining: numberOrZero(source.previousRemaining),
+      newRemaining: numberOrZero(source.newRemaining),
+      adjustedAt: orNull(source.adjustedAt)
+    };
+  }
+
+  /** Any archive, localStorage copy or database load -> the full browser state, host-mode collections included. */
+  function normalizeState(input) {
+    var source = input || {};
+    var nights = listOf(source.nights).map(normalizeNight);
+    var markup = Number(source.markupPercent);
+    var increment = Number(source.roundingIncrementCents);
+    return {
+      people: listOf(source.people),
+      types: listOf(source.types).map(normalizeType),
+      bottles: listOf(source.bottles).map(normalizeBottle),
+      nights: nights,
+      menuItems: listOf(source.menuItems).map(normalizeMenuItem),
+      guestTabs: listOf(source.guestTabs).map(normalizeTab),
+      ringUps: listOf(source.ringUps).map(normalizeRingUp),
+      stockAdjustments: listOf(source.stockAdjustments).map(normalizeAdjustment),
+      activeNightId: source.activeNightId || (nights[0] && nights[0].id) || "",
+      responsibleMode: source.responsibleMode !== false,
+      markupPercent:
+        source.markupPercent !== undefined && source.markupPercent !== null && Number.isFinite(markup) && markup >= 0
+          ? markup
+          : DEFAULT_MARKUP_PERCENT,
+      roundingIncrementCents: Number.isInteger(increment) && increment > 0 ? increment : DEFAULT_ROUNDING_INCREMENT_CENTS
+    };
+  }
+
   // ---------- payload builders for existing tables (KTD8) ----------------------
 
   function typeRow(type, hostModeAvailable) {
@@ -583,6 +724,12 @@ var RNMBDomain = (function () {
     applyStockDeltas: applyStockDeltas,
     tabTotalCents: tabTotalCents,
     summarizeHostNight: summarizeHostNight,
+    normalizeNight: normalizeNight,
+    normalizeMenuItem: normalizeMenuItem,
+    normalizeTab: normalizeTab,
+    normalizeRingUp: normalizeRingUp,
+    normalizeAdjustment: normalizeAdjustment,
+    normalizeState: normalizeState,
     typeRow: typeRow,
     nightRow: nightRow,
     settingsRow: settingsRow,
