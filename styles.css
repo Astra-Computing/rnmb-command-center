@@ -456,6 +456,112 @@ small,
   opacity: 0.6;
 }
 
+/* Menu tab */
+.notice {
+  padding: 12px 14px;
+  border: 1px solid rgba(250, 204, 21, 0.6);
+  border-radius: 8px;
+  background: rgba(250, 204, 21, 0.1);
+  color: var(--yellow);
+  font-weight: 700;
+}
+
+.form-grid .span-2 {
+  grid-column: 1 / -1;
+}
+
+.form-note {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.ingredient-block {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.field-label {
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.ingredient-rows {
+  display: grid;
+  gap: 8px;
+}
+
+.ingredient-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 7.5rem) auto;
+  gap: 8px;
+  align-items: end;
+}
+
+.ingredient-row input[readonly] {
+  color: var(--muted);
+}
+
+.form-grid .secondary-button,
+.card-actions .secondary-button {
+  min-height: 36px;
+  padding: 6px 14px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: 800;
+}
+
+.ingredient-block .secondary-button {
+  justify-self: start;
+}
+
+/* Sits beside the submit button, so match its height. */
+.form-grid #menuItemCancel {
+  min-height: 42px;
+}
+
+.form-grid .remove-button {
+  min-height: 42px;
+  padding: 0 12px;
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+.form-grid .secondary-button:hover:not(:disabled),
+.card-actions .secondary-button:hover:not(:disabled) {
+  background: var(--accent);
+  color: #111;
+}
+
+.form-grid button:disabled,
+.card-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.price-pill {
+  background: rgba(34, 197, 94, 0.14);
+  color: var(--accent-2);
+  font-size: 1rem;
+}
+
+.recipe-lines {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding-left: 18px;
+  font-size: 0.88rem;
+}
+
+.card-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+}
+
 .progress {
   overflow: hidden;
   height: 12px;
@@ -603,7 +709,7 @@ small,
   }
 
   .nav-tabs {
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(6, minmax(0, 1fr));
   }
 
   .tab-button {

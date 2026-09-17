@@ -304,6 +304,78 @@ test("preselection for an uncovered ingredient offers no sources and is unavaila
   assert.equal(tequila.short, false);
 });
 
+// ---------- current menu price (the Menu tab's "as it would ring up now") -----
+
+test("AE1: quoteMenuItem prices the margarita at 500 cents from the preselected sources", () => {
+  const bottles = ae1Bottles();
+  const quote = D.quoteMenuItem(margarita, ae1Context(bottles));
+  assert.equal(quote.available, true);
+  assert.deepEqual(quote.shortTypeIds, []);
+  assert.equal(quote.priceCents, 500);
+  assert.equal(Math.round(quote.costCents), 328);
+  assert.deepEqual(quote.ingredients.map((ingredient) => ingredient.sources), D.preselectSources(margarita, bottles).map((pick) => pick.sources));
+  assert.deepEqual(quote.sources, quote.ingredients.flatMap((ingredient) => ingredient.sources));
+  assert.deepEqual(quote.ingredients.map((ingredient) => ingredient.short), [false, false, false]);
+  // The same settings at 0% markup: 328 cents rounds up to 350.
+  assert.equal(D.quoteMenuItem(margarita, { ...ae1Context(bottles), markupPercent: 0 }).priceCents, 350);
+  // Nothing in the input is changed.
+  assert.deepEqual(bottles, ae1Bottles());
+});
+
+test("quoteMenuItem prices a short ingredient from the preselected item and then the next items in preselection order", () => {
+  const bottles = [
+    { id: "a", typeId: "t-tequila", size: 25.36, remaining: 0.25, price: 20, buyerId: "p-sam", date: "2026-02-01" },
+    { id: "c", typeId: "t-tequila", size: 25.36, remaining: 1, price: 60, buyerId: "p-jordan", date: "2026-01-01" },
+    { id: "b", typeId: "t-tequila", size: 25.36, remaining: 0.75, price: 40, buyerId: "p-alex", date: "2026-03-01" }
+  ];
+  const item = { kind: "cocktail", ingredients: [{ typeId: "t-tequila", amount: 1.5 }] };
+  const quote = D.quoteMenuItem(item, { bottles, types, people, markupPercent: 0, roundingIncrementCents: 25 });
+  assert.equal(quote.available, true);
+  assert.equal(quote.ingredients[0].short, true);
+  assert.deepEqual(quote.ingredients[0].sources, [
+    { bottleId: "a", amount: 0.25 },
+    { bottleId: "b", amount: 0.75 },
+    { bottleId: "c", amount: 0.5 }
+  ]);
+  const expected = D.priceRingUp(quote.sources, { bottles, types, people, markupPercent: 0, roundingIncrementCents: 25 });
+  assert.equal(quote.priceCents, expected.priceCents);
+  assert.equal(quote.costCents, expected.costCents);
+  assert.equal(D.validateSources(item.ingredients[0], quote.ingredients[0].sources, bottles).ok, true);
+});
+
+test("AE5: quoteMenuItem reports an item unavailable, with no price, when combined stock of a type is short", () => {
+  const bottles = ae1Bottles();
+  bottles[1].remaining = 0.25;
+  bottles.push({ id: "b-triple-2", typeId: "t-triple", size: 25.36, remaining: 0.25, price: 20, buyerId: "p-alex", date: "2026-09-02" });
+  const quote = D.quoteMenuItem(margarita, ae1Context(bottles));
+  assert.equal(quote.available, false);
+  assert.deepEqual(quote.shortTypeIds, ["t-triple"]);
+  assert.equal(quote.priceCents, null);
+  assert.equal(quote.costCents, null);
+  assert.deepEqual(quote.sources, []);
+  assert.equal(D.quoteMenuItem({ kind: "cocktail", ingredients: [] }, ae1Context(ae1Bottles())).available, false);
+});
+
+test("quoteMenuItem draws a type used twice from stock that is still left after the first use", () => {
+  const bottles = [
+    { id: "a", typeId: "t-tequila", size: 25.36, remaining: 3, price: 30, buyerId: "p-sam", date: "2026-01-01" },
+    { id: "b", typeId: "t-tequila", size: 25.36, remaining: 3, price: 30, buyerId: "p-alex", date: "2026-02-01" }
+  ];
+  const item = { kind: "cocktail", ingredients: [{ typeId: "t-tequila", amount: 2 }, { typeId: "t-tequila", amount: 2 }] };
+  const quote = D.quoteMenuItem(item, { bottles, types, people, markupPercent: 0, roundingIncrementCents: 1 });
+  assert.equal(quote.available, true);
+  assert.deepEqual(quote.ingredients.map((ingredient) => ingredient.sources), [[{ bottleId: "a", amount: 2 }], [{ bottleId: "b", amount: 2 }]]);
+  assert.deepEqual(D.validateRingUpSources(item, quote.ingredients.map((ingredient) => ingredient.sources), bottles), { ok: true, errors: [] });
+});
+
+test("quoteMenuItem prices a counted item at one unit", () => {
+  const bottles = [{ id: "pack", typeId: "t-lager", size: 12, remaining: 12, price: 18, buyerId: "p-jordan", date: "2026-09-01" }];
+  const item = { kind: "counted", ingredients: [{ typeId: "t-lager", amount: 3 }] };
+  const quote = D.quoteMenuItem(item, { ...ae1Context(bottles), roundingIncrementCents: 25 });
+  assert.deepEqual(quote.sources, [{ bottleId: "pack", amount: 1 }]);
+  assert.equal(quote.priceCents, 225);
+});
+
 // ---------- split validation --------------------------------------------------
 
 test("split validation accepts sources totalling the recipe amount", () => {
