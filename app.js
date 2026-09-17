@@ -1317,6 +1317,7 @@ function render() {
   renderOverview();
   renderTonight();
   renderInventory();
+  renderMenu();
   renderLedger();
   renderCrew();
 }
@@ -1626,6 +1627,220 @@ function renderInventory() {
       typeList.append(chip);
     });
   }
+}
+
+/*
+ * Menu tab (2.6.1-2.6.3, 2.6.5, 2.9.1). The menu item form's ingredient rows are
+ * built by hand and never rebuilt by render(), so a half-built recipe survives a
+ * save elsewhere or a background refresh; render() only refreshes each row's type
+ * options. Saves go through hostAction: the repository validates and applies.
+ */
+const MENU_KIND_LABELS = { cocktail: "Cocktail", straight: "Straight pour", counted: "Counted item" };
+const ONE_INGREDIENT_MESSAGES = {
+  straight: "A straight pour has exactly one ingredient.",
+  counted: "A counted item has exactly one ingredient."
+};
+
+/** The price a menu item would ring up at now (RNMBDomain.quoteMenuItem), or null when it cannot be costed. */
+function menuItemQuote(menuItem) {
+  try {
+    return RNMBDomain.quoteMenuItem(menuItem, {
+      bottles: state.bottles,
+      types: state.types,
+      people: state.people,
+      markupPercent: state.markupPercent,
+      roundingIncrementCents: state.roundingIncrementCents
+    });
+  } catch {
+    // A stock item with no size cannot be costed; show that rather than fail the render.
+    return null;
+  }
+}
+
+function menuItemFormField(name) {
+  return document.querySelector(`#menuItemForm [name='${name}']`);
+}
+
+function ingredientRows() {
+  return Array.from(document.querySelectorAll("#ingredientRows [data-ingredient-row]"));
+}
+
+/** Rebuild one row's type options, keeping the chosen type while it exists. */
+function fillIngredientTypeOptions(row, preferredTypeId) {
+  const select = row.querySelector("select[name='ingredientType']");
+  const chosen = preferredTypeId || select.value;
+  setOptions(select, state.types, (type) => `${type.name}${isCounted(type) ? " · counted" : ""}`, "Add types first");
+  if (state.types.some((type) => type.id === chosen)) select.value = chosen;
+}
+
+/** Amount label and limits follow the row's type; a counted item is always exactly 1 unit. */
+function syncIngredientRow(row) {
+  const kind = menuItemFormField("kind").value;
+  const type = typeById(row.querySelector("select[name='ingredientType']").value);
+  const input = row.querySelector("input[name='ingredientAmount']");
+  const label = row.querySelector("[data-amount-label]");
+  if (kind === "counted") {
+    input.value = "1";
+    input.readOnly = true;
+    input.min = "1";
+    input.step = "1";
+    label.textContent = "Units";
+    return;
+  }
+  input.readOnly = false;
+  input.min = isCounted(type) ? "1" : "0.01";
+  input.step = isCounted(type) ? "1" : "0.01";
+  label.textContent = isCounted(type) ? "Amount units" : "Amount oz";
+}
+
+function addIngredientRow({ id = "", typeId = "", amount = 1 } = {}) {
+  const row = document.createElement("div");
+  row.className = "ingredient-row";
+  row.dataset.ingredientRow = "";
+  row.dataset.ingredientId = id || "";
+  row.innerHTML = `
+    <label>
+      <span>Type</span>
+      <select name="ingredientType"></select>
+    </label>
+    <label>
+      <span data-amount-label>Amount oz</span>
+      <input name="ingredientAmount" type="number" min="0.01" step="0.01" value="${escapeHtml(String(amount))}">
+    </label>
+    <button class="remove-button" type="button" data-remove-ingredient aria-label="Remove ingredient">×</button>
+  `;
+  document.querySelector("#ingredientRows").append(row);
+  fillIngredientTypeOptions(row, typeId);
+  syncIngredientRow(row);
+  row.querySelectorAll("select, input, button").forEach((control) => {
+    control.disabled = !hostModeAvailable;
+  });
+  return row;
+}
+
+function setMenuItemFormMode(editing) {
+  document.querySelector("#menu-title").textContent = editing ? "Edit Menu Item" : "Add Menu Item";
+  document.querySelector("#menuItemSubmit").textContent = editing ? "Save Changes" : "Add Menu Item";
+  document.querySelector("#menuItemCancel").hidden = !editing;
+}
+
+function resetMenuItemForm() {
+  menuItemFormField("menuItemId").value = "";
+  menuItemFormField("name").value = "";
+  menuItemFormField("kind").value = "cocktail";
+  document.querySelector("#ingredientRows").innerHTML = "";
+  addIngredientRow();
+  setMenuItemFormMode(false);
+}
+
+function loadMenuItemIntoForm(menuItem) {
+  menuItemFormField("menuItemId").value = menuItem.id;
+  menuItemFormField("name").value = menuItem.name;
+  menuItemFormField("kind").value = menuItem.kind;
+  document.querySelector("#ingredientRows").innerHTML = "";
+  menuItem.ingredients.forEach((ingredient) => addIngredientRow(ingredient));
+  if (!menuItem.ingredients.length) addIngredientRow();
+  setMenuItemFormMode(true);
+  document.querySelector("#menuItemForm").scrollIntoView({ block: "nearest" });
+}
+
+/** Read the menu item form; returns { menuItem } or { error } with the toast to show (2.6.1). */
+function menuItemDraftFromForm() {
+  const name = menuItemFormField("name").value.trim();
+  const kind = menuItemFormField("kind").value;
+  const rows = ingredientRows();
+  if (!name) return { error: "A menu item needs a name." };
+  if (!MENU_KIND_LABELS[kind]) return { error: "A menu item is a cocktail, a straight pour or a counted item." };
+  if (!rows.length) return { error: "Add at least one ingredient." };
+  if (kind !== "cocktail" && rows.length !== 1) return { error: ONE_INGREDIENT_MESSAGES[kind] };
+  const ingredients = [];
+  for (const row of rows) {
+    const type = typeById(row.querySelector("select[name='ingredientType']").value);
+    if (!type) return { error: "Pick a stock type for every ingredient." };
+    if (kind === "counted" && !isCounted(type)) return { error: `A counted item needs a counted stock type, and ${type.name} is poured.` };
+    if (kind === "straight" && isCounted(type)) return { error: `A straight pour needs a poured stock type, and ${type.name} is counted.` };
+    const raw = row.querySelector("input[name='ingredientAmount']").value.trim();
+    const amount = kind === "counted" ? 1 : Number(raw);
+    if (!Number.isFinite(amount) || amount <= 0 || (kind !== "counted" && raw === "")) {
+      return { error: "Every ingredient needs an amount above zero." };
+    }
+    if (isCounted(type) && !Number.isInteger(amount)) return { error: `${type.name} is counted stock, so use a whole number of units.` };
+    ingredients.push({ id: row.dataset.ingredientId || undefined, typeId: type.id, amount });
+  }
+  return { menuItem: { id: menuItemFormField("menuItemId").value || undefined, name, kind, ingredients } };
+}
+
+function renderMenu() {
+  // KTD8: connected to a database without supabase/host-mode.sql, say so and lock the forms.
+  const locked = !hostModeAvailable;
+  const notice = document.querySelector("#menuHostModeNotice");
+  notice.hidden = !locked;
+  notice.textContent = locked ? HOST_MODE_SQL_MESSAGE : "";
+
+  ingredientRows().forEach((row) => {
+    fillIngredientTypeOptions(row);
+    syncIngredientRow(row);
+  });
+  const pricing = document.querySelector("#pricingForm");
+  // Never overwrite settings the user is part-way through changing.
+  if (pricing.dataset.dirty !== "true") {
+    pricing.querySelector("[name='markupPercent']").value = String(state.markupPercent);
+    pricing.querySelector("[name='roundingIncrement']").value = (state.roundingIncrementCents / 100).toFixed(2);
+  }
+  ["#menuItemForm", "#pricingForm"].forEach((selector) => {
+    Array.from(document.querySelector(selector).elements).forEach((control) => {
+      control.disabled = locked;
+    });
+  });
+
+  const target = document.querySelector("#menuList");
+  target.innerHTML = "";
+  target.classList.toggle("empty-state", state.menuItems.length === 0);
+  if (!state.menuItems.length) {
+    target.textContent = locked ? "The menu appears here once host mode is set up." : "No menu items yet.";
+    return;
+  }
+  state.menuItems.forEach((item) => {
+    const quote = menuItemQuote(item);
+    const recipe = RNMBDomain.menuItemIngredients(item).map((ingredient) => {
+      const type = typeById(ingredient.typeId);
+      return `<li>${amountText(type, ingredient.amount)} ${escapeHtml(type?.name || "Unknown type")}</li>`;
+    }).join("");
+    let price;
+    let detail;
+    if (!quote) {
+      price = `<span class="pill warn" data-menu-price>No price</span>`;
+      detail = "A stock item for this recipe has no size, so it cannot be costed.";
+    } else if (!quote.available) {
+      // 2.6.5: the combined stock of an ingredient type cannot cover the recipe.
+      const short = quote.shortTypeIds.map((typeId) => typeById(typeId)?.name || "an unknown type");
+      price = `<span class="pill hot" data-menu-price>Unavailable</span>`;
+      detail = short.length ? `Not enough ${short.join(", ")} in stock.` : "This item has no ingredients.";
+    } else {
+      const split = quote.ingredients.some((ingredient) => ingredient.short) ? " · poured from more than one bottle" : "";
+      price = `<span class="pill price-pill" data-menu-price>${money(quote.priceCents / 100)}</span>`;
+      detail = `Cost ${money(quote.costCents / 100)} · ${state.markupPercent}% markup${split}`;
+    }
+    const card = document.createElement("article");
+    card.className = "inventory-card menu-card";
+    card.dataset.menuItemId = item.id;
+    card.innerHTML = `
+      <header>
+        <div>
+          <strong>${escapeHtml(item.name)}</strong>
+          <small>${MENU_KIND_LABELS[item.kind] || "Menu item"}</small>
+        </div>
+        ${price}
+      </header>
+      <ul class="recipe-lines">${recipe}</ul>
+      <small data-menu-detail>${escapeHtml(detail)}</small>
+      <div class="card-actions">
+        <button class="secondary-button" type="button" data-edit-menu-item="${escapeHtml(item.id)}"${locked ? " disabled" : ""}>Edit</button>
+        <button class="remove-button" type="button" data-remove-menu-item="${escapeHtml(item.id)}" aria-label="Remove ${escapeHtml(item.name)}"${locked ? " disabled" : ""}>×</button>
+      </div>
+    `;
+    target.append(card);
+  });
 }
 
 function renderLedger() {
@@ -1973,6 +2188,99 @@ document.body.addEventListener("submit", async (event) => {
   form.querySelector("button[type='submit']").disabled = true;
   await hostAction("Stock level set.", (db) => db.correctStock({ bottleId: bottle.id, newRemaining }));
 });
+
+// ---- Menu tab ----
+document.querySelector("#menuItemForm [name='kind']").addEventListener("change", () => {
+  ingredientRows().forEach(syncIngredientRow);
+});
+
+document.querySelector("#ingredientRows").addEventListener("change", (event) => {
+  const row = event.target.closest("[data-ingredient-row]");
+  if (row && event.target.matches("select[name='ingredientType']")) syncIngredientRow(row);
+});
+
+document.querySelector("#ingredientRows").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-remove-ingredient]");
+  if (button) button.closest("[data-ingredient-row]").remove();
+});
+
+document.querySelector("#addIngredientRow").addEventListener("click", () => {
+  const kind = menuItemFormField("kind").value;
+  // 2.6.1: only a cocktail has more than one ingredient.
+  if (kind !== "cocktail" && ingredientRows().length >= 1) {
+    showToast(ONE_INGREDIENT_MESSAGES[kind]);
+    return;
+  }
+  addIngredientRow();
+});
+
+document.querySelector("#menuItemCancel").addEventListener("click", resetMenuItemForm);
+
+document.querySelector("#menuItemForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!hostModeAvailable) {
+    showToast(HOST_MODE_SQL_MESSAGE);
+    return;
+  }
+  const draft = menuItemDraftFromForm();
+  if (draft.error) {
+    showToast(draft.error);
+    return;
+  }
+  const editing = Boolean(draft.menuItem.id);
+  const saved = await hostAction(editing ? "Menu item updated." : "Menu item added.", (db) => db.saveMenuItem(draft.menuItem));
+  if (saved) resetMenuItemForm();
+});
+
+document.querySelector("#pricingForm").addEventListener("input", (event) => {
+  event.currentTarget.dataset.dirty = "true";
+});
+
+document.querySelector("#pricingForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  if (!hostModeAvailable) {
+    showToast(HOST_MODE_SQL_MESSAGE);
+    return;
+  }
+  const markupRaw = form.querySelector("[name='markupPercent']").value.trim();
+  const incrementRaw = form.querySelector("[name='roundingIncrement']").value.trim();
+  const markupPercent = Number(markupRaw);
+  const incrementDollars = Number(incrementRaw);
+  if (markupRaw === "" || !Number.isFinite(markupPercent) || markupPercent < 0) {
+    showToast("The markup must be a percentage of 0 or more.");
+    return;
+  }
+  // Stored as whole cents above zero (KTD11): $0.25 is 25.
+  const roundingIncrementCents = Math.round(incrementDollars * 100);
+  if (incrementRaw === "" || !Number.isFinite(incrementDollars) || roundingIncrementCents <= 0 ||
+    Math.abs(incrementDollars * 100 - roundingIncrementCents) > 1e-6) {
+    showToast("Round up to a whole number of cents, $0.01 or more (for example 0.25).");
+    return;
+  }
+  const saved = await hostAction("Pricing saved.", (db) => db.updatePricing({ markupPercent, roundingIncrementCents }));
+  if (saved) {
+    delete form.dataset.dirty;
+    renderMenu();
+  }
+});
+
+document.querySelector("#menuList").addEventListener("click", async (event) => {
+  const editButton = event.target.closest("[data-edit-menu-item]");
+  const removeButton = event.target.closest("[data-remove-menu-item]");
+  if (editButton) {
+    const item = state.menuItems.find((entry) => entry.id === editButton.dataset.editMenuItem);
+    if (item) loadMenuItemIntoForm(item);
+    return;
+  }
+  if (!removeButton) return;
+  const item = state.menuItems.find((entry) => entry.id === removeButton.dataset.removeMenuItem);
+  if (!item || !confirm(`Remove ${item.name} from the menu? Drinks already rung up keep their name and price.`)) return;
+  const removed = await hostAction("Menu item removed.", (db) => db.removeMenuItem(item.id));
+  if (removed && menuItemFormField("menuItemId").value === item.id) resetMenuItemForm();
+});
+
+resetMenuItemForm();
 
 function bottleHasSales(bottleId) {
   return state.ringUps.some((ringUp) => ringUp.lines.some((line) => line.bottleId === bottleId));

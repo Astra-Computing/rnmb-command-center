@@ -151,6 +151,118 @@ async function logPourViaForm(session, { personName, bottleId, amount }) {
   await clickForToast(session, "#pourForm button[type='submit']", "Pour logged.");
 }
 
+/**
+ * A stub Supabase whose database has never run supabase/host-mode.sql: the
+ * host-mode tables answer 404, and any write carrying a host-mode column gets 400.
+ */
+function preMigrationStub() {
+  const NEW_TABLES = ["rnmb_menu_items", "rnmb_recipe_ingredients", "rnmb_guest_tabs", "rnmb_ring_ups", "rnmb_ring_up_lines", "rnmb_stock_adjustments"];
+  const NEW_COLUMNS = /"(measure|unit_oz|kind|ended_at|markup_percent|rounding_increment_cents)"\s*:/;
+  const store = {
+    rnmb_people: [], rnmb_beverage_types: [], rnmb_bottles: [], rnmb_nights: [], rnmb_pours: [],
+    rnmb_settings: [{ id: true, active_night_id: null, responsible_mode: true }]
+  };
+  const served400 = [];
+  const unexpected = [];
+  const writes = [];
+
+  const routes = async (page) => {
+    await page.route("**/api/config", (route) => route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ enabled: true, supabaseUrl: `${baseUrl}/stub-supabase`, supabaseAnonKey: "stub-key" })
+    }));
+    await page.route("**/stub-supabase/rest/v1/**", (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      const path = url.pathname.replace(/^.*\/rest\/v1\//, "");
+      const method = request.method();
+      const json = (status, body) => route.fulfill({ status, contentType: "application/json", body: body === undefined ? "" : JSON.stringify(body) });
+
+      if (path === "rpc/rnmb_authorized") return json(200, true);
+      if (path.startsWith("rpc/")) {
+        unexpected.push(`${method} ${path}`);
+        return json(404, { code: "PGRST202", message: "function not found" });
+      }
+      if (NEW_TABLES.includes(path)) {
+        if (method !== "GET") unexpected.push(`${method} ${path}`);
+        return json(404, { code: "PGRST205", message: `Could not find the table 'public.${path}' in the schema cache` });
+      }
+      if (!(path in store)) {
+        unexpected.push(`${method} ${path}`);
+        return json(404, { code: "PGRST205", message: "unknown table" });
+      }
+      if (method === "GET") return json(200, store[path]);
+
+      const body = request.postData() || "";
+      if (NEW_COLUMNS.test(body)) {
+        served400.push(`${method} ${path} ${body}`);
+        return json(400, { code: "PGRST204", message: "Could not find a new column in the schema cache" });
+      }
+      if (method === "POST") {
+        const rows = JSON.parse(body);
+        writes.push({ table: path, rows });
+        if (path === "rnmb_settings") store.rnmb_settings = rows;
+        else store[path].push(...rows);
+        return route.fulfill({ status: 201, body: "" });
+      }
+      if (method === "PATCH") {
+        writes.push({ table: path, rows: [JSON.parse(body)] });
+        if (path === "rnmb_settings") Object.assign(store.rnmb_settings[0], JSON.parse(body));
+        return route.fulfill({ status: 204, body: "" });
+      }
+      unexpected.push(`${method} ${path}`);
+      return route.fulfill({ status: 204, body: "" });
+    });
+  };
+
+  const expected404 = (message) => resourceStatusError(message, 404, (url) => NEW_TABLES.some((table) => url.includes(`/rest/v1/${table}?`)));
+  return { store, served400, unexpected, writes, routes, expected404 };
+}
+
+const HOST_MODE_SQL_MESSAGE = "Host mode is not set up on the shared database yet. Run supabase/host-mode.sql in Supabase, then reload.";
+
+/** Add priced stock through the Add Stock form, bought by a named crew member. */
+async function addPricedStockViaForm(session, { typeId, nickname, size, price, buyerName }) {
+  const { page } = session;
+  await page.click('.tab-button[data-tab="inventory"]');
+  const buyerId = await page.evaluate((name) => window.__rnmb.state.people.find((person) => person.name === name)?.id, buyerName);
+  assert.ok(buyerId, `${buyerName} is on the roster`);
+  await page.selectOption("#bottleForm [name='buyerId']", buyerId);
+  await page.fill("#bottleForm [name='price']", String(price));
+  return addStockViaForm(session, { typeId, nickname, size });
+}
+
+const menuCard = (page, name) => page.locator("#menuList .menu-card", { hasText: name });
+const menuItemCount = (page) => page.evaluate(() => window.__rnmb.state.menuItems.length);
+
+/** Fill ingredient row `index` (0-based) with a type and, unless locked, an amount. */
+async function fillIngredientRow(page, index, { typeId, amount }) {
+  const row = page.locator("#ingredientRows [data-ingredient-row]").nth(index);
+  await row.locator("select[name='ingredientType']").selectOption(typeId);
+  if (amount !== undefined) await row.locator("input[name='ingredientAmount']").fill(String(amount));
+}
+
+/** Set markup and rounding through the Pricing form. */
+async function setPricingViaForm(session, { markupPercent, increment }) {
+  const { page } = session;
+  await page.click('.tab-button[data-tab="menu"]');
+  await page.fill("#pricingForm [name='markupPercent']", String(markupPercent));
+  await page.fill("#pricingForm [name='roundingIncrement']", String(increment));
+  await clickForToast(session, "#pricingForm button[type='submit']", "Pricing saved.");
+}
+
+/** The AE1 stock: tequila (Sam), triple sec (Alex) and lime juice (Jordan), through the forms. */
+async function addAe1Stock(session) {
+  const tequila = await addTypeViaForm(session, { name: "Tequila", category: "Tequila", abv: 40 });
+  const tripleSec = await addTypeViaForm(session, { name: "Triple Sec", category: "Liqueur", abv: 30 });
+  const lime = await addTypeViaForm(session, { name: "Lime juice", category: "Mixer", abv: 0 });
+  await addPricedStockViaForm(session, { typeId: tequila.id, nickname: "Sam's tequila", size: 25.36, price: 30, buyerName: "Sam" });
+  await addPricedStockViaForm(session, { typeId: tripleSec.id, nickname: "Alex's triple sec", size: 25.36, price: 20, buyerName: "Alex" });
+  await addPricedStockViaForm(session, { typeId: lime.id, nickname: "Jordan's lime", size: 32, price: 4, buyerName: "Jordan" });
+  return { tequila, tripleSec, lime };
+}
+
 const scenarios = [
   {
     name: "U3 local boot with no /api/config, Reload demo, Export carries every host-mode collection",
@@ -319,66 +431,7 @@ const scenarios = [
   {
     name: "U3 pre-migration database: add a type, start a night, switch nights with no new columns sent",
     async run({ browser }) {
-      const NEW_TABLES = ["rnmb_menu_items", "rnmb_recipe_ingredients", "rnmb_guest_tabs", "rnmb_ring_ups", "rnmb_ring_up_lines", "rnmb_stock_adjustments"];
-      const NEW_COLUMNS = /"(measure|unit_oz|kind|ended_at|markup_percent|rounding_increment_cents)"\s*:/;
-      const store = {
-        rnmb_people: [], rnmb_beverage_types: [], rnmb_bottles: [], rnmb_nights: [], rnmb_pours: [],
-        rnmb_settings: [{ id: true, active_night_id: null, responsible_mode: true }]
-      };
-      const served400 = [];
-      const unexpected = [];
-      const writes = [];
-
-      const routes = async (page) => {
-        await page.route("**/api/config", (route) => route.fulfill({
-          status: 200,
-          contentType: "application/json",
-          body: JSON.stringify({ enabled: true, supabaseUrl: `${baseUrl}/stub-supabase`, supabaseAnonKey: "stub-key" })
-        }));
-        await page.route("**/stub-supabase/rest/v1/**", (route) => {
-          const request = route.request();
-          const url = new URL(request.url());
-          const path = url.pathname.replace(/^.*\/rest\/v1\//, "");
-          const method = request.method();
-          const json = (status, body) => route.fulfill({ status, contentType: "application/json", body: body === undefined ? "" : JSON.stringify(body) });
-
-          if (path === "rpc/rnmb_authorized") return json(200, true);
-          if (path.startsWith("rpc/")) {
-            unexpected.push(`${method} ${path}`);
-            return json(404, { code: "PGRST202", message: "function not found" });
-          }
-          if (NEW_TABLES.includes(path)) {
-            return json(404, { code: "PGRST205", message: `Could not find the table 'public.${path}' in the schema cache` });
-          }
-          if (!(path in store)) {
-            unexpected.push(`${method} ${path}`);
-            return json(404, { code: "PGRST205", message: "unknown table" });
-          }
-          if (method === "GET") return json(200, store[path]);
-
-          const body = request.postData() || "";
-          if (NEW_COLUMNS.test(body)) {
-            served400.push(`${method} ${path} ${body}`);
-            return json(400, { code: "PGRST204", message: "Could not find a new column in the schema cache" });
-          }
-          if (method === "POST") {
-            const rows = JSON.parse(body);
-            writes.push({ table: path, rows });
-            if (path === "rnmb_settings") store.rnmb_settings = rows;
-            else store[path].push(...rows);
-            return route.fulfill({ status: 201, body: "" });
-          }
-          if (method === "PATCH") {
-            writes.push({ table: path, rows: [JSON.parse(body)] });
-            if (path === "rnmb_settings") Object.assign(store.rnmb_settings[0], JSON.parse(body));
-            return route.fulfill({ status: 204, body: "" });
-          }
-          unexpected.push(`${method} ${path}`);
-          return route.fulfill({ status: 204, body: "" });
-        });
-      };
-
-      const expected404 = (message) => resourceStatusError(message, 404, (url) => NEW_TABLES.some((table) => url.includes(`/rest/v1/${table}?`)));
+      const { store, served400, unexpected, writes, routes, expected404 } = preMigrationStub();
       const session = await openPage(browser, { routes, allowConsole: expected404 });
       const { page } = session;
       try {
@@ -695,6 +748,315 @@ const scenarios = [
         } finally {
           await session.close();
         }
+      }
+    }
+  },
+
+  {
+    name: "U5 AE1 a margarita built in the Menu tab shows $5.00 at 50% / $0.50, and 0% markup reprices the list at once",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const people = await page.evaluate(() => window.__rnmb.state.people.map((person) => person.name));
+        ["Sam", "Alex", "Jordan"].forEach((name) => assert.ok(people.includes(name), `demo roster has ${name}`));
+        const { tequila, tripleSec, lime } = await addAe1Stock(session);
+
+        await page.click('.tab-button[data-tab="menu"]');
+        assert.equal(await page.textContent("#pageTitle"), "Menu", "the page title follows the Menu tab");
+        assert.equal(await page.isVisible("#menu"), true);
+        assert.equal(await page.isVisible("#menuHostModeNotice"), false, "no host-mode notice in local mode");
+
+        await setPricingViaForm(session, { markupPercent: 50, increment: "0.50" });
+        assert.deepEqual(
+          await page.evaluate(() => ({ markup: window.__rnmb.state.markupPercent, cents: window.__rnmb.state.roundingIncrementCents })),
+          { markup: 50, cents: 50 },
+          "the increment is stored as integer cents"
+        );
+        assert.equal(await page.inputValue("#pricingForm [name='roundingIncrement']"), "0.50");
+
+        const before = await menuItemCount(page);
+        await page.fill("#menuItemForm [name='name']", "Margarita");
+        assert.equal(await page.inputValue("#menuItemForm [name='kind']"), "cocktail");
+        await fillIngredientRow(page, 0, { typeId: tequila.id, amount: 2 });
+        await page.click("#addIngredientRow");
+        await fillIngredientRow(page, 1, { typeId: tripleSec.id, amount: 1 });
+        await page.click("#addIngredientRow");
+        await fillIngredientRow(page, 2, { typeId: lime.id, amount: 1 });
+        assert.equal((await page.locator("#ingredientRows [data-amount-label]").nth(0).textContent()).trim(), "Amount oz");
+        await clickForToast(session, "#menuItemSubmit", "Menu item added.");
+
+        const saved = await page.evaluate(() => window.__rnmb.state.menuItems.find((item) => item.name === "Margarita"));
+        assert.equal(await menuItemCount(page), before + 1);
+        assert.equal(saved.kind, "cocktail");
+        assert.deepEqual(saved.ingredients.map(({ typeId, amount }) => ({ typeId, amount })), [
+          { typeId: tequila.id, amount: 2 },
+          { typeId: tripleSec.id, amount: 1 },
+          { typeId: lime.id, amount: 1 }
+        ]);
+        assert.equal(await page.locator("#ingredientRows [data-ingredient-row]").count(), 1, "the form resets to one empty row");
+        assert.equal(await page.inputValue("#menuItemForm [name='name']"), "");
+
+        const card = menuCard(page, "Margarita");
+        assert.equal((await card.locator("[data-menu-price]").textContent()).trim(), "$5.00");
+        const text = await card.textContent();
+        assert.match(text, /Cocktail/);
+        assert.match(text, /2\.0 oz Tequila/);
+        assert.match(text, /1\.0 oz Triple Sec/);
+        assert.match(text, /1\.0 oz Lime juice/);
+        assert.match(text, /Cost \$3\.28 · 50% markup/);
+        const bourbonBefore = (await menuCard(page, "Bourbon Neat").locator("[data-menu-price]").textContent()).trim();
+
+        // 0% markup: $3.28 rounds up to $3.50, and every listed price follows.
+        await setPricingViaForm(session, { markupPercent: 0, increment: "0.50" });
+        assert.equal((await card.locator("[data-menu-price]").textContent()).trim(), "$3.50");
+        assert.match(await card.textContent(), /0% markup/);
+        const bourbonAfter = (await menuCard(page, "Bourbon Neat").locator("[data-menu-price]").textContent()).trim();
+        assert.notEqual(bourbonAfter, bourbonBefore, "other items reprice too");
+        assert.equal(await page.inputValue("#pricingForm [name='markupPercent']"), "0");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U5 a straight pour refuses a second ingredient and a counted item refuses a poured type, saving nothing",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const can = await addTypeViaForm(session, { name: "Lager can", category: "Beer", measure: "unit", unitOz: 12, abv: 5 });
+        const bourbonId = await page.evaluate(() => window.__rnmb.state.types.find((type) => type.name === "House Bourbon").id);
+        await page.click('.tab-button[data-tab="menu"]');
+        const before = await menuItemCount(page);
+        const rows = page.locator("#ingredientRows [data-ingredient-row]");
+
+        // Straight pour: the add control refuses a second row.
+        await page.fill("#menuItemForm [name='name']", "Double pour");
+        await page.selectOption("#menuItemForm [name='kind']", "straight");
+        await fillIngredientRow(page, 0, { typeId: bourbonId, amount: 2 });
+        await clickForToast(session, "#addIngredientRow", "A straight pour has exactly one ingredient.");
+        assert.equal(await rows.count(), 1);
+
+        // Two rows built as a cocktail, then switched to a straight pour: submit refuses.
+        await page.selectOption("#menuItemForm [name='kind']", "cocktail");
+        await page.click("#addIngredientRow");
+        await fillIngredientRow(page, 1, { typeId: bourbonId, amount: 1 });
+        assert.equal(await rows.count(), 2);
+        await page.selectOption("#menuItemForm [name='kind']", "straight");
+        await clickForToast(session, "#menuItemSubmit", "A straight pour has exactly one ingredient.");
+        assert.equal(await menuItemCount(page), before, "nothing saved");
+
+        // A straight pour of a counted type is refused too.
+        await rows.nth(1).locator("[data-remove-ingredient]").click();
+        await fillIngredientRow(page, 0, { typeId: can.id });
+        await clickForToast(session, "#menuItemSubmit", "A straight pour needs a poured stock type, and Lager can is counted.");
+        assert.equal(await menuItemCount(page), before, "nothing saved");
+
+        // Counted item: the amount is locked to 1 unit, and a poured type is refused.
+        await page.selectOption("#menuItemForm [name='kind']", "counted");
+        await fillIngredientRow(page, 0, { typeId: bourbonId });
+        const amount = rows.nth(0).locator("input[name='ingredientAmount']");
+        assert.equal(await amount.inputValue(), "1");
+        assert.equal(await amount.evaluate((input) => input.readOnly), true, "the counted amount is locked");
+        assert.equal((await rows.nth(0).locator("[data-amount-label]").textContent()).trim(), "Units");
+        await clickForToast(session, "#addIngredientRow", "A counted item has exactly one ingredient.");
+        await clickForToast(session, "#menuItemSubmit", "A counted item needs a counted stock type, and House Bourbon is poured.");
+        assert.equal(await menuItemCount(page), before, "nothing saved");
+        assert.equal(await page.evaluate(() => localStorage.getItem("rnmb-command-center-v1").includes("Double pour")), false);
+
+        // With a counted type it saves, as exactly 1 unit.
+        await fillIngredientRow(page, 0, { typeId: can.id });
+        await page.fill("#menuItemForm [name='name']", "Can of lager");
+        await clickForToast(session, "#menuItemSubmit", "Menu item added.");
+        const saved = await page.evaluate(() => window.__rnmb.state.menuItems.find((item) => item.name === "Can of lager"));
+        assert.equal(saved.kind, "counted");
+        assert.deepEqual(saved.ingredients.map(({ typeId, amount }) => ({ typeId, amount })), [{ typeId: can.id, amount: 1 }]);
+        assert.match(await menuCard(page, "Can of lager").textContent(), /1 unit Lager can/);
+        assert.equal((await menuCard(page, "Can of lager").locator("[data-menu-price]").textContent()).trim(), "Unavailable", "no can stock yet");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U5 AE5 a margarita whose triple sec totals 0.5 oz shows Unavailable, and after a hand correction is priced across both bottles",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const tripleSec = await addTypeViaForm(session, { name: "Triple Sec", category: "Liqueur", abv: 30 });
+        const a = await addPricedStockViaForm(session, { typeId: tripleSec.id, nickname: "Triple A", size: 25.36, price: 20, buyerName: "Alex" });
+        const b = await addPricedStockViaForm(session, { typeId: tripleSec.id, nickname: "Triple B", size: 25.36, price: 40, buyerName: "Sam" });
+        const setLevel = async (bottleId, level) => {
+          const form = `#inventoryList [data-bottle-id="${bottleId}"] .level-form`;
+          await page.click('.tab-button[data-tab="inventory"]');
+          await page.fill(`${form} input[name='level']`, String(level));
+          await clickForToast(session, `${form} button[type='submit']`, "Stock level set.");
+        };
+        await setLevel(a.id, 0.25);
+        await setLevel(b.id, 0.25);
+
+        await page.click('.tab-button[data-tab="menu"]');
+        await page.fill("#menuItemForm [name='name']", "Margarita");
+        await fillIngredientRow(page, 0, { typeId: tripleSec.id, amount: 1 });
+        await clickForToast(session, "#menuItemSubmit", "Menu item added.");
+        const card = menuCard(page, "Margarita");
+        assert.equal((await card.locator("[data-menu-price]").textContent()).trim(), "Unavailable");
+        assert.match(await card.locator("[data-menu-detail]").textContent(), /Not enough Triple Sec in stock/);
+
+        // Corrected by hand: 0.25 + 0.75 = 1 oz combined. 0.25 oz at $20 and 0.75 oz at $40 per 25.36 oz
+        // cost 138 cents, which rounds up to $1.50 at 0% / $0.25 (either bottle alone would be $1.00 or $1.75).
+        await setLevel(b.id, 0.75);
+        await page.click('.tab-button[data-tab="menu"]');
+        assert.equal((await card.locator("[data-menu-price]").textContent()).trim(), "$1.50");
+        assert.match(await card.locator("[data-menu-detail]").textContent(), /more than one bottle/);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U5 editing a menu item keeps its id and changes its recipe; removing it asks first and takes it off the list",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await page.click('.tab-button[data-tab="menu"]');
+        const original = await page.evaluate(() => window.__rnmb.state.menuItems.find((item) => item.name === "Bourbon Neat"));
+        const count = await menuItemCount(page);
+
+        await menuCard(page, "Bourbon Neat").locator("[data-edit-menu-item]").click();
+        assert.equal((await page.textContent("#menu-title")).trim(), "Edit Menu Item");
+        assert.equal(await page.isVisible("#menuItemCancel"), true);
+        assert.equal(await page.inputValue("#menuItemForm [name='name']"), "Bourbon Neat");
+        assert.equal(await page.inputValue("#menuItemForm [name='kind']"), "straight");
+        const row = page.locator("#ingredientRows [data-ingredient-row]");
+        assert.equal(await row.count(), 1);
+        assert.equal(await row.nth(0).locator("select").inputValue(), original.ingredients[0].typeId);
+        assert.equal(await row.nth(0).locator("input[name='ingredientAmount']").inputValue(), "2");
+
+        await page.fill("#menuItemForm [name='name']", "Bourbon Short");
+        await row.nth(0).locator("input[name='ingredientAmount']").fill("1.5");
+        await clickForToast(session, "#menuItemSubmit", "Menu item updated.");
+        const edited = await page.evaluate((id) => window.__rnmb.state.menuItems.find((item) => item.id === id), original.id);
+        assert.equal(await menuItemCount(page), count, "an edit does not add an item");
+        assert.equal(edited.name, "Bourbon Short");
+        assert.equal(edited.ingredients.length, 1);
+        assert.equal(edited.ingredients[0].amount, 1.5);
+        assert.equal((await page.textContent("#menu-title")).trim(), "Add Menu Item", "the form leaves edit mode");
+        assert.equal(await page.isVisible("#menuItemCancel"), false);
+        assert.match(await menuCard(page, "Bourbon Short").textContent(), /1\.5 oz House Bourbon/);
+        assert.equal(await menuCard(page, "Bourbon Neat").count(), 0);
+
+        let dialogMessage = "";
+        page.once("dialog", (dialog) => { dialogMessage = dialog.message(); });
+        await clickForToast(session, `#menuList [data-remove-menu-item="${original.id}"]`, "Menu item removed.");
+        assert.match(dialogMessage, /Remove Bourbon Short from the menu\?/);
+        assert.equal(await menuItemCount(page), count - 1);
+        assert.equal(await menuCard(page, "Bourbon Short").count(), 0);
+        const stored = await page.evaluate(() => JSON.parse(localStorage.getItem("rnmb-command-center-v1")).menuItems.map((item) => item.id));
+        assert.ok(!stored.includes(original.id), "the removal is stored");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U5 Menu tab controls have non-zero bounding boxes at 1440 and 400 widths, with no horizontal scroll",
+    async run({ browser }) {
+      for (const viewport of [{ width: 1440, height: 1000 }, { width: 400, height: 900 }]) {
+        const session = await openPage(browser, { allowConsole: apiConfig404, viewport });
+        const { page } = session;
+        try {
+          await page.click('.tab-button[data-tab="menu"]');
+          await page.click("#addIngredientRow");
+          const cards = await page.$$eval("#menuList .menu-card", (list) => list.map((card) => card.dataset.menuItemId));
+          assert.ok(cards.length >= 3, "every demo menu item has a card");
+          await page.click(`#menuList [data-edit-menu-item="${cards[0]}"]`);
+          await page.selectOption("#menuItemForm [name='kind']", "cocktail");
+          await page.click("#addIngredientRow");
+
+          const selectors = [
+            '.tab-button[data-tab="menu"]',
+            "#menuItemForm [name='name']",
+            "#menuItemForm [name='kind']",
+            "#ingredientRows [data-ingredient-row]:nth-child(1) select[name='ingredientType']",
+            "#ingredientRows [data-ingredient-row]:nth-child(1) input[name='ingredientAmount']",
+            "#ingredientRows [data-ingredient-row]:nth-child(2) select[name='ingredientType']",
+            "#ingredientRows [data-ingredient-row]:nth-child(2) input[name='ingredientAmount']",
+            "#ingredientRows [data-ingredient-row]:nth-child(2) [data-remove-ingredient]",
+            "#addIngredientRow",
+            "#menuItemSubmit",
+            "#menuItemCancel",
+            "#pricingForm [name='markupPercent']",
+            "#pricingForm [name='roundingIncrement']",
+            "#pricingForm button[type='submit']"
+          ];
+          cards.forEach((id) => {
+            selectors.push(`#menuList [data-menu-item-id="${id}"] [data-menu-price]`);
+            selectors.push(`#menuList [data-edit-menu-item="${id}"]`);
+            selectors.push(`#menuList [data-remove-menu-item="${id}"]`);
+          });
+          for (const selector of selectors) {
+            await page.locator(selector).scrollIntoViewIfNeeded();
+            const box = await page.locator(selector).boundingBox();
+            assert.ok(box && box.width > 0 && box.height > 0, `${selector} has a non-zero box at ${viewport.width}px (got ${JSON.stringify(box)})`);
+          }
+          const widths = await page.evaluate(() => ({ scroll: document.documentElement.scrollWidth, client: document.documentElement.clientWidth }));
+          assert.ok(widths.scroll <= widths.client, `no horizontal scroll at ${viewport.width}px (scrollWidth ${widths.scroll} > ${widths.client})`);
+          // Ingredient controls stay inside the form.
+          const overflow = await page.$$eval("#ingredientRows [data-ingredient-row]", (rows) => rows
+            .map((row, index) => (row.querySelector("[data-remove-ingredient]").getBoundingClientRect().right <= document.querySelector("#menuItemForm").getBoundingClientRect().right + 0.5 ? null : index))
+            .filter((index) => index !== null));
+          assert.deepEqual(overflow, [], `ingredient rows overflow the form at ${viewport.width}px`);
+          session.assertClean();
+        } finally {
+          await session.close();
+        }
+      }
+    }
+  },
+
+  {
+    name: "U5 pre-migration database: the Menu tab names supabase/host-mode.sql and its forms are disabled",
+    async run({ browser }) {
+      const { writes, served400, unexpected, routes, expected404 } = preMigrationStub();
+      const session = await openPage(browser, { routes, allowConsole: expected404 });
+      const { page } = session;
+      try {
+        await session.waitForToast("Connected to Supabase.");
+        assert.equal(await page.evaluate(() => window.__rnmb.hostModeAvailable), false);
+        await page.click('.tab-button[data-tab="menu"]');
+        assert.equal(await page.textContent("#pageTitle"), "Menu");
+        assert.equal(await page.isVisible("#menuHostModeNotice"), true);
+        assert.equal((await page.textContent("#menuHostModeNotice")).trim(), HOST_MODE_SQL_MESSAGE);
+
+        const controls = await page.$$eval("#menuItemForm input, #menuItemForm select, #menuItemForm button, #pricingForm input, #pricingForm button", (list) => list
+          .map((control) => ({ name: control.name || control.id || control.textContent.trim(), disabled: control.disabled })));
+        assert.ok(controls.length >= 8, "the Menu forms have their controls");
+        assert.deepEqual(controls.filter((control) => !control.disabled), [], "every Menu form control is disabled");
+        assert.match(await page.textContent("#menuList"), /once host mode is set up/);
+
+        // Even a submit that bypasses the disabled button saves nothing and names the fix.
+        const writesBefore = writes.length;
+        const count = (await session.toasts()).length;
+        await page.evaluate(() => document.querySelector("#pricingForm").requestSubmit());
+        await page.waitForFunction(({ count, text }) => window.__toasts.slice(count).includes(text), { count, text: HOST_MODE_SQL_MESSAGE });
+        assert.equal(writes.length, writesBefore, "no write was sent");
+        assert.deepEqual(served400, []);
+        assert.deepEqual(unexpected, []);
+        session.assertClean();
+      } finally {
+        await session.close();
       }
     }
   }

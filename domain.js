@@ -42,6 +42,9 @@
  *   combinedRemaining(bottles, typeId) -> number
  *   menuItemAvailability(menuItem, bottles) -> { available, shortTypeIds[] }
  *   preselectSources(menuItem, bottles) -> [{ typeId, amount, sources[source], short, available }]
+ *   quoteMenuItem(menuItem, { bottles, types, people, markupPercent, roundingIncrementCents })
+ *               -> { available, shortTypeIds[], ingredients[{ typeId, amount, sources[source], short }],
+ *                    sources[source], costCents|null, priceCents|null } (the price if rung up now)
  *   validateSources(ingredient, sources, bottles) -> { ok, errors[] }
  *   validateRingUpSources(menuItem, sourcesPerIngredient[[source]], bottles) -> { ok, errors[] }
  *   stockDeltasForRingUp(lines) -> [{ bottleId, delta (negative) }]
@@ -333,6 +336,75 @@ var RNMBDomain = (function () {
       }
       return result;
     });
+  }
+
+  /**
+   * The price a menu item would ring up at now, for the Menu tab (2.6.3, 2.6.5).
+   * Unavailable items get no sources and a null price. Otherwise each ingredient
+   * uses preselectSources' pick; a short ingredient then draws the rest from the
+   * next items of its type in preselection order, so the price is one the register
+   * could really charge. Ingredients are sourced in recipe order against the stock
+   * the earlier ones left, so a type used twice never counts the same ounces twice.
+   * context: { bottles, types, people, markupPercent, roundingIncrementCents }.
+   */
+  function quoteMenuItem(menuItem, context) {
+    var ctx = context || {};
+    var availability = menuItemAvailability(menuItem, ctx.bottles);
+    var unavailable = {
+      available: false,
+      shortTypeIds: availability.shortTypeIds,
+      ingredients: [],
+      sources: [],
+      costCents: null,
+      priceCents: null
+    };
+    if (!availability.available) return unavailable;
+
+    var working = (ctx.bottles || []).map(function (bottle) { return Object.assign({}, bottle); });
+    var workingById = byId(working);
+    var ingredients = [];
+    var covered = menuItemIngredients(menuItem).every(function (ingredient) {
+      var pick = preselectSources({ kind: "cocktail", ingredients: [ingredient] }, working)[0];
+      if (!pick.available) return false;
+      var sources = pick.sources.slice();
+      if (pick.short) {
+        var left = round6(ingredient.amount - sources[0].amount);
+        candidatesFor(working, ingredient.typeId).forEach(function (bottle) {
+          if (left <= AMOUNT_EPSILON || bottle.id === sources[0].bottleId) return;
+          var take = round6(Math.min(remainingOf(bottle), left));
+          sources.push({ bottleId: bottle.id, amount: take });
+          left = round6(left - take);
+        });
+        if (left > AMOUNT_EPSILON) return false;
+      }
+      sources.forEach(function (source) {
+        var bottle = workingById.get(source.bottleId);
+        bottle.remaining = round6(remainingOf(bottle) - source.amount);
+      });
+      ingredients.push({ typeId: ingredient.typeId, amount: ingredient.amount, sources: sources, short: pick.short });
+      return true;
+    });
+    if (!covered) return unavailable;
+
+    var flat = [];
+    ingredients.forEach(function (ingredient) {
+      ingredient.sources.forEach(function (source) { flat.push(source); });
+    });
+    var priced = priceRingUp(flat, {
+      bottles: ctx.bottles,
+      types: ctx.types,
+      people: ctx.people,
+      markupPercent: ctx.markupPercent,
+      roundingIncrementCents: ctx.roundingIncrementCents
+    });
+    return {
+      available: true,
+      shortTypeIds: [],
+      ingredients: ingredients,
+      sources: flat,
+      costCents: priced.costCents,
+      priceCents: priced.priceCents
+    };
   }
 
   // ---------- split validation (1.7.7) -----------------------------------------
@@ -717,6 +789,7 @@ var RNMBDomain = (function () {
     combinedRemaining: combinedRemaining,
     menuItemAvailability: menuItemAvailability,
     preselectSources: preselectSources,
+    quoteMenuItem: quoteMenuItem,
     validateSources: validateSources,
     validateRingUpSources: validateRingUpSources,
     stockDeltasForRingUp: stockDeltasForRingUp,
