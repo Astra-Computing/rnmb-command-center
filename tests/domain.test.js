@@ -862,7 +862,8 @@ test("normalizeState keeps host nights, the browser-only local mark only when li
   });
   assert.deepEqual(state.nights[0], { id: "h1", name: "Party", date: "2026-09-16", kind: "host", endedAt: null, pours: [], startedLocally: true });
   assert.deepEqual(state.nights[1], { id: "h2", name: "Old party", date: "2026-09-01", kind: "host", endedAt: "2026-09-02T03:00:00Z", pours: [] });
-  assert.deepEqual(state.nights[2], { id: "c1", name: "Crew", date: "2026-09-01", kind: "crew", endedAt: null, pours: [] });
+  // KTD7: a crew night (an unknown kind reads as crew) keeps its ended time.
+  assert.deepEqual(state.nights[2], { id: "c1", name: "Crew", date: "2026-09-01", kind: "crew", endedAt: "2026-09-02T03:00:00Z", pours: [] });
   assert.equal(state.responsibleMode, false);
   assert.equal(state.markupPercent, 50);
   assert.equal(state.roundingIncrementCents, 50);
@@ -1367,4 +1368,72 @@ test("normalizeState defaults payments, pour cost and buyer fields, and the writ
   assert.equal(state.guestTabs[0].writtenOffByName, "Jordan");
   assert.deepEqual(state.payments, [{ id: "pay1", fromPersonId: "p-alex", fromName: "Alex", toPersonId: "p-sam", toName: "Sam", amountCents: 320, paidAt: null, voidedAt: null }]);
   assert.deepEqual(D.normalizeState(JSON.parse(JSON.stringify(state))), state);
+});
+
+// ---------- U3: crew balance payloads and pour stamping ---------------------------
+
+test("KTD7: normalizeNight keeps a crew night's ended time, and an unknown kind is a crew night that keeps it", () => {
+  assert.deepEqual(
+    D.normalizeNight({ id: "c1", name: "Friday", date: "2026-09-17", kind: "crew", endedAt: "2026-09-18T02:00:00Z" }),
+    { id: "c1", name: "Friday", date: "2026-09-17", kind: "crew", endedAt: "2026-09-18T02:00:00Z", pours: [] }
+  );
+  assert.equal(D.normalizeNight({ id: "c2", kind: "weird", endedAt: "" }).endedAt, null);
+});
+
+test("an archive without payments normalizes to an empty payments collection", () => {
+  const archive = { people: [{ id: "p-sam", name: "Sam" }], types: [], bottles: [], nights: [], guestTabs: [], ringUps: [] };
+  assert.deepEqual(D.normalizeState(archive).payments, []);
+  assert.deepEqual(D.normalizeState({ ...archive, payments: null }).payments, []);
+});
+
+test("pourRow writes today's pour columns, adding cost and buyer only when crew balances are available (literal true)", () => {
+  const pour = { id: "x1", personId: "p-alex", bottleId: "b1", ounces: 2, abv: 40, timestamp: "2026-09-17T20:00:00Z", costCents: 320, buyerId: "p-sam", buyerName: "Sam" };
+  const today = { id: "x1", night_id: "n1", person_id: "p-alex", bottle_id: "b1", ounces: 2, abv_snapshot: 40, poured_at: "2026-09-17T20:00:00Z" };
+  assert.deepEqual(D.pourRow(pour, "n1", false), today);
+  assert.deepEqual(D.pourRow(pour, "n1", "yes"), today);
+  assert.deepEqual(D.pourRow(pour, "n1", undefined), today);
+  assert.deepEqual(D.pourRow(pour, "n1", true), { ...today, cost_cents: 320, buyer_id: "p-sam", buyer_name: "Sam" });
+  assert.deepEqual(D.pourRow({ id: "x2", personId: "p-alex", bottleId: "b1", ounces: 1, abv: 40, timestamp: "t" }, "n1", true), {
+    id: "x2", night_id: "n1", person_id: "p-alex", bottle_id: "b1", ounces: 1, abv_snapshot: 40, poured_at: "t",
+    cost_cents: null, buyer_id: null, buyer_name: null
+  });
+});
+
+test("paymentRow writes every rnmb_payments column in snake_case", () => {
+  assert.deepEqual(
+    D.paymentRow({ id: "pay1", fromPersonId: "p-alex", fromName: "Alex", toPersonId: "p-sam", toName: "Sam", amountCents: 320, paidAt: "2026-09-17T23:00:00Z" }),
+    { id: "pay1", from_person_id: "p-alex", from_name: "Alex", to_person_id: "p-sam", to_name: "Sam", amount_cents: 320, paid_at: "2026-09-17T23:00:00Z", voided_at: null }
+  );
+});
+
+test("stampPour fixes the pour's whole-cent cost and the bottle buyer's snapshot, as rnmb_add_crew_pour does", () => {
+  const bottle = { id: "b1", typeId: "t-tequila", size: 25, remaining: 20, price: 40, buyerId: "p-sam" };
+  const pour = { id: "x1", personId: "p-alex", bottleId: "b1", ounces: 2, abv: 40, timestamp: "t" };
+  assert.deepEqual(D.stampPour(pour, bottle, people), { ...pour, costCents: 320, buyerId: "p-sam", buyerName: "Sam" });
+  assert.equal(pour.costCents, undefined, "the input pour is not changed");
+  // 30 dollars / 25.36 oz x 1.5 oz = 177.44... cents -> 177
+  assert.equal(D.stampPour({ ...pour, ounces: 1.5 }, { ...bottle, size: 25.36, price: 30 }, people).costCents, 177);
+  // A buyer no longer on the roster (or none) credits nobody.
+  assert.deepEqual(D.stampPour(pour, { ...bottle, buyerId: "p-gone" }, people), { ...pour, costCents: 320, buyerId: null, buyerName: null });
+  assert.deepEqual(D.stampPour(pour, { ...bottle, buyerId: "" }, people), { ...pour, costCents: 320, buyerId: null, buyerName: null });
+});
+
+test("hasCrewBalanceRecords spots anything a database without crew-balance.sql has nowhere to keep", () => {
+  const plain = D.normalizeState({
+    nights: [{ id: "n1", kind: "crew", pours: [{ id: "x1", personId: "p", bottleId: "b", ounces: 1, abv: 40, timestamp: "t" }] }],
+    guestTabs: [{ id: "g1", nightId: "h1", guestName: "Quinn", status: "written_off" }]
+  });
+  assert.equal(D.hasCrewBalanceRecords(plain), false);
+  assert.equal(D.hasCrewBalanceRecords(D.normalizeState({})), false);
+  assert.equal(D.hasCrewBalanceRecords({}), false);
+  const withPayment = { ...plain, payments: [D.normalizePayment({ id: "pay1", amountCents: 5 })] };
+  assert.equal(D.hasCrewBalanceRecords(withPayment), true);
+  const stamped = D.normalizeState({ nights: [{ id: "n1", pours: [{ id: "x1", costCents: 0 }] }] });
+  assert.equal(D.hasCrewBalanceRecords(stamped), true);
+  const author = D.normalizeState({ guestTabs: [{ id: "g1", status: "written_off", writtenOffByName: "Jordan" }] });
+  assert.equal(D.hasCrewBalanceRecords(author), true);
+  const endedCrew = D.normalizeState({ nights: [{ id: "n1", kind: "crew", endedAt: "2026-09-18T02:00:00Z" }] });
+  assert.equal(D.hasCrewBalanceRecords(endedCrew), true);
+  const endedHost = D.normalizeState({ nights: [{ id: "h1", kind: "host", endedAt: "2026-09-18T02:00:00Z" }] });
+  assert.equal(D.hasCrewBalanceRecords(endedHost), false);
 });

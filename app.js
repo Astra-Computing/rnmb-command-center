@@ -76,6 +76,18 @@ let hostModeAvailable = true;
 const HOST_MODE_SQL_MESSAGE = "Host mode is not set up on the shared database yet. Run supabase/host-mode.sql in Supabase, then reload.";
 const NOT_SAVING_MESSAGE = "This host night belongs to the shared database, and this browser is not connected to it, so nothing was saved. Reload the page to reconnect, then try again.";
 const SOLD_BOTTLE_MESSAGE = "Drinks have been sold from this stock item, so it cannot be deleted. Set its remaining level to empty instead.";
+// Crew balances (crew-balance KTD6): false when the shared database has not run
+// supabase/crew-balance.sql -- rnmb_payments answers 404, or rnmb_pours has no
+// cost columns (and always when host mode itself is missing). Local mode always
+// has them, so this starts true and is reset on every load, like hostModeAvailable.
+// While false, no payment, pour-cost or write-off-author column is ever sent.
+let crewBalanceAvailable = true;
+const CREW_BALANCE_SQL_MESSAGE = "Crew balances are not set up on the shared database yet. Run supabase/crew-balance.sql in Supabase, then reload.";
+// crew-balance.sql requires the crew member who writes a tab off (0.7.8). The
+// register does not ask for one yet, so until it does (U5 sets this to true) a
+// write-off without an author is still accepted locally; one WITH an author is
+// always checked and its name snapshotted.
+const WRITE_OFF_NEEDS_AUTHOR = false;
 
 // The bar register (KTD7): the order being built is this one object, never the
 // DOM, so every render rebuilds the register from it. See renderRegister().
@@ -148,10 +160,28 @@ function openHostNightFor(nightId, local) {
   return night;
 }
 
+/**
+ * The night a ring-up goes on (crew-balance KTD6/KTD7, as rnmb_ring_up): guest
+ * drinks need an open host night; crew drinks may also go on a crew night,
+ * whether or not it has ended. The KTD9 local check applies to host nights only.
+ */
+function ringUpNightFor(record, local) {
+  const night = state.nights.find((entry) => entry.id === record.nightId);
+  if (record.kind === "crew" && night && night.kind !== "host") return night;
+  return openHostNightFor(record.nightId, local);
+}
+
+/** A crew member on the roster, or a refusal with the given message. */
+function crewMember(personId, message) {
+  const person = personId ? personById(personId) : null;
+  if (!person) throw refusal(message);
+  return person;
+}
+
 const hostRules = {
   ringUp(record, { local }) {
     if (state.ringUps.some((entry) => entry.id === record.id)) throw refusal("That ring-up was already saved.");
-    const night = openHostNightFor(record.nightId, local);
+    const night = ringUpNightFor(record, local);
     let person = null;
     if (record.kind === "guest") {
       if (!record.tabId) throw refusal("A guest ring-up needs a tab.");
@@ -243,8 +273,11 @@ const hostRules = {
     if (!ringUp) throw refusal("That ring-up does not exist.");
     if (ringUp.voidedAt) throw refusal("That item was already voided.");
     const night = state.nights.find((entry) => entry.id === ringUp.nightId);
-    if (night?.endedAt) throw refusal("This host night has ended, so its items can no longer be voided.");
-    if (local && night?.startedLocally !== true) throw refusal(NOT_SAVING_MESSAGE);
+    // A crew night's items stay voidable after it ends (KTD7); host nights keep their locks.
+    if (night?.kind !== "crew") {
+      if (night?.endedAt) throw refusal("This host night has ended, so its items can no longer be voided.");
+      if (local && night?.startedLocally !== true) throw refusal(NOT_SAVING_MESSAGE);
+    }
     if (ringUp.kind === "guest") {
       const tab = state.guestTabs.find((entry) => entry.id === ringUp.tabId);
       if (tab?.status !== "open") throw refusal("That tab is already closed, so its items can no longer be voided.");
@@ -271,7 +304,7 @@ const hostRules = {
     return saved;
   },
 
-  closeTab({ id, status, collectorId, amountCents }, { local }) {
+  closeTab({ id, status, collectorId, amountCents, writtenOffBy }, { local }) {
     const tab = state.guestTabs.find((entry) => entry.id === id);
     if (!tab) throw refusal("That tab does not exist.");
     if (tab.status !== "open") throw refusal("That tab is already closed.");
@@ -285,12 +318,24 @@ const hostRules = {
       if (!Number.isInteger(amountCents) || amountCents !== total) {
         throw refusal(`The amount collected (${amountCents ?? "no"} cents) must equal the tab total (${total} cents).`);
       }
-      closed = { ...tab, status, collectorId: collector.id, collectorName: collector.name, amountCents, closedAt: nowIso() };
+      closed = {
+        ...tab, status, collectorId: collector.id, collectorName: collector.name, amountCents,
+        writtenOffBy: null, writtenOffByName: null, closedAt: nowIso()
+      };
     } else if (status === "written_off") {
       if ((collectorId ?? null) !== null || (amountCents ?? null) !== null) {
         throw refusal("A written-off tab has no collector and no amount.");
       }
-      closed = { ...tab, status, collectorId: null, collectorName: null, amountCents: null, closedAt: nowIso() };
+      let author = null;
+      if (writtenOffBy) {
+        author = crewMember(writtenOffBy, "The crew member writing off the tab does not exist.");
+      } else if (WRITE_OFF_NEEDS_AUTHOR && crewBalanceAvailable) {
+        throw refusal("A written-off tab needs the crew member who wrote it off.");
+      }
+      closed = {
+        ...tab, status, collectorId: null, collectorName: null, amountCents: null,
+        writtenOffBy: author ? author.id : null, writtenOffByName: author ? author.name : null, closedAt: nowIso()
+      };
     } else {
       throw refusal("A tab closes as paid or written off.");
     }
@@ -332,6 +377,50 @@ const hostRules = {
     const ended = { ...night, endedAt: nowIso() };
     state.nights = state.nights.map((entry) => (entry.id === nightId ? ended : entry));
     return ended;
+  },
+
+  /** rnmb_end_night: a crew night ends straight away; a host night keeps endHostNight's rules. */
+  endNight(nightId, { local }) {
+    const night = state.nights.find((entry) => entry.id === nightId);
+    if (!night) throw refusal("That night does not exist.");
+    if (night.kind === "host") return hostRules.endHostNight(nightId, { local });
+    if (night.endedAt) throw refusal("This crew night has already ended.");
+    const ended = { ...night, endedAt: nowIso() };
+    state.nights = state.nights.map((entry) => (entry.id === nightId ? ended : entry));
+    return ended;
+  },
+
+  /** rnmb_record_payment (0.5.4, KTD5): whole cents above zero between two different crew members, names snapshotted. */
+  recordPayment({ id, fromPersonId, toPersonId, amountCents, paidAt }) {
+    if (!id) throw refusal("A payment needs an id.");
+    if (state.payments.some((entry) => entry.id === id)) throw refusal("That payment was already recorded.");
+    if (!Number.isInteger(amountCents) || amountCents <= 0) throw refusal("A payment needs an amount above zero, in whole cents.");
+    if (!fromPersonId || !toPersonId) throw refusal("A payment needs the crew member who paid and the one who was paid.");
+    if (fromPersonId === toPersonId) throw refusal("A payment must be between two different crew members.");
+    const from = crewMember(fromPersonId, "The crew member who paid does not exist.");
+    const to = crewMember(toPersonId, "The crew member who was paid does not exist.");
+    const saved = RNMBDomain.normalizePayment({
+      id,
+      fromPersonId: from.id,
+      fromName: from.name,
+      toPersonId: to.id,
+      toName: to.name,
+      amountCents,
+      paidAt: paidAt || nowIso(),
+      voidedAt: null
+    });
+    state.payments.push(saved);
+    return saved;
+  },
+
+  /** rnmb_void_payment: a soft void; the payment stays in the history. */
+  voidPayment(paymentId) {
+    const payment = state.payments.find((entry) => entry.id === paymentId);
+    if (!payment) throw refusal("That payment does not exist.");
+    if (payment.voidedAt) throw refusal("That payment was already voided.");
+    const voided = { ...payment, voidedAt: nowIso() };
+    state.payments = state.payments.map((entry) => (entry.id === paymentId ? voided : entry));
+    return voided;
   },
 
   correctStock({ id, bottleId, newRemaining }) {
@@ -423,6 +512,34 @@ function preparePricing({ markupPercent, roundingIncrementCents }) {
   return { markupPercent: markup, roundingIncrementCents: increment };
 }
 
+/**
+ * Check a crew pour and build it, without touching state (the caller applies it
+ * and saves with saveState + db.addPour). Mirrors rnmb_add_crew_pour: an ended
+ * host night takes no pours, but an ended crew night does (KTD7). When crew
+ * balances are available the pour is stamped with its whole-cent cost and the
+ * bottle buyer (KTD2), as the database function stamps it; otherwise it carries
+ * no stamp, because the shared database has nowhere to keep one.
+ */
+function preparePour(night, { id, personId, bottleId, ounces, timestamp }) {
+  if (night?.kind === "host" && night.endedAt) throw refusal("This host night has ended, so no more pours can be logged.");
+  const bottle = bottleById(bottleId);
+  const type = typeById(bottle?.typeId);
+  const amount = Number(ounces);
+  if (!bottle || !type || !(amount > 0)) throw refusal("Pick a stocked bottle and a valid pour.");
+  if (!(Number(type.abv) > 0)) throw refusal(`${type.name} has no alcohol, so it is not logged as a pour.`);
+  if (isCounted(type) && !Number.isInteger(amount)) throw refusal(`${type.name} is counted stock, so log a whole number of units.`);
+  if (amount > Number(bottle.remaining)) throw refusal("That pour exceeds the bottle inventory.");
+  const pour = {
+    id: id || uid(),
+    personId,
+    bottleId: bottle.id,
+    ounces: amount,
+    abv: type.abv,
+    timestamp: timestamp || new Date().toISOString()
+  };
+  return RNMBDomain.normalizePour(crewBalanceAvailable ? RNMBDomain.stampPour(pour, bottle, state.people) : pour);
+}
+
 /** Price a draft with the current settings. sources: [{ bottleId, amount }] across every ingredient. */
 function buildRingUp({ id, nightId, kind, tabId, personId, menuItemId, sources }) {
   const priced = RNMBDomain.priceRingUp(sources, {
@@ -473,6 +590,9 @@ function createLocalRepository() {
     closeTab: apply("closeTab"),
     startHostNight: apply("startHostNight"),
     endHostNight: apply("endHostNight"),
+    endNight: apply("endNight"),
+    recordPayment: apply("recordPayment"),
+    voidPayment: apply("voidPayment"),
     correctStock: apply("correctStock"),
     saveMenuItem: apply("saveMenuItem"),
     removeMenuItem: apply("removeMenuItem"),
@@ -558,6 +678,25 @@ function createSupabaseRepository(config) {
       if (error.status === 404 || ["PGRST205", "42P01"].includes(error.code)) return null;
       throw error;
     }
+  }
+
+  /*
+   * Whether rnmb_pours has the crew-balance cost columns. Selecting a column that
+   * does not exist is refused (400, 42703) even when no row matches, and no row
+   * ever has a null id, so this reads nothing either way.
+   */
+  async function pourCostColumnsExist() {
+    try {
+      await request("rnmb_pours?select=cost_cents,buyer_id,buyer_name&id=is.null");
+      return true;
+    } catch (error) {
+      if ([400, 404].includes(error.status) || ["42703", "PGRST204", "PGRST205", "42P01"].includes(error.code)) return false;
+      throw error;
+    }
+  }
+
+  function requireCrewBalance() {
+    if (!crewBalanceAvailable) throw refusal(CREW_BALANCE_SQL_MESSAGE);
   }
 
   async function rpc(name, payload) {
@@ -691,7 +830,7 @@ function createSupabaseRepository(config) {
     async load() {
       const [
         peopleRows, typeRows, bottleRows, nightRows, pourRows, settingsRows,
-        menuItemRows, ingredientRowsRead, tabRows, ringUpRows, lineRows, adjustmentRows
+        menuItemRows, ingredientRowsRead, tabRows, ringUpRows, lineRows, adjustmentRows, paymentRows
       ] = await Promise.all([
         readTable("rnmb_people", "order=created_at.asc"),
         readTable("rnmb_beverage_types", "order=created_at.asc"),
@@ -704,10 +843,13 @@ function createSupabaseRepository(config) {
         readHostModeTable("rnmb_guest_tabs", "order=opened_at.asc"),
         readHostModeTable("rnmb_ring_ups", "order=rung_at.asc"),
         readHostModeTable("rnmb_ring_up_lines", "order=line_no.asc"),
-        readHostModeTable("rnmb_stock_adjustments", "order=adjusted_at.asc")
+        readHostModeTable("rnmb_stock_adjustments", "order=adjusted_at.asc"),
+        readHostModeTable("rnmb_payments", "order=paid_at.asc")
       ]);
       const hostTables = [menuItemRows, ingredientRowsRead, tabRows, ringUpRows, lineRows, adjustmentRows];
       hostModeAvailable = hostTables.every((rows) => rows !== null);
+      // KTD6: balances need the payments table AND the pour cost columns (crew-balance.sql adds both).
+      crewBalanceAvailable = hostModeAvailable && paymentRows !== null && await pourCostColumnsExist();
 
       const groupBy = (rows, key) => {
         const groups = new Map();
@@ -734,7 +876,10 @@ function createSupabaseRepository(config) {
             bottleId: pour.bottle_id,
             ounces: Number(pour.ounces),
             abv: Number(pour.abv_snapshot),
-            timestamp: pour.poured_at
+            timestamp: pour.poured_at,
+            costCents: pour.cost_cents,
+            buyerId: pour.buyer_id,
+            buyerName: pour.buyer_name
           }))
       }));
 
@@ -782,6 +927,8 @@ function createSupabaseRepository(config) {
           collectorId: tab.collector_id,
           collectorName: tab.collector_name,
           amountCents: tab.amount_cents,
+          writtenOffBy: tab.written_off_by,
+          writtenOffByName: tab.written_off_by_name,
           openedAt: tab.opened_at,
           closedAt: tab.closed_at
         })),
@@ -816,6 +963,16 @@ function createSupabaseRepository(config) {
           newRemaining: adjustment.new_remaining,
           adjustedAt: adjustment.adjusted_at
         })),
+        payments: (paymentRows || []).map((payment) => ({
+          id: payment.id,
+          fromPersonId: payment.from_person_id,
+          fromName: payment.from_name,
+          toPersonId: payment.to_person_id,
+          toName: payment.to_name,
+          amountCents: payment.amount_cents,
+          paidAt: payment.paid_at,
+          voidedAt: payment.voided_at
+        })),
         activeNightId: settings.active_night_id || nights[0]?.id || "",
         responsibleMode: settings.responsible_mode !== false,
         markupPercent: settings.markup_percent,
@@ -828,6 +985,13 @@ function createSupabaseRepository(config) {
       const hasHostHistory = nextState.guestTabs.length || nextState.ringUps.length ||
         nextState.stockAdjustments.length || nextState.nights.some((night) => night.kind === "host");
       if (!hostModeAvailable && hasHostHistory) throw refusal(`This data includes host-night records. ${HOST_MODE_SQL_MESSAGE}`);
+      if (!crewBalanceAvailable && RNMBDomain.hasCrewBalanceRecords(nextState)) {
+        throw refusal(`This data includes crew balance records (payments, drink costs, write-off authors or an ended crew night). ${CREW_BALANCE_SQL_MESSAGE}`);
+      }
+      // crew-balance.sql requires a written-off tab's author; one without cannot be re-inserted.
+      if (crewBalanceAvailable && nextState.guestTabs.some((tab) => tab.status === "written_off" && !tab.writtenOffByName)) {
+        throw refusal("This data has a written-off tab with no record of who wrote it off, and the shared database needs one, so nothing was replaced.");
+      }
 
       await request("rnmb_settings?id=eq.true", {
         method: "PATCH",
@@ -837,6 +1001,7 @@ function createSupabaseRepository(config) {
 
       // Children before parents: the host-mode tables reference nights, people,
       // bottles and types, and bottles and tabs refuse deletes while referenced.
+      if (crewBalanceAvailable) await deleteAll("rnmb_payments");
       if (hostModeAvailable) {
         await deleteAll("rnmb_ring_up_lines");
         await deleteAll("rnmb_ring_ups");
@@ -860,15 +1025,11 @@ function createSupabaseRepository(config) {
       await insertRows("rnmb_nights", nextState.nights.map((night) => RNMBDomain.nightRow(night, hostModeAvailable)));
       await insertRows("rnmb_bottles", nextState.bottles.map((bottle) => RNMBDomain.bottleRow(bottle)));
       await insertRows("rnmb_pours", nextState.nights.flatMap((night) => (
-        (night.pours || []).map((pour) => ({
-          id: pour.id,
-          night_id: night.id,
-          person_id: pour.personId,
-          bottle_id: pour.bottleId,
-          ounces: pour.ounces,
-          abv_snapshot: pour.abv,
-          poured_at: pour.timestamp
-        }))
+        (night.pours || []).map((pour) => RNMBDomain.pourRow(
+          { ...pour, buyerId: knownId(nextState.people, pour.buyerId) },
+          night.id,
+          crewBalanceAvailable
+        ))
       )));
 
       if (hostModeAvailable) {
@@ -885,6 +1046,9 @@ function createSupabaseRepository(config) {
           collector_id: knownId(people, tab.collectorId),
           collector_name: tab.collectorName,
           amount_cents: tab.amountCents,
+          ...(crewBalanceAvailable
+            ? { written_off_by: knownId(people, tab.writtenOffBy), written_off_by_name: tab.writtenOffByName || null }
+            : {}),
           opened_at: tab.openedAt || nowIso(),
           closed_at: tab.closedAt
         })));
@@ -920,6 +1084,13 @@ function createSupabaseRepository(config) {
           previous_remaining: adjustment.previousRemaining,
           new_remaining: adjustment.newRemaining,
           adjusted_at: adjustment.adjustedAt || nowIso()
+        })));
+      }
+      if (crewBalanceAvailable) {
+        await insertRows("rnmb_payments", nextState.payments.map((payment) => RNMBDomain.paymentRow({
+          ...payment,
+          fromPersonId: knownId(nextState.people, payment.fromPersonId),
+          toPersonId: knownId(nextState.people, payment.toPersonId)
         })));
       }
       await saveSettings(nextState);
@@ -959,15 +1130,7 @@ function createSupabaseRepository(config) {
         return;
       }
       await patchWhere("rnmb_bottles", `id=eq.${pour.bottleId}`, { remaining_oz: remaining });
-      await insertRow("rnmb_pours", {
-        id: pour.id,
-        night_id: night.id,
-        person_id: pour.personId,
-        bottle_id: pour.bottleId,
-        ounces: pour.ounces,
-        abv_snapshot: pour.abv,
-        poured_at: pour.timestamp
-      });
+      await insertRow("rnmb_pours", RNMBDomain.pourRow(pour, night.id, crewBalanceAvailable));
     },
     async removePour(pour, restoredRemaining) {
       if (hostModeAvailable) {
@@ -1004,7 +1167,8 @@ function createSupabaseRepository(config) {
           id: line.id,
           bottle_id: line.bottleId,
           amount: line.amount,
-          cost_cents: line.costCents,
+          // Always sent, crew lines too: a crew drink's cost is what balances debit (KTD2).
+          cost_cents: Number(line.costCents ?? 0),
           ...(record.kind === "guest" ? { share_cents: line.shareCents } : {})
         }))
       });
@@ -1019,12 +1183,15 @@ function createSupabaseRepository(config) {
       return mirror("openTab", tab);
     },
     async closeTab(closing) {
+      // A database without crew-balance.sql has nowhere to keep the author, so it is neither sent nor mirrored.
+      const kept = crewBalanceAvailable ? closing : { ...closing, writtenOffBy: undefined };
       await rpc("rnmb_close_tab", {
-        id: closing.id,
-        status: closing.status,
-        ...(closing.status === "paid" ? { collector_id: closing.collectorId, amount_cents: closing.amountCents } : {})
+        id: kept.id,
+        status: kept.status,
+        ...(kept.status === "paid" ? { collector_id: kept.collectorId, amount_cents: kept.amountCents } : {}),
+        ...(kept.status === "written_off" && kept.writtenOffBy ? { written_off_by: kept.writtenOffBy } : {})
       });
-      return mirror("closeTab", closing);
+      return mirror("closeTab", kept);
     },
     async startHostNight(night) {
       await rpc("rnmb_start_host_night", { id: night.id, name: night.name, date: night.date || today() });
@@ -1037,6 +1204,33 @@ function createSupabaseRepository(config) {
     async endHostNight(nightId) {
       await rpc("rnmb_end_host_night", { id: nightId });
       return mirror("endHostNight", nightId);
+    },
+    async endNight(nightId) {
+      if (!crewBalanceAvailable) {
+        // Before crew-balance.sql only a host night can end, through the older function.
+        const night = state.nights.find((entry) => entry.id === nightId);
+        if (night?.kind !== "host") throw refusal(hostModeAvailable ? CREW_BALANCE_SQL_MESSAGE : HOST_MODE_SQL_MESSAGE);
+        return repositoryApi.endHostNight(nightId);
+      }
+      await rpc("rnmb_end_night", { id: nightId });
+      return mirror("endNight", nightId);
+    },
+    async recordPayment(payment) {
+      requireCrewBalance();
+      const withId = { ...payment, id: payment.id || uid() };
+      await rpc("rnmb_record_payment", {
+        id: withId.id,
+        from_person_id: withId.fromPersonId,
+        to_person_id: withId.toPersonId,
+        amount_cents: withId.amountCents,
+        ...(withId.paidAt ? { paid_at: withId.paidAt } : {})
+      });
+      return mirror("recordPayment", withId);
+    },
+    async voidPayment(paymentId) {
+      requireCrewBalance();
+      await rpc("rnmb_void_payment", { id: paymentId });
+      return mirror("voidPayment", paymentId);
     },
     async correctStock(correction) {
       const withId = { ...correction, id: correction.id || uid() };
@@ -1121,6 +1315,7 @@ async function init() {
       repository = createLocalRepository();
       syncMode = "local";
       hostModeAvailable = true;
+      crewBalanceAvailable = true;
       showToast("No passphrase. Using local browser storage.");
     }
     state = await repository.load();
@@ -1134,6 +1329,7 @@ async function init() {
     repository = createLocalRepository();
     syncMode = "local";
     hostModeAvailable = true;
+    crewBalanceAvailable = true;
     state = await repository.load();
     render();
     showToast("Supabase load failed. Using local browser storage.");
@@ -2742,37 +2938,17 @@ document.querySelector("#pourForm").addEventListener("submit", async (event) => 
     return;
   }
   const data = new FormData(event.currentTarget);
-  const bottle = bottleById(data.get("bottleId"));
-  const type = typeById(bottle?.typeId);
-  // In the type's measure: ounces, or a count for counted stock (KTD5). The
-  // field keeps its old name, and so does the pour's `ounces` property.
-  const ounces = Number(data.get("ounces"));
-  if (!bottle || !type || !(ounces > 0)) {
-    showToast("Pick a stocked bottle and a valid pour.");
+  let pour;
+  try {
+    // In the type's measure: ounces, or a count for counted stock (KTD5). The
+    // field keeps its old name, and so does the pour's `ounces` property.
+    pour = preparePour(night, { personId: data.get("personId"), bottleId: data.get("bottleId"), ounces: Number(data.get("ounces")) });
+  } catch (error) {
+    showToast(error.userMessage || "Pick a stocked bottle and a valid pour.");
     return;
   }
-  if (!(Number(type.abv) > 0)) {
-    showToast(`${type.name} has no alcohol, so it is not logged as a pour.`);
-    return;
-  }
-  if (isCounted(type) && !Number.isInteger(ounces)) {
-    showToast(`${type.name} is counted stock, so log a whole number of units.`);
-    return;
-  }
-  if (ounces > Number(bottle.remaining)) {
-    showToast("That pour exceeds the bottle inventory.");
-    return;
-  }
-
-  bottle.remaining = Math.max(0, Number(bottle.remaining) - ounces);
-  const pour = {
-    id: uid(),
-    personId: data.get("personId"),
-    bottleId: bottle.id,
-    ounces,
-    abv: type.abv,
-    timestamp: new Date().toISOString()
-  };
+  const bottle = bottleById(pour.bottleId);
+  bottle.remaining = Math.max(0, Number(bottle.remaining) - pour.ounces);
   night.pours.push(pour);
 
   const personTotal = activeNightTotals().byPerson.get(data.get("personId"))?.drinks || 0;
@@ -3171,7 +3347,7 @@ document.querySelector("#importData").addEventListener("change", async (event) =
     }
     // Host-mode collections are optional (older archives have none), but when
     // present they must be lists, and every ring-up must carry its lines.
-    const hostCollections = ["menuItems", "guestTabs", "ringUps", "stockAdjustments"];
+    const hostCollections = ["menuItems", "guestTabs", "ringUps", "stockAdjustments", "payments"];
     if (hostCollections.some((key) => imported[key] !== undefined && !Array.isArray(imported[key]))) {
       throw new Error("Invalid archive");
     }
@@ -3216,6 +3392,9 @@ window.__rnmb = Object.freeze({
   get repository() { return repository; },
   get syncMode() { return syncMode; },
   get hostModeAvailable() { return hostModeAvailable; },
+  get crewBalanceAvailable() { return crewBalanceAvailable; },
+  crewBalances: () => RNMBDomain.crewBalances(state),
+  preparePour,
   get registerDraft() { return registerDraft; },
   archiveData,
   buildRingUp,
