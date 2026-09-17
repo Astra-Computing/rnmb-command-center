@@ -83,11 +83,6 @@ const SOLD_BOTTLE_MESSAGE = "Drinks have been sold from this stock item, so it c
 // While false, no payment, pour-cost or write-off-author column is ever sent.
 let crewBalanceAvailable = true;
 const CREW_BALANCE_SQL_MESSAGE = "Crew balances are not set up on the shared database yet. Run supabase/crew-balance.sql in Supabase, then reload.";
-// crew-balance.sql requires the crew member who writes a tab off (0.7.8), and the
-// register asks for one on every open tab card, so the local rules require it too
-// whenever crew balances are on. Before crew-balance.sql the database has nowhere
-// to keep an author, so none is required (or sent).
-const WRITE_OFF_NEEDS_AUTHOR = true;
 
 // The bar register (KTD7): the order being built is this one object, never the
 // DOM, so every render rebuilds the register from it. See renderRegister().
@@ -353,7 +348,11 @@ const hostRules = {
       let author = null;
       if (writtenOffBy) {
         author = crewMember(writtenOffBy, "The crew member writing off the tab does not exist.");
-      } else if (WRITE_OFF_NEEDS_AUTHOR && crewBalanceAvailable) {
+      // crew-balance.sql requires the crew member who writes a tab off (0.7.8), and the
+      // register asks for one on every open tab card, so the local rules require one too
+      // whenever crew balances are on. Before crew-balance.sql the database has nowhere
+      // to keep an author, so none is required (or sent).
+      } else if (crewBalanceAvailable) {
         throw refusal("A written-off tab needs the crew member who wrote it off.");
       }
       closed = {
@@ -873,6 +872,10 @@ function createSupabaseRepository(config) {
       const hostTables = [menuItemRows, ingredientRowsRead, tabRows, ringUpRows, lineRows, adjustmentRows];
       hostModeAvailable = hostTables.every((rows) => rows !== null);
       // KTD6: balances need the payments table AND the pour cost columns (crew-balance.sql adds both).
+      // Deliberately sequential: this probe names columns a pre-crew-balance database
+      // does not have, so it must run only after the reads above prove host mode and
+      // the payments table exist. Racing it alongside them costs a pre-migration
+      // database a 400 on every load (KTD6).
       crewBalanceAvailable = hostModeAvailable && paymentRows !== null && await pourCostColumnsExist();
 
       const groupBy = (rows, key) => {

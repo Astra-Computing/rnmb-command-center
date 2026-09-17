@@ -761,9 +761,8 @@ var RNMBDomain = (function () {
   }
 
   function wholeCentsOrNull(value) {
-    if (value === undefined || value === null || value === "") return null;
-    var number = Number(value);
-    return Number.isFinite(number) ? Math.round(number) : null;
+    var number = numberOrNull(value);
+    return number === null ? null : Math.round(number);
   }
 
   function isOwnedLine(line) {
