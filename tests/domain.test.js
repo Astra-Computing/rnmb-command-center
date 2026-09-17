@@ -437,6 +437,77 @@ test("validateRingUpSources catches two ingredients overdrawing the same item to
   assert.equal(D.validateRingUpSources(margarita, [[{ bottleId: "b-tequila", amount: 2 }]], ae1Bottles()).ok, false);
 });
 
+// ---------- register draft helpers (1.7.3, 1.7.7, KTD10) ----------------------
+
+test("flattenSources lists every ingredient's sources in recipe order with numeric amounts", () => {
+  assert.deepEqual(
+    D.flattenSources([
+      [{ bottleId: "a", amount: 0.5 }, { bottleId: "b", amount: "1.5" }],
+      [],
+      [{ bottleId: "lime", amount: 1 }]
+    ]),
+    [
+      { bottleId: "a", amount: 0.5 },
+      { bottleId: "b", amount: 1.5 },
+      { bottleId: "lime", amount: 1 }
+    ]
+  );
+  assert.deepEqual(D.flattenSources(undefined), []);
+  assert.deepEqual(D.flattenSources([undefined, null]), []);
+});
+
+test("sourcesShortfall is what the sources still leave uncovered, never negative, ignoring bad amounts", () => {
+  const ingredient = { typeId: "t-tequila", amount: 2 };
+  assert.equal(D.sourcesShortfall(ingredient, [{ bottleId: "a", amount: 0.5 }]), 1.5);
+  assert.equal(D.sourcesShortfall(ingredient, [{ bottleId: "a", amount: 0.5 }, { bottleId: "b", amount: 1.5 }]), 0);
+  assert.equal(D.sourcesShortfall(ingredient, [{ bottleId: "a", amount: 0.1 }, { bottleId: "b", amount: 1.9 }]), 0, "float noise is not a shortfall");
+  assert.equal(D.sourcesShortfall(ingredient, [{ bottleId: "b", amount: 3 }]), 0, "over is not short");
+  assert.equal(D.sourcesShortfall(ingredient, []), 2);
+  assert.equal(D.sourcesShortfall(ingredient, [{ bottleId: "a", amount: Number.NaN }, { bottleId: "b", amount: -1 }]), 2);
+});
+
+test("AE9: suggestExtraSource offers the next unused item of the type with the shortfall, capped at what it holds", () => {
+  const bottles = [
+    { id: "a", typeId: "t-tequila", size: 25.36, remaining: 0.5, date: "2026-09-01" },
+    { id: "c", typeId: "t-tequila", size: 25.36, remaining: 1, date: "2026-09-01" },
+    { id: "b", typeId: "t-tequila", size: 25.36, remaining: 25.36, date: "2026-09-02" },
+    { id: "empty", typeId: "t-tequila", size: 25.36, remaining: 0, date: "2026-08-01" },
+    { id: "lime", typeId: "t-lime", size: 32, remaining: 32 }
+  ];
+  const ingredient = { typeId: "t-tequila", amount: 2 };
+  // Preselection order is least remaining first: a (used), then c.
+  assert.deepEqual(D.suggestExtraSource(ingredient, [{ bottleId: "a", amount: 0.5 }], bottles), { bottleId: "c", amount: 1 });
+  assert.deepEqual(
+    D.suggestExtraSource(ingredient, [{ bottleId: "a", amount: 0.5 }, { bottleId: "c", amount: 1 }], bottles),
+    { bottleId: "b", amount: 0.5 }
+  );
+  // Nothing short: the next item is offered with amount 0 for the bartender to fill in.
+  assert.deepEqual(D.suggestExtraSource(ingredient, [{ bottleId: "b", amount: 2 }], bottles), { bottleId: "a", amount: 0 });
+  // No other item of the type with stock left.
+  assert.equal(
+    D.suggestExtraSource(ingredient, [{ bottleId: "a", amount: 0.5 }, { bottleId: "c", amount: 1 }, { bottleId: "b", amount: 0.5 }], bottles),
+    null
+  );
+  assert.equal(D.suggestExtraSource({ typeId: "t-ghost", amount: 1 }, [], bottles), null);
+});
+
+test("AE3: switchSource gives a lone source the recipe amount capped at the new item, and keeps a split source's amount", () => {
+  const bottles = [
+    { id: "a", typeId: "t-tequila", size: 25.36, remaining: 0.5 },
+    { id: "b", typeId: "t-tequila", size: 25.36, remaining: 25.36 },
+    { id: "c", typeId: "t-tequila", size: 25.36, remaining: 1 }
+  ];
+  const ingredient = { typeId: "t-tequila", amount: 2 };
+  const lone = [{ bottleId: "c", amount: 1 }];
+  assert.deepEqual(D.switchSource(ingredient, lone, 0, "b", bottles), [{ bottleId: "b", amount: 2 }]);
+  assert.deepEqual(D.switchSource(ingredient, [{ bottleId: "b", amount: 2 }], 0, "a", bottles), [{ bottleId: "a", amount: 0.5 }]);
+  assert.deepEqual(lone, [{ bottleId: "c", amount: 1 }], "the input is not changed");
+  const split = [{ bottleId: "a", amount: 0.5 }, { bottleId: "c", amount: 1.5 }];
+  assert.deepEqual(D.switchSource(ingredient, split, 1, "b", bottles), [{ bottleId: "a", amount: 0.5 }, { bottleId: "b", amount: 1.5 }]);
+  // An index that does not exist changes nothing.
+  assert.deepEqual(D.switchSource(ingredient, split, 5, "b", bottles), split);
+});
+
 // ---------- counted items, mixers and the amount helper -----------------------
 
 test("a counted item consumes exactly 1 unit and its standard drinks come from unit volume x ABV", () => {
