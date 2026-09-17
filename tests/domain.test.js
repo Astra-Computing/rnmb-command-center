@@ -608,3 +608,122 @@ test("normalizeType defaults legacy types to poured ounces with no unit volume",
     id: "t2", name: "Lager", abv: 5, measure: "unit", unitOz: 12
   });
 });
+
+// ---------- whole-state normalizer (U3: archives, localStorage, database loads) --
+
+test("normalizeState maps a legacy archive's sizeOz/remainingOz onto size/remaining with the same values", () => {
+  const legacy = {
+    people: [{ id: "p1", name: "Alex", color: "#f97316" }],
+    types: [{ id: "t1", name: "Bourbon", category: "Whiskey", abv: 45 }],
+    bottles: [{ id: "b1", typeId: "t1", nickname: "Old", sizeOz: 25.36, remainingOz: 19.2, price: 34.99, buyerId: "p1", date: "2026-09-01" }],
+    nights: [{ id: "n1", name: "Friday", date: "2026-09-01", pours: [] }],
+    activeNightId: "n1",
+    responsibleMode: true
+  };
+  const state = D.normalizeState(legacy);
+  assert.equal(state.bottles[0].size, 25.36);
+  assert.equal(state.bottles[0].remaining, 19.2);
+  assert.equal("sizeOz" in state.bottles[0], false);
+  assert.equal("remainingOz" in state.bottles[0], false);
+  assert.equal(state.types[0].measure, "oz");
+  assert.equal(state.types[0].unitOz, null);
+});
+
+test("normalizeState on an archive with no host-mode collections yields empty collections and default markup and increment", () => {
+  const state = D.normalizeState({
+    people: [],
+    types: [],
+    bottles: [],
+    nights: [{ id: "n1", name: "Friday", date: "2026-09-01" }]
+  });
+  assert.deepEqual(state.menuItems, []);
+  assert.deepEqual(state.guestTabs, []);
+  assert.deepEqual(state.ringUps, []);
+  assert.deepEqual(state.stockAdjustments, []);
+  assert.equal(state.markupPercent, 0);
+  assert.equal(state.roundingIncrementCents, 25);
+  assert.equal(state.activeNightId, "n1");
+  assert.equal(state.responsibleMode, true);
+  assert.deepEqual(state.nights[0], { id: "n1", name: "Friday", date: "2026-09-01", kind: "crew", endedAt: null, pours: [] });
+});
+
+test("normalizeState on nothing at all is an empty state", () => {
+  const state = D.normalizeState({});
+  assert.deepEqual(state, {
+    people: [], types: [], bottles: [], nights: [],
+    menuItems: [], guestTabs: [], ringUps: [], stockAdjustments: [],
+    activeNightId: "", responsibleMode: true, markupPercent: 0, roundingIncrementCents: 25
+  });
+});
+
+test("normalizeState keeps host nights, the browser-only local mark only when literally true, and valid settings", () => {
+  const state = D.normalizeState({
+    nights: [
+      { id: "h1", name: "Party", date: "2026-09-16", kind: "host", endedAt: null, pours: [], startedLocally: true },
+      { id: "h2", name: "Old party", date: "2026-09-01", kind: "host", endedAt: "2026-09-02T03:00:00Z", startedLocally: "yes" },
+      { id: "c1", name: "Crew", date: "2026-09-01", kind: "weird", endedAt: "2026-09-02T03:00:00Z" }
+    ],
+    activeNightId: "h1",
+    responsibleMode: false,
+    markupPercent: "50",
+    roundingIncrementCents: 50
+  });
+  assert.deepEqual(state.nights[0], { id: "h1", name: "Party", date: "2026-09-16", kind: "host", endedAt: null, pours: [], startedLocally: true });
+  assert.deepEqual(state.nights[1], { id: "h2", name: "Old party", date: "2026-09-01", kind: "host", endedAt: "2026-09-02T03:00:00Z", pours: [] });
+  assert.deepEqual(state.nights[2], { id: "c1", name: "Crew", date: "2026-09-01", kind: "crew", endedAt: null, pours: [] });
+  assert.equal(state.responsibleMode, false);
+  assert.equal(state.markupPercent, 50);
+  assert.equal(state.roundingIncrementCents, 50);
+
+  const bad = D.normalizeState({ markupPercent: -5, roundingIncrementCents: 12.5 });
+  assert.equal(bad.markupPercent, 0);
+  assert.equal(bad.roundingIncrementCents, 25);
+});
+
+test("normalizeState normalizes menu items, tabs, ring-ups with their lines, and stock adjustments", () => {
+  const state = D.normalizeState({
+    menuItems: [
+      { id: "m1", name: "Margarita", kind: "cocktail", ingredients: [{ id: "i1", typeId: "t-tequila", amount: "2" }] },
+      { id: "m2", name: "Odd", kind: "nonsense" }
+    ],
+    guestTabs: [{ id: "g1", nightId: "h1", guestName: "Riley" }],
+    ringUps: [{
+      id: "r1", nightId: "h1", kind: "guest", tabId: "g1", menuItemId: "m1", menuItemName: "Margarita",
+      priceCents: "500", rungAt: "2026-09-16T22:00:00Z",
+      lines: [{ id: "l1", bottleId: "b1", typeId: "t-tequila", amount: "2", costCents: "236.59", shareCents: "500", buyerId: "p1", buyerName: "Sam", abv: "40" }]
+    }, {
+      id: "r2", nightId: "h1", kind: "crew", personId: "p2", personName: "Alex", menuItemId: null, menuItemName: "Shot",
+      priceCents: null, rungAt: "2026-09-16T22:05:00Z", voidedAt: "2026-09-16T22:06:00Z",
+      lines: [{ bottleId: "b1", typeId: "t-tequila", amount: 1.5, costCents: 177.4, shareCents: null, buyerId: null, buyerName: null, abv: 40 }]
+    }],
+    stockAdjustments: [{ id: "a1", bottleId: "b1", previousRemaining: "10", newRemaining: "8.5", adjustedAt: "2026-09-16T23:00:00Z" }]
+  });
+
+  assert.deepEqual(state.menuItems[0], { id: "m1", name: "Margarita", kind: "cocktail", ingredients: [{ id: "i1", typeId: "t-tequila", amount: 2 }] });
+  assert.deepEqual(state.menuItems[1], { id: "m2", name: "Odd", kind: "cocktail", ingredients: [] });
+  assert.deepEqual(state.guestTabs[0], {
+    id: "g1", nightId: "h1", guestName: "Riley", status: "open",
+    collectorId: null, collectorName: null, amountCents: null, openedAt: null, closedAt: null
+  });
+  assert.deepEqual(state.ringUps[0], {
+    id: "r1", nightId: "h1", kind: "guest", tabId: "g1", personId: null, personName: null,
+    menuItemId: "m1", menuItemName: "Margarita", priceCents: 500, rungAt: "2026-09-16T22:00:00Z", voidedAt: null,
+    lines: [{ id: "l1", bottleId: "b1", typeId: "t-tequila", amount: 2, costCents: 236.59, shareCents: 500, buyerId: "p1", buyerName: "Sam", abv: 40 }]
+  });
+  assert.equal(state.ringUps[1].kind, "crew");
+  assert.equal(state.ringUps[1].priceCents, null);
+  assert.equal(state.ringUps[1].voidedAt, "2026-09-16T22:06:00Z");
+  assert.deepEqual(state.ringUps[1].lines[0], {
+    id: null, bottleId: "b1", typeId: "t-tequila", amount: 1.5, costCents: 177.4, shareCents: null, buyerId: null, buyerName: "", abv: 40
+  });
+  assert.deepEqual(state.stockAdjustments[0], { id: "a1", bottleId: "b1", previousRemaining: 10, newRemaining: 8.5, adjustedAt: "2026-09-16T23:00:00Z" });
+});
+
+test("normalizeState is idempotent", () => {
+  const once = D.normalizeState({
+    bottles: [{ id: "b1", typeId: "t1", sizeOz: 12, remainingOz: 6, price: 10 }],
+    nights: [{ id: "h1", name: "Party", date: "2026-09-16", kind: "host", startedLocally: true }],
+    ringUps: [{ id: "r1", nightId: "h1", kind: "guest", tabId: "g1", priceCents: 100, lines: [{ bottleId: "b1", amount: 1 }] }]
+  });
+  assert.deepEqual(D.normalizeState(JSON.parse(JSON.stringify(once))), once);
+});

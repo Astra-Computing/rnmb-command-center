@@ -17,14 +17,8 @@ const safeColor = (value) => (/^#[0-9a-f]{3,8}$/i.test(String(value || "")) ? va
 const uid = () => crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
 const money = (value) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(value || 0);
 const oneDecimal = (value) => Number(value || 0).toFixed(1);
-const emptyState = () => ({
-  people: [],
-  types: [],
-  bottles: [],
-  nights: [],
-  activeNightId: "",
-  responsibleMode: true
-});
+// Every collection, host mode included, with default markup and rounding.
+const emptyState = () => RNMBDomain.normalizeState({});
 
 const demoData = () => {
   const people = [
@@ -40,19 +34,34 @@ const demoData = () => {
     { id: uid(), name: "Emergency Tequila", category: "Tequila", abv: 40 }
   ];
   const bottles = [
-    { id: uid(), typeId: types[0].id, nickname: "The Briefing Bottle", sizeOz: 25.36, remainingOz: 19.2, price: 34.99, buyerId: people[0].id, date: today() },
-    { id: uid(), typeId: types[1].id, nickname: "Cooler Battalion", sizeOz: 144, remainingOz: 96, price: 22.5, buyerId: people[1].id, date: today() },
-    { id: uid(), typeId: types[2].id, nickname: "Diplomatic Pouch", sizeOz: 25.36, remainingOz: 25.36, price: 18.99, buyerId: people[2].id, date: today() }
+    { id: uid(), typeId: types[0].id, nickname: "The Briefing Bottle", size: 25.36, remaining: 19.2, price: 34.99, buyerId: people[0].id, date: today() },
+    { id: uid(), typeId: types[1].id, nickname: "Cooler Battalion", size: 144, remaining: 96, price: 22.5, buyerId: people[1].id, date: today() },
+    { id: uid(), typeId: types[2].id, nickname: "Diplomatic Pouch", size: 25.36, remaining: 25.36, price: 18.99, buyerId: people[2].id, date: today() }
+  ];
+  // A small menu drawn only from the stock above, so every item is available.
+  const menuItems = [
+    {
+      id: uid(),
+      name: "Boilermaker",
+      kind: "cocktail",
+      ingredients: [
+        { id: uid(), typeId: types[0].id, amount: 1.5 },
+        { id: uid(), typeId: types[1].id, amount: 12 }
+      ]
+    },
+    { id: uid(), name: "Bourbon Neat", kind: "straight", ingredients: [{ id: uid(), typeId: types[0].id, amount: 2 }] },
+    { id: uid(), name: "Glass of Red", kind: "straight", ingredients: [{ id: uid(), typeId: types[2].id, amount: 5 }] }
   ];
   const nightId = uid();
-  return {
+  return normalizeState({
     people,
     types,
     bottles,
-    nights: [{ id: nightId, name: "Friday Recon", date: today(), pours: [] }],
+    nights: [{ id: nightId, name: "Friday Recon", date: today(), kind: "crew", endedAt: null, pours: [] }],
+    menuItems,
     activeNightId: nightId,
     responsibleMode: true
-  };
+  });
 };
 
 let state = emptyState();
@@ -61,16 +70,16 @@ let syncMode = "local";
 let accessKey = "";
 let saveInFlight = false;
 let lastSyncedAt = null;
+// KTD8: false only when the shared database answers 404 for a host-mode table,
+// i.e. supabase/host-mode.sql has not been run. The local repository always
+// runs host mode (KTD9), so this starts true and is reset on every load.
+let hostModeAvailable = true;
+const HOST_MODE_SQL_MESSAGE = "Host mode is not set up on the shared database yet. Run supabase/host-mode.sql in Supabase, then reload.";
+const NOT_SAVING_MESSAGE = "This host night belongs to the shared database, and this browser is not connected to it, so nothing was saved. Reload the page to reconnect, then try again.";
+const SOLD_BOTTLE_MESSAGE = "Drinks have been sold from this stock item, so it cannot be deleted. Set its remaining level to empty instead.";
 
 function normalizeState(input) {
-  return {
-    people: input.people || [],
-    types: input.types || [],
-    bottles: input.bottles || [],
-    nights: input.nights || [],
-    activeNightId: input.activeNightId || input.nights?.[0]?.id || "",
-    responsibleMode: input.responsibleMode !== false
-  };
+  return RNMBDomain.normalizeState(input);
 }
 
 function loadLocalState() {
@@ -82,7 +91,353 @@ function loadLocalState() {
   }
 }
 
+/*
+ * Host-mode rules, applied to `state`.
+ *
+ * The local repository runs these as the whole save (KTD9). The Supabase
+ * repository runs them after the database function has accepted the change, to
+ * mirror it into this browser without a full reload; if the mirror disagrees
+ * (this browser's copy was stale) it reloads instead. Each rule validates
+ * everything before it touches `state`, so a refusal leaves state unchanged.
+ * `local: true` adds the KTD9 check that a host night was started in this browser.
+ */
+function refusal(message) {
+  const error = new Error(message);
+  error.userMessage = message;
+  return error;
+}
+
+const nowIso = () => new Date().toISOString();
+const round6 = (value) => Math.round(value * 1e6) / 1e6 + 0;
+const hasAtMostTwoDecimals = (value) => Math.abs(value * 100 - Math.round(value * 100)) < 1e-6;
+
+function stockLabel(bottle) {
+  const type = typeById(bottle.typeId);
+  return bottle.nickname || type?.name || "that stock item";
+}
+
+function checkAmount(amount, type, what) {
+  if (!Number.isFinite(amount) || amount <= 0) throw refusal(`${what} needs an amount above zero.`);
+  if (!hasAtMostTwoDecimals(amount)) throw refusal(`Amounts are kept to two decimal places, and ${amount} has more.`);
+  if (type?.measure === RNMBDomain.MEASURE_UNIT && !Number.isInteger(amount)) {
+    throw refusal(`${type.name} is counted stock and is used in whole units.`);
+  }
+}
+
+function openHostNightFor(nightId, local) {
+  const night = state.nights.find((entry) => entry.id === nightId);
+  if (!night) throw refusal("That night does not exist.");
+  if (night.kind !== "host") throw refusal("Drinks and guest tabs only exist on a host night.");
+  if (night.endedAt) throw refusal("This host night has ended, so nothing more can be changed on it.");
+  if (local && night.startedLocally !== true) throw refusal(NOT_SAVING_MESSAGE);
+  return night;
+}
+
+const hostRules = {
+  ringUp(record, { local }) {
+    if (state.ringUps.some((entry) => entry.id === record.id)) throw refusal("That ring-up was already saved.");
+    const night = openHostNightFor(record.nightId, local);
+    let person = null;
+    if (record.kind === "guest") {
+      if (!record.tabId) throw refusal("A guest ring-up needs a tab.");
+      if (record.personId) throw refusal("A guest ring-up goes on a tab, not to a crew member.");
+      const tab = state.guestTabs.find((entry) => entry.id === record.tabId);
+      if (!tab) throw refusal("That tab does not exist.");
+      if (tab.nightId !== night.id) throw refusal("That tab belongs to a different night.");
+      if (tab.status !== "open") throw refusal("That tab is closed, so nothing more can be added to it.");
+      if (!Number.isInteger(record.priceCents) || record.priceCents < 0) throw refusal("A guest ring-up needs a price in cents.");
+    } else if (record.kind === "crew") {
+      if (record.tabId) throw refusal("Crew members never get a tab; ring up a crew drink to the person.");
+      if (record.priceCents !== null && record.priceCents !== undefined) throw refusal("A crew ring-up carries no price.");
+      person = personById(record.personId);
+      if (!person) throw refusal("That crew member does not exist.");
+    } else {
+      throw refusal("A ring-up is either for a guest or for a crew member.");
+    }
+    const menuItem = state.menuItems.find((entry) => entry.id === record.menuItemId);
+    if (!menuItem) throw refusal("That menu item does not exist.");
+
+    const lines = record.lines || [];
+    if (!lines.length) throw refusal("A ring-up needs at least one ingredient line.");
+    if (record.kind === "guest") {
+      if (lines.some((line) => !Number.isInteger(line.shareCents) || line.shareCents < 0)) {
+        throw refusal("Every line of a guest ring-up needs a share in cents.");
+      }
+      const shares = lines.reduce((sum, line) => sum + line.shareCents, 0);
+      if (shares !== record.priceCents) {
+        throw refusal(`The line shares add up to ${shares} cents but the price is ${record.priceCents} cents.`);
+      }
+    } else if (lines.some((line) => line.shareCents !== null && line.shareCents !== undefined)) {
+      throw refusal("A crew ring-up carries no price, so its lines carry no shares.");
+    }
+
+    const drawn = new Map();
+    lines.forEach((line) => {
+      const bottle = bottleById(line.bottleId);
+      if (!bottle) throw refusal("A stock item on this ring-up no longer exists.");
+      const amount = Number(line.amount);
+      checkAmount(amount, typeById(bottle.typeId), "Every line");
+      if (record.kind === "guest" && (line.costCents === null || line.costCents === undefined)) {
+        throw refusal("Every line of a guest ring-up needs its cost in cents.");
+      }
+      const cost = Number(line.costCents ?? 0);
+      if (!Number.isFinite(cost) || cost < 0) throw refusal("A line cost cannot be negative.");
+      drawn.set(bottle.id, (drawn.get(bottle.id) || 0) + amount);
+    });
+    drawn.forEach((amount, bottleId) => {
+      const bottle = bottleById(bottleId);
+      if (Number(bottle.remaining) + RNMBDomain.AMOUNT_EPSILON < amount) {
+        throw refusal(`Not enough left in ${stockLabel(bottle)} (${bottle.remaining} left, ${round6(amount)} needed), so nothing was rung up.`);
+      }
+    });
+    const nextBottles = RNMBDomain.applyStockDeltas(state.bottles, RNMBDomain.stockDeltasForRingUp(lines));
+
+    // The same snapshots the database function fills in: type, buyer and ABV
+    // from the stock item, and the person and menu item names.
+    const saved = RNMBDomain.normalizeRingUp({
+      ...record,
+      tabId: record.kind === "guest" ? record.tabId : null,
+      personId: person ? person.id : null,
+      personName: person ? person.name : null,
+      menuItemName: menuItem.name,
+      priceCents: record.kind === "guest" ? record.priceCents : null,
+      rungAt: record.rungAt || nowIso(),
+      voidedAt: null,
+      lines: lines.map((line) => {
+        const bottle = bottleById(line.bottleId);
+        const buyer = personById(bottle.buyerId);
+        return {
+          ...line,
+          id: line.id || uid(),
+          typeId: bottle.typeId,
+          costCents: Number(line.costCents ?? 0),
+          shareCents: record.kind === "guest" ? line.shareCents : null,
+          buyerId: buyer ? buyer.id : null,
+          buyerName: buyer ? buyer.name : "",
+          abv: Number(typeById(bottle.typeId)?.abv) || 0
+        };
+      })
+    });
+    state.bottles = nextBottles;
+    state.ringUps.push(saved);
+    return saved;
+  },
+
+  voidRingUp(ringUpId, { local }) {
+    const ringUp = state.ringUps.find((entry) => entry.id === ringUpId);
+    if (!ringUp) throw refusal("That ring-up does not exist.");
+    if (ringUp.voidedAt) throw refusal("That item was already voided.");
+    const night = state.nights.find((entry) => entry.id === ringUp.nightId);
+    if (night?.endedAt) throw refusal("This host night has ended, so its items can no longer be voided.");
+    if (local && night?.startedLocally !== true) throw refusal(NOT_SAVING_MESSAGE);
+    if (ringUp.kind === "guest") {
+      const tab = state.guestTabs.find((entry) => entry.id === ringUp.tabId);
+      if (tab?.status !== "open") throw refusal("That tab is already closed, so its items can no longer be voided.");
+    }
+    // Put back exactly what was drawn, never above an item's size (as the database does).
+    const restore = new Map(RNMBDomain.stockDeltasForVoid(ringUp.lines).map((entry) => [entry.bottleId, entry.delta]));
+    state.bottles = state.bottles.map((bottle) => (
+      restore.has(bottle.id)
+        ? { ...bottle, remaining: round6(Math.min(Number(bottle.size), Number(bottle.remaining) + restore.get(bottle.id))) }
+        : bottle
+    ));
+    const voided = { ...ringUp, voidedAt: nowIso() };
+    state.ringUps = state.ringUps.map((entry) => (entry.id === ringUpId ? voided : entry));
+    return voided;
+  },
+
+  openTab(tab, { local }) {
+    if (state.guestTabs.some((entry) => entry.id === tab.id)) throw refusal("That tab was already opened.");
+    const guestName = String(tab.guestName || "").trim();
+    if (!guestName) throw refusal("A tab needs the guest's name.");
+    openHostNightFor(tab.nightId, local);
+    const saved = RNMBDomain.normalizeTab({ id: tab.id, nightId: tab.nightId, guestName, status: "open", openedAt: tab.openedAt || nowIso() });
+    state.guestTabs.push(saved);
+    return saved;
+  },
+
+  closeTab({ id, status, collectorId, amountCents }, { local }) {
+    const tab = state.guestTabs.find((entry) => entry.id === id);
+    if (!tab) throw refusal("That tab does not exist.");
+    if (tab.status !== "open") throw refusal("That tab is already closed.");
+    const night = state.nights.find((entry) => entry.id === tab.nightId);
+    if (local && night?.startedLocally !== true) throw refusal(NOT_SAVING_MESSAGE);
+    let closed;
+    if (status === "paid") {
+      const collector = personById(collectorId);
+      if (!collector) throw refusal("A paid tab needs the crew member who collected the money.");
+      const total = RNMBDomain.tabTotalCents(id, state.ringUps);
+      if (!Number.isInteger(amountCents) || amountCents !== total) {
+        throw refusal(`The amount collected (${amountCents ?? "no"} cents) must equal the tab total (${total} cents).`);
+      }
+      closed = { ...tab, status, collectorId: collector.id, collectorName: collector.name, amountCents, closedAt: nowIso() };
+    } else if (status === "written_off") {
+      if ((collectorId ?? null) !== null || (amountCents ?? null) !== null) {
+        throw refusal("A written-off tab has no collector and no amount.");
+      }
+      closed = { ...tab, status, collectorId: null, collectorName: null, amountCents: null, closedAt: nowIso() };
+    } else {
+      throw refusal("A tab closes as paid or written off.");
+    }
+    state.guestTabs = state.guestTabs.map((entry) => (entry.id === id ? closed : entry));
+    return closed;
+  },
+
+  startHostNight({ id, name, date }, { local }) {
+    const trimmed = String(name || "").trim();
+    if (!trimmed) throw refusal("A host night needs a name.");
+    if (state.nights.some((night) => night.kind === "host" && !night.endedAt)) {
+      throw refusal("A host night is already running; end it before starting another.");
+    }
+    if (state.nights.some((night) => night.id === id)) throw refusal("That night already exists.");
+    const night = RNMBDomain.normalizeNight({
+      id,
+      name: trimmed,
+      date: date || today(),
+      kind: "host",
+      endedAt: null,
+      pours: [],
+      startedLocally: local === true
+    });
+    state.nights.push(night);
+    state.activeNightId = night.id;
+    return night;
+  },
+
+  endHostNight(nightId, { local }) {
+    const night = state.nights.find((entry) => entry.id === nightId);
+    if (!night) throw refusal("That night does not exist.");
+    if (night.kind !== "host") throw refusal("Only a host night can be ended.");
+    if (night.endedAt) throw refusal("This host night has already ended.");
+    if (local && night.startedLocally !== true) throw refusal(NOT_SAVING_MESSAGE);
+    const open = state.guestTabs.filter((tab) => tab.nightId === nightId && tab.status === "open").length;
+    if (open > 0) {
+      throw refusal(`${open} tab(s) are still open; close each one as paid or written off before ending the night.`);
+    }
+    const ended = { ...night, endedAt: nowIso() };
+    state.nights = state.nights.map((entry) => (entry.id === nightId ? ended : entry));
+    return ended;
+  },
+
+  correctStock({ id, bottleId, newRemaining }) {
+    const bottle = bottleById(bottleId);
+    if (!bottle) throw refusal("That stock item does not exist.");
+    const level = Number(newRemaining);
+    if (!Number.isFinite(level) || level < 0 || level > Number(bottle.size)) {
+      throw refusal(`The new level must be between 0 and ${bottle.size} (the item's size).`);
+    }
+    if (!hasAtMostTwoDecimals(level)) throw refusal(`Amounts are kept to two decimal places, and ${level} has more.`);
+    const type = typeById(bottle.typeId);
+    if (type?.measure === RNMBDomain.MEASURE_UNIT && !Number.isInteger(level)) {
+      throw refusal(`${type.name} is counted stock and is counted in whole units.`);
+    }
+    const adjustment = RNMBDomain.normalizeAdjustment({
+      id: id || uid(),
+      bottleId,
+      previousRemaining: Number(bottle.remaining),
+      newRemaining: level,
+      adjustedAt: nowIso()
+    });
+    state.bottles = state.bottles.map((entry) => (entry.id === bottleId ? { ...entry, remaining: level } : entry));
+    state.stockAdjustments.push(adjustment);
+    return adjustment;
+  },
+
+  saveMenuItem(menuItem) {
+    const saved = prepareMenuItem(menuItem);
+    const exists = state.menuItems.some((entry) => entry.id === saved.id);
+    state.menuItems = exists
+      ? state.menuItems.map((entry) => (entry.id === saved.id ? saved : entry))
+      : [...state.menuItems, saved];
+    return saved;
+  },
+
+  removeMenuItem(menuItemId) {
+    if (!state.menuItems.some((entry) => entry.id === menuItemId)) throw refusal("That menu item does not exist.");
+    state.menuItems = state.menuItems.filter((entry) => entry.id !== menuItemId);
+    // Past ring-ups keep the item's name (KTD6); only the reference goes.
+    state.ringUps = state.ringUps.map((ringUp) => (ringUp.menuItemId === menuItemId ? { ...ringUp, menuItemId: null } : ringUp));
+  },
+
+  updatePricing(pricing) {
+    Object.assign(state, preparePricing(pricing));
+  }
+};
+
+/** Validate a menu item and fill its ids; returns the normalized item or throws a refusal. Does not touch state. */
+function prepareMenuItem(menuItem) {
+  const name = String(menuItem.name || "").trim();
+  if (!name) throw refusal("A menu item needs a name.");
+  if (!["cocktail", "straight", "counted"].includes(menuItem.kind)) {
+    throw refusal("A menu item is a cocktail, a straight pour or a counted item.");
+  }
+  const ingredients = (menuItem.ingredients || []).map((ingredient) => ({
+    id: ingredient.id || uid(),
+    typeId: ingredient.typeId,
+    amount: menuItem.kind === "counted" ? 1 : Number(ingredient.amount)
+  }));
+  if (!ingredients.length) throw refusal("A menu item needs at least one ingredient.");
+  if (menuItem.kind !== "cocktail" && ingredients.length !== 1) {
+    throw refusal("A straight pour or counted item has exactly one ingredient.");
+  }
+  ingredients.forEach((ingredient) => {
+    const type = typeById(ingredient.typeId);
+    if (!type) throw refusal("Every ingredient needs a stock type.");
+    if (menuItem.kind === "counted" && type.measure !== RNMBDomain.MEASURE_UNIT) {
+      throw refusal(`A counted item needs a counted stock type, and ${type.name} is poured.`);
+    }
+    if (menuItem.kind === "straight" && type.measure === RNMBDomain.MEASURE_UNIT) {
+      throw refusal(`A straight pour needs a poured stock type, and ${type.name} is counted.`);
+    }
+    checkAmount(ingredient.amount, type, "Every ingredient");
+  });
+  return RNMBDomain.normalizeMenuItem({ id: menuItem.id || uid(), name, kind: menuItem.kind, ingredients });
+}
+
+/** Validate markup and rounding; returns { markupPercent, roundingIncrementCents } or throws a refusal. */
+function preparePricing({ markupPercent, roundingIncrementCents }) {
+  const markup = Number(markupPercent);
+  const increment = Number(roundingIncrementCents);
+  if (!Number.isFinite(markup) || markup < 0) throw refusal("The markup must be a percentage of 0 or more.");
+  if (!Number.isInteger(increment) || increment <= 0) throw refusal("The rounding increment must be a whole number of cents above 0.");
+  return { markupPercent: markup, roundingIncrementCents: increment };
+}
+
+/** Price a draft with the current settings. sources: [{ bottleId, amount }] across every ingredient. */
+function buildRingUp({ id, nightId, kind, tabId, personId, menuItemId, sources }) {
+  const priced = RNMBDomain.priceRingUp(sources, {
+    bottles: state.bottles,
+    types: state.types,
+    people: state.people,
+    markupPercent: state.markupPercent,
+    roundingIncrementCents: state.roundingIncrementCents,
+    kind
+  });
+  return {
+    id: id || uid(),
+    nightId,
+    kind,
+    tabId: kind === "guest" ? tabId : null,
+    personId: kind === "crew" ? personId : null,
+    menuItemId,
+    priceCents: priced.priceCents,
+    rungAt: nowIso(),
+    lines: priced.lines.map((line) => ({ id: uid(), ...line }))
+  };
+}
+
+function persistLocal() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+}
+
 function createLocalRepository() {
+  // Every host-mode method validates and applies the change to `state`, then
+  // stores it, or throws a readable refusal and changes nothing.
+  const apply = (rule) => async (...args) => {
+    const result = hostRules[rule](...args, { local: true });
+    persistLocal();
+    return result;
+  };
   return {
     async load() {
       const local = loadLocalState();
@@ -91,7 +446,17 @@ function createLocalRepository() {
     },
     async saveAll(nextState) {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(nextState));
-    }
+    },
+    ringUp: apply("ringUp"),
+    voidRingUp: apply("voidRingUp"),
+    openTab: apply("openTab"),
+    closeTab: apply("closeTab"),
+    startHostNight: apply("startHostNight"),
+    endHostNight: apply("endHostNight"),
+    correctStock: apply("correctStock"),
+    saveMenuItem: apply("saveMenuItem"),
+    removeMenuItem: apply("removeMenuItem"),
+    updatePricing: apply("updatePricing")
   };
 }
 
@@ -139,7 +504,20 @@ function createSupabaseRepository(config) {
 
     if (!response.ok) {
       const body = await response.text();
-      throw new Error(`Supabase ${options.method || "GET"} ${path} failed: ${body}`);
+      const error = new Error(`Supabase ${options.method || "GET"} ${path} failed: ${body}`);
+      error.status = response.status;
+      try {
+        const parsed = JSON.parse(body);
+        error.code = parsed?.code;
+        // The host-mode functions refuse with a message that starts "RNMB:" and
+        // says what to fix; carry it to the toast.
+        if (typeof parsed?.message === "string" && parsed.message.startsWith("RNMB:")) {
+          error.userMessage = parsed.message;
+        }
+      } catch {
+        // Not JSON; the generic toast is all we can say.
+      }
+      throw error;
     }
 
     if (response.status === 204) return null;
@@ -149,6 +527,54 @@ function createSupabaseRepository(config) {
 
   async function readTable(table, query = "") {
     return request(`${table}?select=*&${query}`);
+  }
+
+  // A host-mode table that does not exist yet (supabase/host-mode.sql not run)
+  // answers 404 / PGRST205. Read it as missing, like checkAccess's "open".
+  async function readHostModeTable(table, query) {
+    try {
+      return await readTable(table, query);
+    } catch (error) {
+      if (error.status === 404 || ["PGRST205", "42P01"].includes(error.code)) return null;
+      throw error;
+    }
+  }
+
+  async function rpc(name, payload) {
+    if (!hostModeAvailable) throw refusal(HOST_MODE_SQL_MESSAGE);
+    return request(`rpc/${name}`, { method: "POST", body: JSON.stringify({ payload }) });
+  }
+
+  function requireHostMode() {
+    if (!hostModeAvailable) throw refusal(HOST_MODE_SQL_MESSAGE);
+  }
+
+  // After the database accepted a change, apply the same rule to this browser's
+  // copy. If the copy was stale and the rule disagrees, reload instead.
+  async function mirror(rule, ...args) {
+    try {
+      return hostRules[rule](...args, { local: false });
+    } catch (error) {
+      console.warn("Reloading after a host-mode change this browser could not mirror:", error.message);
+      state = await repositoryApi.load();
+      return null;
+    }
+  }
+
+  const knownId = (list, id) => (id && list.some((entry) => entry.id === id) ? id : null);
+
+  function menuItemRow(menuItem) {
+    return { id: menuItem.id, name: menuItem.name, kind: menuItem.kind };
+  }
+
+  function ingredientRows(menuItem) {
+    return (menuItem.ingredients || []).map((ingredient, index) => ({
+      id: ingredient.id || uid(),
+      menu_item_id: menuItem.id,
+      type_id: ingredient.typeId,
+      amount: ingredient.amount,
+      line_no: index
+    }));
   }
 
   async function deleteAll(table) {
@@ -190,15 +616,11 @@ function createSupabaseRepository(config) {
     await request("rnmb_settings?on_conflict=id", {
       method: "POST",
       headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-      body: JSON.stringify([{
-        id: true,
-        active_night_id: nextState.activeNightId || null,
-        responsible_mode: nextState.responsibleMode !== false
-      }])
+      body: JSON.stringify([RNMBDomain.settingsRow(nextState, hostModeAvailable)])
     });
   }
 
-  return {
+  const repositoryApi = {
     // "open"   - the passphrase gate is not installed in Postgres (yet)
     // "ok"     - the passphrase we are holding is the right one
     // "denied" - a passphrase is required and ours is missing or wrong
@@ -214,19 +636,43 @@ function createSupabaseRepository(config) {
     },
 
     async load() {
-      const [peopleRows, typeRows, bottleRows, nightRows, pourRows, settingsRows] = await Promise.all([
+      const [
+        peopleRows, typeRows, bottleRows, nightRows, pourRows, settingsRows,
+        menuItemRows, ingredientRowsRead, tabRows, ringUpRows, lineRows, adjustmentRows
+      ] = await Promise.all([
         readTable("rnmb_people", "order=created_at.asc"),
         readTable("rnmb_beverage_types", "order=created_at.asc"),
         readTable("rnmb_bottles", "order=created_at.asc"),
         readTable("rnmb_nights", "order=date.desc,created_at.desc"),
         readTable("rnmb_pours", "order=poured_at.asc"),
-        readTable("rnmb_settings", "id=eq.true")
+        readTable("rnmb_settings", "id=eq.true"),
+        readHostModeTable("rnmb_menu_items", "order=created_at.asc"),
+        readHostModeTable("rnmb_recipe_ingredients", "order=line_no.asc,created_at.asc"),
+        readHostModeTable("rnmb_guest_tabs", "order=opened_at.asc"),
+        readHostModeTable("rnmb_ring_ups", "order=rung_at.asc"),
+        readHostModeTable("rnmb_ring_up_lines", "order=line_no.asc"),
+        readHostModeTable("rnmb_stock_adjustments", "order=adjusted_at.asc")
       ]);
+      const hostTables = [menuItemRows, ingredientRowsRead, tabRows, ringUpRows, lineRows, adjustmentRows];
+      hostModeAvailable = hostTables.every((rows) => rows !== null);
+
+      const groupBy = (rows, key) => {
+        const groups = new Map();
+        (rows || []).forEach((row) => {
+          if (!groups.has(row[key])) groups.set(row[key], []);
+          groups.get(row[key]).push(row);
+        });
+        return groups;
+      };
+      const ingredientsByItem = groupBy(ingredientRowsRead, "menu_item_id");
+      const linesByRingUp = groupBy(lineRows, "ring_up_id");
 
       const nights = nightRows.map((night) => ({
         id: night.id,
         name: night.name,
         date: night.date,
+        kind: night.kind,
+        endedAt: night.ended_at,
         pours: pourRows
           .filter((pour) => pour.night_id === night.id)
           .map((pour) => ({
@@ -250,30 +696,102 @@ function createSupabaseRepository(config) {
           id: type.id,
           name: type.name,
           category: type.category,
-          abv: Number(type.abv)
+          abv: Number(type.abv),
+          measure: type.measure,
+          unitOz: type.unit_oz
         })),
         bottles: bottleRows.map((bottle) => ({
           id: bottle.id,
           typeId: bottle.type_id,
           nickname: bottle.nickname || "",
-          sizeOz: Number(bottle.size_oz),
-          remainingOz: Number(bottle.remaining_oz),
+          size: Number(bottle.size_oz),
+          remaining: Number(bottle.remaining_oz),
           price: Number(bottle.price),
           buyerId: bottle.buyer_id || "",
           date: bottle.purchase_date
         })),
         nights,
+        menuItems: (menuItemRows || []).map((item) => ({
+          id: item.id,
+          name: item.name,
+          kind: item.kind,
+          ingredients: (ingredientsByItem.get(item.id) || []).map((ingredient) => ({
+            id: ingredient.id,
+            typeId: ingredient.type_id,
+            amount: ingredient.amount
+          }))
+        })),
+        guestTabs: (tabRows || []).map((tab) => ({
+          id: tab.id,
+          nightId: tab.night_id,
+          guestName: tab.guest_name,
+          status: tab.status,
+          collectorId: tab.collector_id,
+          collectorName: tab.collector_name,
+          amountCents: tab.amount_cents,
+          openedAt: tab.opened_at,
+          closedAt: tab.closed_at
+        })),
+        ringUps: (ringUpRows || []).map((ringUp) => ({
+          id: ringUp.id,
+          nightId: ringUp.night_id,
+          kind: ringUp.kind,
+          tabId: ringUp.tab_id,
+          personId: ringUp.person_id,
+          personName: ringUp.person_name,
+          menuItemId: ringUp.menu_item_id,
+          menuItemName: ringUp.menu_item_name,
+          priceCents: ringUp.price_cents,
+          rungAt: ringUp.rung_at,
+          voidedAt: ringUp.voided_at,
+          lines: (linesByRingUp.get(ringUp.id) || []).map((line) => ({
+            id: line.id,
+            bottleId: line.bottle_id,
+            typeId: line.type_id,
+            amount: line.amount,
+            costCents: line.cost_cents,
+            shareCents: line.share_cents,
+            buyerId: line.buyer_id,
+            buyerName: line.buyer_name,
+            abv: line.abv_snapshot
+          }))
+        })),
+        stockAdjustments: (adjustmentRows || []).map((adjustment) => ({
+          id: adjustment.id,
+          bottleId: adjustment.bottle_id,
+          previousRemaining: adjustment.previous_remaining,
+          newRemaining: adjustment.new_remaining,
+          adjustedAt: adjustment.adjusted_at
+        })),
         activeNightId: settings.active_night_id || nights[0]?.id || "",
-        responsibleMode: settings.responsible_mode !== false
+        responsibleMode: settings.responsible_mode !== false,
+        markupPercent: settings.markup_percent,
+        roundingIncrementCents: settings.rounding_increment_cents
       });
     },
     async saveAll(nextState) {
+      // Replacing the database would silently drop money and stock history the
+      // pre-host-mode schema has nowhere to keep, so refuse before deleting anything.
+      const hasHostHistory = nextState.guestTabs.length || nextState.ringUps.length ||
+        nextState.stockAdjustments.length || nextState.nights.some((night) => night.kind === "host");
+      if (!hostModeAvailable && hasHostHistory) throw refusal(`This data includes host-night records. ${HOST_MODE_SQL_MESSAGE}`);
+
       await request("rnmb_settings?id=eq.true", {
         method: "PATCH",
         headers: { Prefer: "return=minimal" },
         body: JSON.stringify({ active_night_id: null })
       }).catch(() => undefined);
 
+      // Children before parents: the host-mode tables reference nights, people,
+      // bottles and types, and bottles and tabs refuse deletes while referenced.
+      if (hostModeAvailable) {
+        await deleteAll("rnmb_ring_up_lines");
+        await deleteAll("rnmb_ring_ups");
+        await deleteAll("rnmb_guest_tabs");
+        await deleteAll("rnmb_stock_adjustments");
+        await deleteAll("rnmb_recipe_ingredients");
+        await deleteAll("rnmb_menu_items");
+      }
       await deleteAll("rnmb_pours");
       await deleteAll("rnmb_bottles");
       await deleteAll("rnmb_nights");
@@ -285,27 +803,9 @@ function createSupabaseRepository(config) {
         name: person.name,
         color: person.color
       })));
-      await insertRows("rnmb_beverage_types", nextState.types.map((type) => ({
-        id: type.id,
-        name: type.name,
-        category: type.category,
-        abv: type.abv
-      })));
-      await insertRows("rnmb_nights", nextState.nights.map((night) => ({
-        id: night.id,
-        name: night.name,
-        date: night.date
-      })));
-      await insertRows("rnmb_bottles", nextState.bottles.map((bottle) => ({
-        id: bottle.id,
-        type_id: bottle.typeId,
-        nickname: bottle.nickname || null,
-        size_oz: bottle.sizeOz,
-        remaining_oz: bottle.remainingOz,
-        price: bottle.price,
-        buyer_id: bottle.buyerId || null,
-        purchase_date: bottle.date
-      })));
+      await insertRows("rnmb_beverage_types", nextState.types.map((type) => RNMBDomain.typeRow(type, hostModeAvailable)));
+      await insertRows("rnmb_nights", nextState.nights.map((night) => RNMBDomain.nightRow(night, hostModeAvailable)));
+      await insertRows("rnmb_bottles", nextState.bottles.map((bottle) => RNMBDomain.bottleRow(bottle)));
       await insertRows("rnmb_pours", nextState.nights.flatMap((night) => (
         (night.pours || []).map((pour) => ({
           id: pour.id,
@@ -317,6 +817,58 @@ function createSupabaseRepository(config) {
           poured_at: pour.timestamp
         }))
       )));
+
+      if (hostModeAvailable) {
+        // Every row in one bulk insert must carry the same keys, and person and
+        // menu references that no longer exist become null (their names stay).
+        const people = nextState.people;
+        await insertRows("rnmb_menu_items", nextState.menuItems.map(menuItemRow));
+        await insertRows("rnmb_recipe_ingredients", nextState.menuItems.flatMap(ingredientRows));
+        await insertRows("rnmb_guest_tabs", nextState.guestTabs.map((tab) => ({
+          id: tab.id,
+          night_id: tab.nightId,
+          guest_name: tab.guestName,
+          status: tab.status,
+          collector_id: knownId(people, tab.collectorId),
+          collector_name: tab.collectorName,
+          amount_cents: tab.amountCents,
+          opened_at: tab.openedAt || nowIso(),
+          closed_at: tab.closedAt
+        })));
+        await insertRows("rnmb_ring_ups", nextState.ringUps.map((ringUp) => ({
+          id: ringUp.id,
+          night_id: ringUp.nightId,
+          kind: ringUp.kind,
+          tab_id: ringUp.kind === "guest" ? ringUp.tabId : null,
+          person_id: ringUp.kind === "crew" ? knownId(people, ringUp.personId) : null,
+          person_name: ringUp.kind === "crew" ? ringUp.personName || "Unknown" : null,
+          menu_item_id: knownId(nextState.menuItems, ringUp.menuItemId),
+          menu_item_name: ringUp.menuItemName || "Unknown",
+          price_cents: ringUp.kind === "guest" ? ringUp.priceCents : null,
+          rung_at: ringUp.rungAt || nowIso(),
+          voided_at: ringUp.voidedAt
+        })));
+        await insertRows("rnmb_ring_up_lines", nextState.ringUps.flatMap((ringUp) => ringUp.lines.map((line, index) => ({
+          id: line.id || uid(),
+          ring_up_id: ringUp.id,
+          line_no: index + 1,
+          bottle_id: line.bottleId,
+          type_id: line.typeId,
+          amount: line.amount,
+          cost_cents: line.costCents,
+          share_cents: ringUp.kind === "guest" ? line.shareCents : null,
+          buyer_id: knownId(people, line.buyerId),
+          buyer_name: line.buyerName || null,
+          abv_snapshot: line.abv
+        }))));
+        await insertRows("rnmb_stock_adjustments", nextState.stockAdjustments.map((adjustment) => ({
+          id: adjustment.id,
+          bottle_id: adjustment.bottleId,
+          previous_remaining: adjustment.previousRemaining,
+          new_remaining: adjustment.newRemaining,
+          adjusted_at: adjustment.adjustedAt || nowIso()
+        })));
+      }
       await saveSettings(nextState);
     },
     async updateSettings(nextState) {
@@ -330,35 +882,30 @@ function createSupabaseRepository(config) {
       });
     },
     async addType(type) {
-      await insertRow("rnmb_beverage_types", {
-        id: type.id,
-        name: type.name,
-        category: type.category,
-        abv: type.abv
-      });
+      await insertRow("rnmb_beverage_types", RNMBDomain.typeRow(type, hostModeAvailable));
     },
     async addBottle(bottle) {
-      await insertRow("rnmb_bottles", {
-        id: bottle.id,
-        type_id: bottle.typeId,
-        nickname: bottle.nickname || null,
-        size_oz: bottle.sizeOz,
-        remaining_oz: bottle.remainingOz,
-        price: bottle.price,
-        buyer_id: bottle.buyerId || null,
-        purchase_date: bottle.date
-      });
+      await insertRow("rnmb_bottles", RNMBDomain.bottleRow(bottle));
     },
     async addNight(night, nextState) {
-      await insertRow("rnmb_nights", {
-        id: night.id,
-        name: night.name,
-        date: night.date
-      });
+      await insertRow("rnmb_nights", RNMBDomain.nightRow(night, hostModeAvailable));
       await saveSettings(nextState);
     },
-    async addPour(night, pour, remainingOz) {
-      await patchWhere("rnmb_bottles", `id=eq.${pour.bottleId}`, { remaining_oz: remainingOz });
+    async addPour(night, pour, remaining) {
+      if (hostModeAvailable) {
+        // KTD13: one call that takes the amount off the level in the database
+        // right now, so a stale copy here cannot undo another device's sales.
+        await rpc("rnmb_add_crew_pour", {
+          id: pour.id,
+          night_id: night.id,
+          person_id: pour.personId,
+          bottle_id: pour.bottleId,
+          ounces: pour.ounces,
+          poured_at: pour.timestamp
+        });
+        return;
+      }
+      await patchWhere("rnmb_bottles", `id=eq.${pour.bottleId}`, { remaining_oz: remaining });
       await insertRow("rnmb_pours", {
         id: pour.id,
         night_id: night.id,
@@ -369,17 +916,107 @@ function createSupabaseRepository(config) {
         poured_at: pour.timestamp
       });
     },
-    async removePour(pour, restoredRemainingOz) {
+    async removePour(pour, restoredRemaining) {
+      if (hostModeAvailable) {
+        await rpc("rnmb_remove_crew_pour", { id: pour.id });
+        return;
+      }
       await deleteWhere("rnmb_pours", `id=eq.${pour.id}`);
-      await patchWhere("rnmb_bottles", `id=eq.${pour.bottleId}`, { remaining_oz: restoredRemainingOz });
+      await patchWhere("rnmb_bottles", `id=eq.${pour.bottleId}`, { remaining_oz: restoredRemaining });
     },
     async removeBottle(bottleId) {
-      await deleteWhere("rnmb_bottles", `id=eq.${bottleId}`);
+      if (bottleHasSales(bottleId)) throw refusal(SOLD_BOTTLE_MESSAGE);
+      try {
+        await deleteWhere("rnmb_bottles", `id=eq.${bottleId}`);
+      } catch (error) {
+        // Another device sold from it since this copy loaded (on delete restrict).
+        if (error.status === 409 || error.code === "23503") throw refusal(SOLD_BOTTLE_MESSAGE);
+        throw error;
+      }
     },
     async removePerson(personId) {
       await deleteWhere("rnmb_people", `id=eq.${personId}`);
+    },
+
+    // ---- host mode: one database function call each (KTD3), then mirrored ----
+    async ringUp(record) {
+      await rpc("rnmb_ring_up", {
+        id: record.id,
+        night_id: record.nightId,
+        kind: record.kind,
+        ...(record.kind === "guest" ? { tab_id: record.tabId, price_cents: record.priceCents } : { person_id: record.personId }),
+        menu_item_id: record.menuItemId,
+        rung_at: record.rungAt,
+        lines: record.lines.map((line) => ({
+          id: line.id,
+          bottle_id: line.bottleId,
+          amount: line.amount,
+          cost_cents: line.costCents,
+          ...(record.kind === "guest" ? { share_cents: line.shareCents } : {})
+        }))
+      });
+      return mirror("ringUp", record);
+    },
+    async voidRingUp(ringUpId) {
+      await rpc("rnmb_void_ring_up", { id: ringUpId });
+      return mirror("voidRingUp", ringUpId);
+    },
+    async openTab(tab) {
+      await rpc("rnmb_open_tab", { id: tab.id, night_id: tab.nightId, guest_name: tab.guestName, opened_at: tab.openedAt || nowIso() });
+      return mirror("openTab", tab);
+    },
+    async closeTab(closing) {
+      await rpc("rnmb_close_tab", {
+        id: closing.id,
+        status: closing.status,
+        ...(closing.status === "paid" ? { collector_id: closing.collectorId, amount_cents: closing.amountCents } : {})
+      });
+      return mirror("closeTab", closing);
+    },
+    async startHostNight(night) {
+      await rpc("rnmb_start_host_night", { id: night.id, name: night.name, date: night.date || today() });
+      const started = await mirror("startHostNight", night);
+      // The function does not touch settings; making the new night active is ours.
+      state.activeNightId = night.id;
+      await saveSettings(state);
+      return started;
+    },
+    async endHostNight(nightId) {
+      await rpc("rnmb_end_host_night", { id: nightId });
+      return mirror("endHostNight", nightId);
+    },
+    async correctStock(correction) {
+      const withId = { ...correction, id: correction.id || uid() };
+      await rpc("rnmb_correct_stock", { id: withId.id, bottle_id: withId.bottleId, new_remaining: withId.newRemaining });
+      return mirror("correctStock", withId);
+    },
+    // Menu items and recipes are plain table writes; the gated policies allow them.
+    async saveMenuItem(menuItem) {
+      requireHostMode();
+      const exists = state.menuItems.some((entry) => entry.id === menuItem.id);
+      // Validate and fill ids first, so the rows sent are the rows kept.
+      const saved = prepareMenuItem(menuItem);
+      if (exists) {
+        await patchWhere("rnmb_menu_items", `id=eq.${saved.id}`, { name: saved.name, kind: saved.kind });
+        await deleteWhere("rnmb_recipe_ingredients", `menu_item_id=eq.${saved.id}`);
+      } else {
+        await insertRow("rnmb_menu_items", menuItemRow(saved));
+      }
+      await insertRows("rnmb_recipe_ingredients", ingredientRows(saved));
+      return mirror("saveMenuItem", saved);
+    },
+    async removeMenuItem(menuItemId) {
+      requireHostMode();
+      await deleteWhere("rnmb_menu_items", `id=eq.${menuItemId}`);
+      return mirror("removeMenuItem", menuItemId);
+    },
+    async updatePricing(pricing) {
+      requireHostMode();
+      await saveSettings({ ...state, ...preparePricing(pricing) });
+      return mirror("updatePricing", pricing);
     }
   };
+  return repositoryApi;
 }
 
 // The shared passphrase gates every table (supabase/rls-passphrase.sql). Ask for
@@ -415,6 +1052,7 @@ async function init() {
     if (syncMode === "supabase" && !(await unlockSupabase())) {
       repository = createLocalRepository();
       syncMode = "local";
+      hostModeAvailable = true;
       showToast("No passphrase. Using local browser storage.");
     }
     state = await repository.load();
@@ -427,25 +1065,47 @@ async function init() {
     console.error(error);
     repository = createLocalRepository();
     syncMode = "local";
+    hostModeAvailable = true;
     state = await repository.load();
     render();
     showToast("Supabase load failed. Using local browser storage.");
   }
 }
 
+/*
+ * Two ways to save. saveState is today's pattern: the handler has already
+ * changed `state`, Supabase mode sends one targeted write and local mode stores
+ * the whole state. hostAction is for host-mode changes (ring-ups, tabs, host
+ * nights, stock corrections, menu and pricing): the repository itself checks the
+ * rules and applies the change to `state` in both modes, so the handler must
+ * not change `state` first. Both return true on success and false on failure.
+ */
 async function saveState(message, supabaseOperation) {
-  saveInFlight = true;
-  try {
+  return commitSave(message, async () => {
     if (syncMode === "supabase" && supabaseOperation) {
       await supabaseOperation(repository);
     } else {
       await repository.saveAll(state);
     }
+  });
+}
+
+async function hostAction(message, operation) {
+  return commitSave(message, () => operation(repository));
+}
+
+async function commitSave(message, write) {
+  saveInFlight = true;
+  try {
+    await write();
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     render();
     if (message) showToast(message);
+    return true;
   } catch (error) {
-    console.error(error);
+    // A refusal is the app working as intended (a rule said no), not a bug.
+    if (error.userMessage) console.warn(error.message);
+    else console.error(error);
     if (syncMode === "supabase") {
       try {
         state = await repository.load();
@@ -455,7 +1115,8 @@ async function saveState(message, supabaseOperation) {
       }
     }
     render();
-    showToast("Save failed. Check Supabase settings and policies.");
+    showToast(error.userMessage || "Save failed. Check Supabase settings and policies.");
+    return false;
   } finally {
     saveInFlight = false;
     lastSyncedAt = new Date();
@@ -466,7 +1127,7 @@ async function saveState(message, supabaseOperation) {
  * Shared state is read once at boot and never again, so two people on the same
  * dashboard never saw each other's pours. There is no realtime subscription
  * here on purpose: the app has no dependencies and adding a websocket client
- * would be the only one. Polling six small tables every 15s is enough for a
+ * would be the only one. Polling a dozen small tables every 15s is enough for a
  * dashboard a handful of people watch for an evening.
  */
 const REFRESH_MS = 15000;
@@ -556,7 +1217,7 @@ function totalSpend() {
 function totalRemainingStandardDrinks() {
   return state.bottles.reduce((sum, bottle) => {
     const type = typeById(bottle.typeId);
-    return sum + standardDrinks(bottle.remainingOz, type?.abv || 0);
+    return sum + standardDrinks(bottle.remaining, type?.abv || 0);
   }, 0);
 }
 
@@ -669,8 +1330,8 @@ function renderForms() {
   setOptions(document.querySelector("select[name='typeId']"), state.types, (type) => `${type.name} · ${type.abv}%`, "Add types first");
   setOptions(
     document.querySelector("select[name='bottleId']"),
-    state.bottles.filter((bottle) => Number(bottle.remainingOz) > 0),
-    (bottle) => `${bottleLabel(bottle)} · ${oneDecimal(bottle.remainingOz)} oz left`,
+    state.bottles.filter((bottle) => Number(bottle.remaining) > 0),
+    (bottle) => `${bottleLabel(bottle)} · ${oneDecimal(bottle.remaining)} oz left`,
     "No stocked bottles"
   );
 }
@@ -733,7 +1394,7 @@ function renderSpendBars() {
 function renderLowSupply() {
   const target = document.querySelector("#lowSupplyList");
   const low = state.bottles
-    .map((bottle) => ({ bottle, ratio: Number(bottle.remainingOz || 0) / Number(bottle.sizeOz || 1) }))
+    .map((bottle) => ({ bottle, ratio: Number(bottle.remaining || 0) / Number(bottle.size || 1) }))
     .filter((entry) => entry.ratio <= 0.25)
     .sort((a, b) => a.ratio - b.ratio);
 
@@ -747,7 +1408,7 @@ function renderLowSupply() {
   low.forEach(({ bottle, ratio }) => {
     const item = document.createElement("div");
     item.className = "stack-item";
-    item.innerHTML = `<strong>${escapeHtml(bottleLabel(bottle))}</strong><br><small>${oneDecimal(bottle.remainingOz)} oz left · ${Math.round(ratio * 100)}%</small>`;
+    item.innerHTML = `<strong>${escapeHtml(bottleLabel(bottle))}</strong><br><small>${oneDecimal(bottle.remaining)} oz left · ${Math.round(ratio * 100)}%</small>`;
     target.append(item);
   });
 }
@@ -846,7 +1507,7 @@ function renderInventory() {
     state.bottles.forEach((bottle) => {
       const type = typeById(bottle.typeId);
       const buyer = personById(bottle.buyerId);
-      const fill = Math.max(0, Math.min(100, (Number(bottle.remainingOz || 0) / Number(bottle.sizeOz || 1)) * 100));
+      const fill = Math.max(0, Math.min(100, (Number(bottle.remaining || 0) / Number(bottle.size || 1)) * 100));
       const card = document.createElement("article");
       card.className = "inventory-card";
       card.innerHTML = `
@@ -858,7 +1519,7 @@ function renderInventory() {
           <span class="pill">${oneDecimal(type?.abv || 0)}%</span>
         </header>
         <div class="progress"><span style="--fill: ${fill}%"></span></div>
-        <small>${oneDecimal(bottle.remainingOz)} of ${oneDecimal(bottle.sizeOz)} oz · ${oneDecimal(standardDrinks(bottle.remainingOz, type?.abv || 0))} standard drinks left</small>
+        <small>${oneDecimal(bottle.remaining)} of ${oneDecimal(bottle.size)} oz · ${oneDecimal(standardDrinks(bottle.remaining, type?.abv || 0))} standard drinks left</small>
         <small>${money(bottle.price)} paid by ${escapeHtml(buyer?.name || "Unknown")}</small>
         <button class="remove-button" type="button" data-remove-bottle="${bottle.id}" aria-label="Remove bottle">×</button>
       `;
@@ -1011,7 +1672,7 @@ document.querySelector("#typeForm").addEventListener("submit", async (event) => 
     category: data.get("category"),
     abv: Number(data.get("abv"))
   };
-  state.types.push(type);
+  state.types.push(RNMBDomain.normalizeType(type));
   event.currentTarget.reset();
   event.currentTarget.abv.value = 40;
   await saveState("Beverage type added.", (db) => db.addType(type));
@@ -1024,13 +1685,14 @@ document.querySelector("#bottleForm").addEventListener("submit", async (event) =
     return;
   }
   const data = new FormData(event.currentTarget);
-  const sizeOz = Number(data.get("sizeOz"));
+  // The form field keeps its old name; the amount is in the type's measure (KTD5).
+  const size = Number(data.get("sizeOz"));
   const bottle = {
     id: uid(),
     typeId: data.get("typeId"),
     nickname: data.get("nickname").trim(),
-    sizeOz,
-    remainingOz: sizeOz,
+    size,
+    remaining: size,
     price: Number(data.get("price")),
     buyerId: data.get("buyerId"),
     date: data.get("date")
@@ -1046,7 +1708,7 @@ document.querySelector("#bottleForm").addEventListener("submit", async (event) =
 document.querySelector("#nightForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const data = new FormData(event.currentTarget);
-  const night = { id: uid(), name: data.get("name").trim(), date: data.get("date"), pours: [] };
+  const night = { id: uid(), name: data.get("name").trim(), date: data.get("date"), kind: "crew", endedAt: null, pours: [] };
   state.nights.push(night);
   state.activeNightId = night.id;
   event.currentTarget.reset();
@@ -1074,12 +1736,12 @@ document.querySelector("#pourForm").addEventListener("submit", async (event) => 
     showToast("Pick a stocked bottle and a valid pour.");
     return;
   }
-  if (ounces > Number(bottle.remainingOz)) {
+  if (ounces > Number(bottle.remaining)) {
     showToast("That pour exceeds the bottle inventory.");
     return;
   }
 
-  bottle.remainingOz = Math.max(0, Number(bottle.remainingOz) - ounces);
+  bottle.remaining = Math.max(0, Number(bottle.remaining) - ounces);
   const pour = {
     id: uid(),
     personId: data.get("personId"),
@@ -1093,7 +1755,7 @@ document.querySelector("#pourForm").addEventListener("submit", async (event) => 
   const personTotal = activeNightTotals().byPerson.get(data.get("personId"))?.drinks || 0;
   const status = statusForDrinks(personTotal);
   const message = state.responsibleMode && status.className ? `${status.label}: ${status.meta}` : "Pour logged.";
-  await saveState(message, (db) => db.addPour(night, pour, bottle.remainingOz));
+  await saveState(message, (db) => db.addPour(night, pour, bottle.remaining));
 });
 
 document.body.addEventListener("click", async (event) => {
@@ -1106,14 +1768,19 @@ document.body.addEventListener("click", async (event) => {
     const pour = night?.pours.find((entry) => entry.id === pourId);
     const bottle = bottleById(pour?.bottleId);
     if (pour && bottle) {
-      bottle.remainingOz = Math.min(Number(bottle.sizeOz), Number(bottle.remainingOz) + Number(pour.ounces));
+      bottle.remaining = Math.min(Number(bottle.size), Number(bottle.remaining) + Number(pour.ounces));
       night.pours = night.pours.filter((entry) => entry.id !== pourId);
-      await saveState("Pour removed and inventory restored.", (db) => db.removePour(pour, bottle.remainingOz));
+      await saveState("Pour removed and inventory restored.", (db) => db.removePour(pour, bottle.remaining));
     }
   }
 
-  if (bottleId && confirm("Remove this bottle and its receipt from the dashboard?")) {
+  // KTD6: money history is never destroyed, so a stock item that drinks were
+  // sold from stays. Checked here for both repositories, before anything changes.
+  if (bottleId && bottleHasSales(bottleId)) {
+    showToast(SOLD_BOTTLE_MESSAGE);
+  } else if (bottleId && confirm("Remove this bottle and its receipt from the dashboard?")) {
     state.bottles = state.bottles.filter((bottle) => bottle.id !== bottleId);
+    state.stockAdjustments = state.stockAdjustments.filter((adjustment) => adjustment.bottleId !== bottleId);
     state.nights.forEach((night) => {
       night.pours = night.pours.filter((pour) => pour.bottleId !== bottleId);
     });
@@ -1128,12 +1795,29 @@ document.body.addEventListener("click", async (event) => {
     state.nights.forEach((night) => {
       night.pours = night.pours.filter((pour) => pour.personId !== personId);
     });
+    // As the database does (on delete set null): the reference goes, the name
+    // snapshot stays on every tab, ring-up and line.
+    state.guestTabs = state.guestTabs.map((tab) => (tab.collectorId === personId ? { ...tab, collectorId: null } : tab));
+    state.ringUps = state.ringUps.map((ringUp) => ({
+      ...ringUp,
+      personId: ringUp.personId === personId ? null : ringUp.personId,
+      lines: ringUp.lines.map((line) => (line.buyerId === personId ? { ...line, buyerId: null } : line))
+    }));
     await saveState("Person removed.", (db) => db.removePerson(personId));
   }
 });
 
+function bottleHasSales(bottleId) {
+  return state.ringUps.some((ringUp) => ringUp.lines.some((line) => line.bottleId === bottleId));
+}
+
+/** The export archive: the whole state, every host-mode collection included. */
+function archiveData() {
+  return JSON.parse(JSON.stringify(state));
+}
+
 function downloadArchive(label) {
-  const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+  const blob = new Blob([JSON.stringify(archiveData(), null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
@@ -1144,8 +1828,8 @@ function downloadArchive(label) {
 
 /*
  * Import, Reload demo and Clear are the only actions that do not write a single
- * targeted row: they go through saveAll, which deletes every row in all five
- * tables and re-inserts. Connected to Supabase that is everyone's data, not
+ * targeted row: they go through saveAll, which deletes every row in every
+ * table and re-inserts. Connected to Supabase that is everyone's data, not
  * this browser's copy -- and Clear's old wording ("from this browser") said the
  * opposite. Name the real scope, and take a backup on the way out, because the
  * deletes and inserts are separate requests with no transaction around them.
@@ -1174,6 +1858,18 @@ document.querySelector("#importData").addEventListener("change", async (event) =
     if (!Array.isArray(imported.people) || !Array.isArray(imported.types) || !Array.isArray(imported.bottles) || !Array.isArray(imported.nights)) {
       throw new Error("Invalid archive");
     }
+    // Host-mode collections are optional (older archives have none), but when
+    // present they must be lists, and every ring-up must carry its lines.
+    const hostCollections = ["menuItems", "guestTabs", "ringUps", "stockAdjustments"];
+    if (hostCollections.some((key) => imported[key] !== undefined && !Array.isArray(imported[key]))) {
+      throw new Error("Invalid archive");
+    }
+    if ((imported.ringUps || []).some((ringUp) => !ringUp || !Array.isArray(ringUp.lines))) {
+      throw new Error("Invalid archive");
+    }
+    if ((imported.menuItems || []).some((item) => !item || (item.ingredients !== undefined && !Array.isArray(item.ingredients)))) {
+      throw new Error("Invalid archive");
+    }
     if (!confirmDestructive(`Import ${file.name}?`)) {
       event.target.value = "";
       return;
@@ -1200,6 +1896,18 @@ document.querySelector("#clearData").addEventListener("click", async () => {
   downloadArchive("backup-before-clear");
   state = emptyState();
   await saveState("Dashboard cleared.");
+});
+
+// Read-mostly handle for the browser smoke tests (tests/browser/host-mode.smoke.js)
+// and later UI units. It exposes nothing the console could not already reach.
+window.__rnmb = Object.freeze({
+  get state() { return state; },
+  get repository() { return repository; },
+  get syncMode() { return syncMode; },
+  get hostModeAvailable() { return hostModeAvailable; },
+  archiveData,
+  buildRingUp,
+  hostAction
 });
 
 init();
