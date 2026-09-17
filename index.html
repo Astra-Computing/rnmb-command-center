@@ -162,8 +162,8 @@
                   <select name="bottleId" required></select>
                 </label>
                 <label>
-                  Ounces consumed
-                  <input name="ounces" type="number" min="0.1" step="0.1" value="1.5" required>
+                  <span id="pourAmountLabel">Ounces consumed</span>
+                  <input name="ounces" type="number" min="0.1" step="0.1" value="1.5" data-measure="oz" required>
                 </label>
                 <button type="submit">Log Pour</button>
               </form>
@@ -216,12 +216,24 @@
                     <option>Gin</option>
                     <option>Tequila</option>
                     <option>Liqueur</option>
+                    <option>Mixer</option>
                     <option>Other</option>
                   </select>
                 </label>
                 <label>
+                  Measure
+                  <select name="measure" required>
+                    <option value="oz">Poured, ounces</option>
+                    <option value="unit">Counted, units</option>
+                  </select>
+                </label>
+                <label>
                   ABV %
-                  <input name="abv" type="number" min="0.1" max="95" step="0.1" value="40" required>
+                  <input name="abv" type="number" min="0" max="95" step="0.1" value="40" required>
+                </label>
+                <label id="typeUnitOzField" hidden>
+                  Unit volume oz
+                  <input name="unitOz" type="number" min="0.1" step="0.1" value="12" disabled>
                 </label>
                 <button type="submit">Add Type</button>
               </form>
@@ -244,8 +256,8 @@
                   <input name="nickname" placeholder="The Council Bottle">
                 </label>
                 <label>
-                  Size oz
-                  <input name="sizeOz" type="number" min="1" step="0.1" value="25.36" required>
+                  <span id="bottleSizeLabel">Size oz</span>
+                  <input name="sizeOz" type="number" min="1" step="0.01" value="25.36" data-measure="oz" required>
                 </label>
                 <label>
                   Price

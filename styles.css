@@ -403,6 +403,59 @@ small,
   justify-content: space-between;
 }
 
+/* .form-grid label is display:grid, which would override the hidden attribute. */
+.form-grid [hidden] {
+  display: none;
+}
+
+/* Set level on an inventory card: one compact row, input then button. */
+.level-form {
+  display: flex;
+  gap: 8px;
+  align-items: end;
+}
+
+.level-form label {
+  display: grid;
+  flex: 1 1 auto;
+  gap: 4px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+
+.level-form input {
+  width: 100%;
+  min-width: 0;
+  min-height: 36px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.level-form button {
+  flex: 0 0 auto;
+  min-height: 36px;
+  padding: 6px 14px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: 800;
+}
+
+.level-form button:hover {
+  background: var(--accent);
+  color: #111;
+}
+
+.level-form button:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+
 .progress {
   overflow: hidden;
   height: 12px;
