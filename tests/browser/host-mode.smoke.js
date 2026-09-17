@@ -363,13 +363,19 @@ async function payTabViaRegister(session, guestName, collectorName) {
   return dialogMessage;
 }
 
-/** Write a tab off from its register card; returns the confirm text. */
-async function writeOffTabViaRegister(session, guestName) {
+/**
+ * Write a tab off from its register card, charged to a crew member (0.7.8); returns
+ * the confirm text. The cost is the card's own "Write off $x.xx" figure.
+ */
+async function writeOffTabViaRegister(session, guestName, writerName = "Casey") {
   const { page } = session;
-  const tabId = await tabCard(page, guestName).getAttribute("data-tab-id");
+  const card = tabCard(page, guestName);
+  const tabId = await card.getAttribute("data-tab-id");
+  await card.locator("select[name='writtenOffBy']").selectOption(await personIdOf(page, writerName));
+  const cost = (await card.locator("[data-write-off-tab]").textContent()).trim().replace("Write off ", "");
   let dialogMessage = "";
   page.once("dialog", (dialog) => { dialogMessage = dialog.message(); });
-  await clickForToast(session, `#registerTabList [data-write-off-tab="${tabId}"]`, `${guestName}'s tab written off.`);
+  await clickForToast(session, `#registerTabList [data-write-off-tab="${tabId}"]`, `${guestName}'s tab written off by ${writerName}, at ${cost}.`);
   return dialogMessage;
 }
 
@@ -394,6 +400,69 @@ async function addAe1Margarita(session) {
     }
   });
   return types;
+}
+
+// ---------- crew balance helpers (U4, U5) ------------------------------------------------
+
+const CREW_BALANCE_SQL_MESSAGE = "Crew balances are not set up on the shared database yet. Run supabase/crew-balance.sql in Supabase, then reload.";
+
+/** AE1's bottle: Sam's $40, 25 oz rye, so every ounce costs 160 cents. */
+async function addAe1Balance(session) {
+  const rye = await addTypeViaForm(session, { name: "Rye", category: "Whiskey", abv: 45 });
+  return addPricedStockViaForm(session, { typeId: rye.id, nickname: "Sam's rye", size: 25, price: 40, buyerName: "Sam" });
+}
+
+/** Set a stock level through the repository (the Inventory card has its own scenario). */
+async function setLevel(page, bottleId, newRemaining) {
+  const ok = await page.evaluate(
+    ({ bottleId, newRemaining }) => window.__rnmb.hostAction("", (db) => db.correctStock({ bottleId, newRemaining })),
+    { bottleId, newRemaining }
+  );
+  assert.equal(ok, true, "the level was set");
+}
+
+/** Every Ledger balance row as { name: "is owed $3.20 +$3.20" }, straight from the page. */
+async function balanceRows(page) {
+  await page.click('.tab-button[data-tab="ledger"]');
+  const rows = await page.locator("#balanceList .balance-row").evaluateAll((elements) => elements.map((row) => [
+    row.dataset.balancePerson,
+    `${row.querySelector("[data-balance-status]").textContent} ${row.querySelector("[data-balance-amount]").textContent}`
+  ]));
+  return Object.fromEntries(rows);
+}
+
+/** The suggested payments as they read on screen, in order. */
+const suggestionTexts = (page) => page.locator("#paymentSuggestions [data-payment-text]").allTextContents();
+
+/** The balances the domain derives, keyed by name: the numbers behind the Ledger. */
+const balanceCents = (page) => page.evaluate(() => Object.fromEntries(window.__rnmb.crewBalances().map((entry) => [entry.name, entry.cents])));
+
+/** Tap Paid on the suggested payment at `index` (confirm is auto-accepted); returns the confirm text. */
+async function paySuggestion(session, index, toastText) {
+  const { page } = session;
+  await page.click('.tab-button[data-tab="ledger"]');
+  let dialogMessage = "";
+  page.once("dialog", (dialog) => { dialogMessage = dialog.message(); });
+  await clickForToast(session, `#paymentSuggestions [data-pay-suggestion] >> nth=${index}`, toastText);
+  return dialogMessage;
+}
+
+/** Record a payment through the Ledger's manual form. */
+async function recordPaymentViaForm(session, { fromName, toName, amount, toast }) {
+  const { page } = session;
+  await page.click('.tab-button[data-tab="ledger"]');
+  await page.selectOption("#paymentForm [name='fromPersonId']", await personIdOf(page, fromName));
+  await page.selectOption("#paymentForm [name='toPersonId']", await personIdOf(page, toName));
+  await page.fill("#paymentForm [name='amount']", amount);
+  await clickForToast(session, "#paymentSubmit", toast);
+}
+
+/** Pick a person in the quick log, then tap one of their offered drinks by its name. */
+async function quickLog(session, personName, itemName, toastText) {
+  const { page } = session;
+  await page.click('.tab-button[data-tab="tonight"]');
+  await page.click(`#quickLogPeople [data-quick-person="${await personIdOf(page, personName)}"]`);
+  await clickForToast(session, `#quickLogItems button:has-text("${itemName}")`, toastText);
 }
 
 /** Leave the register for a dashboard tab. */
@@ -1625,8 +1694,8 @@ const scenarios = [
         await registerCrew(page, "Casey").click();
         assert.equal(await registerCrew(page, "Casey").getAttribute("aria-pressed"), "true");
         assert.equal(await registerTab(page, "Riley").getAttribute("aria-pressed"), "false", "a crew member replaces the tab as target");
-        assert.equal((await page.textContent("#registerConfirm")).trim(), "Pour for Casey · no charge");
-        await clickForToast(session, "#registerConfirm", "Bourbon Neat poured for Casey. No charge.");
+        assert.equal((await page.textContent("#registerConfirm")).trim(), "Pour for Casey · $2.76 at cost");
+        await clickForToast(session, "#registerConfirm", "Bourbon Neat poured for Casey · $2.76 at cost.");
 
         const result = await page.evaluate(() => {
           const r = window.__rnmb;
@@ -1934,14 +2003,13 @@ const scenarios = [
   },
 
   {
-    name: "U7 AE8 a paid and a written-off tab show the collector's money by buyer and the write-off by buyer; Settle Up reads exactly as before",
+    name: "U7 AE8 a paid and a written-off tab show the collector's money by buyer and the write-off by buyer, and both land in Crew Balances",
     async run({ browser }) {
       const session = await openPage(browser, { allowConsole: apiConfig404 });
       const { page } = session;
       try {
-        await page.click('.tab-button[data-tab="ledger"]');
-        const settleBefore = { lines: (await page.locator("#settleList .stack-item").allTextContents()).map(squash), html: await page.innerHTML("#settleList") };
-        assert.ok(settleBefore.lines.length >= 4, "demo Settle Up has a line per person");
+        const balancesBefore = await balanceRows(page);
+        assert.deepEqual(Object.values(balancesBefore), new Array(4).fill("all square $0.00"), "every demo balance starts square");
         assert.match(await page.textContent("#hostNightList"), /No host nights yet/);
 
         await startHostNightViaForm(session, "Guest party");
@@ -1968,9 +2036,17 @@ const scenarios = [
         assert.equal(squash(await card.locator("[data-written-off-total]").textContent()), "$3.75");
         assert.deepEqual(await hostNightRows(page, "Guest party", "[data-written-off-group]"), ["from Sam's stock $3.75"]);
 
-        const settleAfter = { lines: (await page.locator("#settleList .stack-item").allTextContents()).map(squash), html: await page.innerHTML("#settleList") };
-        assert.deepEqual(settleAfter.lines, settleBefore.lines, "every Settle Up line reads the same");
-        assert.equal(settleAfter.html, settleBefore.html, "Settle Up output is byte-identical");
+        // AE3's shape: the collector carries what they collected, the buyers are credited
+        // their share, and Casey (who wrote Riley's tab off) covers the red's $3.74 of cost.
+        assert.deepEqual(await balanceRows(page), {
+          Alex: "is owed $5.10 +$5.10",
+          Jordan: "owes $5.10 -$5.10",
+          Sam: "is owed $3.74 +$3.74",
+          Casey: "owes $3.74 -$3.74"
+        });
+        const cents = await balanceCents(page);
+        assert.equal(Object.values(cents).reduce((sum, value) => sum + value, 0), 0, "balances sum to zero");
+        assert.deepEqual(await suggestionTexts(page), ["Jordan pays Alex $5.10", "Casey pays Sam $3.74"]);
         session.assertClean();
       } finally {
         await session.close();
@@ -2085,7 +2161,7 @@ const scenarios = [
         await openRegister(session);
         await registerItem(page, "Bourbon Neat").click();
         await registerCrew(page, "Casey").click();
-        await clickForToast(session, "#registerConfirm", "Bourbon Neat poured for Casey. No charge.");
+        await clickForToast(session, "#registerConfirm", "Bourbon Neat poured for Casey · $2.76 at cost.");
         await exitRegisterTo(page, "tonight");
         const after = await figures();
         assert.equal(after.consumptionEmpty, false);
@@ -2185,7 +2261,13 @@ const scenarios = [
           await ringUpToTab(session, "Boilermaker", "Riley Montgomery-Fitzgerald");
           await openTabViaRegister(session, "Sky");
           await ringUpToTab(session, "Glass of Red", "Sky");
-          for (const selector of ["#registerEndNight", "#registerTabList select[name='collectorId']", "#registerTabList [data-pay-tab]", "#registerTabList [data-write-off-tab]"]) {
+          for (const selector of [
+            "#registerEndNight",
+            "#registerTabList select[name='collectorId']",
+            "#registerTabList select[name='writtenOffBy']",
+            "#registerTabList [data-pay-tab]",
+            "#registerTabList [data-write-off-tab]"
+          ]) {
             await check(selector);
           }
           await noHorizontalScroll("the register");
@@ -2200,7 +2282,9 @@ const scenarios = [
             "#hostNightList [data-collector] li",
             "#hostNightList [data-written-off-total]",
             "#hostNightList [data-written-off-group] li",
-            "#settleList .stack-item"
+            "#balanceList .balance-row",
+            "#balanceList [data-balance-amount]",
+            "#paymentSuggestions [data-pay-suggestion]"
           ]) {
             await check(selector);
           }
@@ -2361,7 +2445,7 @@ const scenarios = [
         await openRegister(session);
         await registerItem(page, "Bourbon Neat").click();
         await registerCrew(page, "Casey").click();
-        await clickForToast(session, "#registerConfirm", "Bourbon Neat poured for Casey. No charge.");
+        await clickForToast(session, "#registerConfirm", "Bourbon Neat poured for Casey · $2.76 at cost.");
         const ringUpId = await page.evaluate(() => window.__rnmb.state.ringUps[0].id);
         assert.equal(await stockOf(page, bourbon), Math.round((stockBefore - 2) * 100) / 100);
 
@@ -2639,6 +2723,7 @@ const scenarios = [
           const authored = await r.hostAction("Written off.", (db) => db.closeTab({ id: tabId, status: "written_off", writtenOffBy: casey }));
           const riley = r.state.guestTabs.find((tab) => tab.id === tabId);
           const noAuthor = await r.hostAction("Written off.", (db) => db.closeTab({ id: skyId, status: "written_off" }));
+          const skyAuthored = await r.hostAction("Written off.", (db) => db.closeTab({ id: skyId, status: "written_off", writtenOffBy: casey }));
           const sky = r.state.guestTabs.find((tab) => tab.id === skyId);
           const ended = await r.hostAction("Host night ended.", (db) => db.endNight(nightId));
           const item = r.state.menuItems.find((entry) => entry.name === "Bourbon Neat");
@@ -2651,7 +2736,7 @@ const scenarios = [
             lockedPour = error.userMessage;
           }
           return {
-            skyOpened, unknownAuthor, authored, noAuthor, ended, lockedRingUp, lockedPour, casey,
+            skyOpened, unknownAuthor, authored, noAuthor, skyAuthored, ended, lockedRingUp, lockedPour, casey,
             riley: { status: riley.status, writtenOffBy: riley.writtenOffBy, writtenOffByName: riley.writtenOffByName },
             sky: { status: sky.status, writtenOffBy: sky.writtenOffBy, writtenOffByName: sky.writtenOffByName }
           };
@@ -2660,8 +2745,9 @@ const scenarios = [
         assert.equal(host.unknownAuthor, false, "an unknown author is refused");
         assert.equal(host.authored, true);
         assert.deepEqual(host.riley, { status: "written_off", writtenOffBy: host.casey, writtenOffByName: "Casey" });
-        assert.equal(host.noAuthor, true, "until the register asks for one, a write-off without an author is still accepted");
-        assert.deepEqual(host.sky, { status: "written_off", writtenOffBy: null, writtenOffByName: null });
+        assert.equal(host.noAuthor, false, "a write-off with no author is refused while crew balances are on (0.7.8)");
+        assert.equal(host.skyAuthored, true);
+        assert.deepEqual(host.sky, { status: "written_off", writtenOffBy: host.casey, writtenOffByName: "Casey" });
         assert.equal(host.ended, true, "endNight ends a host night once its tabs are closed");
         assert.equal(host.lockedRingUp, false, "an ended host night takes no crew ring-up");
         assert.equal(host.lockedPour, "This host night has ended, so no more pours can be logged.");
@@ -2671,6 +2757,7 @@ const scenarios = [
           "This crew night has already ended.",
           "Drinks and guest tabs only exist on a host night.",
           "The crew member writing off the tab does not exist.",
+          "A written-off tab needs the crew member who wrote it off.",
           "This host night has ended, so nothing more can be changed on it."
         ]) {
           assert.ok(toasts.includes(message), `refusal toast "${message}" shown`);
@@ -2916,6 +3003,377 @@ const scenarios = [
         assert.deepEqual([tabRow.written_off_by, tabRow.written_off_by_name], [alex, "Alex"]);
         assert.equal(stub.store.rnmb_payments.length, 2);
         assert.deepEqual(stub.unexpected, []);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Crew U4 AE1, AE2 the Ledger reads Alex owes $3.20, suggests one payment, and Paid settles both to $0.00",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const bottle = await addAe1Balance(session);
+        await logPourViaForm(session, { personName: "Alex", bottleId: bottle.id, amount: 2 });
+        await logPourViaForm(session, { personName: "Sam", bottleId: bottle.id, amount: 1 });
+
+        assert.deepEqual(await balanceRows(page), {
+          Alex: "owes $3.20 -$3.20",
+          Jordan: "all square $0.00",
+          Sam: "is owed $3.20 +$3.20",
+          Casey: "all square $0.00"
+        }, "Sam's own 1 oz costs him nothing; Alex's 2 oz is $3.20 of Sam's bottle");
+        assert.deepEqual(await balanceCents(page), { Alex: -320, Jordan: 0, Sam: 320, Casey: 0 });
+        assert.match(await page.textContent("#balanceSummary"), /1 owed · 1 owes · everything nets to \$0\.00\./);
+        assert.deepEqual(await suggestionTexts(page), ["Alex pays Sam $3.20"]);
+
+        const confirmText = await paySuggestion(session, 0, "Payment recorded: Alex paid Sam $3.20.");
+        assert.match(confirmText, /^Record that Alex paid Sam \$3\.20\?/);
+        assert.deepEqual(await balanceCents(page), { Alex: 0, Jordan: 0, Sam: 0, Casey: 0 }, "AE2: both read $0.00");
+        assert.deepEqual(await balanceRows(page), {
+          Alex: "all square $0.00",
+          Jordan: "all square $0.00",
+          Sam: "all square $0.00",
+          Casey: "all square $0.00"
+        });
+        assert.match(await page.textContent("#balanceSummary"), /Everyone's square/);
+        assert.match(await page.textContent("#paymentSuggestions"), /Nothing to settle/);
+        assert.deepEqual(await page.locator("#paymentList [data-payment-text]").allTextContents(), ["Alex paid Sam $3.20"]);
+        const payments = await page.evaluate(() => window.__rnmb.state.payments);
+        assert.equal(payments.length, 1, "one payment, saved once");
+        assert.deepEqual([payments[0].fromName, payments[0].toName, payments[0].amountCents, payments[0].voidedAt], ["Alex", "Sam", 320, null]);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Crew U4 a payment recorded by hand can be voided, which puts both balances back; bad amounts save nothing",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const bottle = await addAe1Balance(session);
+        await logPourViaForm(session, { personName: "Alex", bottleId: bottle.id, amount: 2 });
+        const before = await balanceCents(page);
+
+        await page.click('.tab-button[data-tab="ledger"]');
+        await page.selectOption("#paymentForm [name='fromPersonId']", await personIdOf(page, "Alex"));
+        await page.selectOption("#paymentForm [name='toPersonId']", await personIdOf(page, "Alex"));
+        await page.fill("#paymentForm [name='amount']", "3.20");
+        await clickForToast(session, "#paymentSubmit", "A payment goes between two different crew members.");
+        await page.selectOption("#paymentForm [name='toPersonId']", await personIdOf(page, "Sam"));
+        await page.fill("#paymentForm [name='amount']", "3.205");
+        await clickForToast(session, "#paymentSubmit", "Enter the amount in dollars, like 3.20.");
+        assert.equal(await page.evaluate(() => window.__rnmb.state.payments.length), 0, "no refused payment was saved");
+        assert.deepEqual(await balanceCents(page), before);
+
+        await recordPaymentViaForm(session, { fromName: "Alex", toName: "Sam", amount: "3.20", toast: "Payment recorded: Alex paid Sam $3.20." });
+        assert.deepEqual(await balanceCents(page), { Alex: 0, Jordan: 0, Sam: 0, Casey: 0 });
+        assert.equal(await page.inputValue("#paymentForm [name='amount']"), "", "the amount field is cleared for the next one");
+
+        let voidText = "";
+        page.once("dialog", (dialog) => { voidText = dialog.message(); });
+        await clickForToast(session, "#paymentList [data-void-payment]", "Payment voided. Both balances are back where they were.");
+        assert.match(voidText, /^Void Alex's \$3\.20 payment to Sam\?/);
+        assert.deepEqual(await balanceCents(page), before, "voiding restores both balances");
+        assert.deepEqual(await suggestionTexts(page), ["Alex pays Sam $3.20"], "and the suggestion comes back");
+        assert.equal(await page.locator("#paymentList .payment-row.is-voided").count(), 1, "the voided payment stays in the history");
+        assert.equal(await page.locator("#paymentList [data-void-payment]").count(), 0, "with no second Void");
+        assert.ok(await page.evaluate(() => window.__rnmb.state.payments[0].voidedAt), "the void is recorded, not deleted");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Crew U4 AE5 removing a crew member at -$5.00 is refused, and works once they are settled",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        // Sam sent Casey $5.00, so Casey is $5.00 down until she pays it back.
+        await recordPaymentViaForm(session, { fromName: "Sam", toName: "Casey", amount: "5.00", toast: "Payment recorded: Sam paid Casey $5.00." });
+        assert.deepEqual(await balanceCents(page), { Alex: 0, Jordan: 0, Sam: 500, Casey: -500 });
+
+        const removeCasey = async () => {
+          await page.click('.tab-button[data-tab="crew"]');
+          const caseyId = await personIdOf(page, "Casey");
+          return page.locator(`#personList [data-remove-person="${caseyId}"]`).click();
+        };
+        await removeCasey();
+        await session.waitForToast("Casey owes $5.00, so they stay on the roster for now. Settle up in the Ledger until they read $0.00, then remove them.");
+        assert.ok(await page.evaluate(() => window.__rnmb.state.people.some((person) => person.name === "Casey")), "Casey is still on the roster");
+
+        assert.deepEqual(await suggestionTexts(page), ["Casey pays Sam $5.00"]);
+        await paySuggestion(session, 0, "Payment recorded: Casey paid Sam $5.00.");
+        assert.deepEqual(await balanceCents(page), { Alex: 0, Jordan: 0, Sam: 0, Casey: 0 });
+
+        await removeCasey();
+        await session.waitForToast("Person removed.");
+        assert.equal(await page.evaluate(() => window.__rnmb.state.people.some((person) => person.name === "Casey")), false, "a settled person can leave");
+        const cents = await balanceCents(page);
+        assert.equal(cents.Casey, undefined, "Casey is gone from the balances");
+        assert.deepEqual(cents, { Alex: 0, Jordan: 0, Sam: 0 }, "and nobody else moved");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Crew U4 Ledger balances, suggestions, the payment form and its history have non-zero bounding boxes at 1440 and 400 widths, with no horizontal scroll",
+    async run({ browser }) {
+      for (const viewport of [{ width: 1440, height: 1000 }, { width: 400, height: 900 }]) {
+        const session = await openPage(browser, { allowConsole: apiConfig404, viewport });
+        const { page } = session;
+        try {
+          const bottle = await addAe1Balance(session);
+          await logPourViaForm(session, { personName: "Alex", bottleId: bottle.id, amount: 2 });
+          await recordPaymentViaForm(session, { fromName: "Jordan", toName: "Casey", amount: "1.00", toast: "Payment recorded: Jordan paid Casey $1.00." });
+
+          for (const selector of [
+            "#balanceList .balance-row",
+            "#balanceList [data-balance-status]",
+            "#balanceList [data-balance-amount]",
+            "#paymentSuggestions [data-pay-suggestion]",
+            "#paymentForm select",
+            "#paymentForm [name='amount']",
+            "#paymentSubmit",
+            "#paymentList .payment-row",
+            "#paymentList [data-void-payment]"
+          ]) {
+            const count = await page.locator(selector).count();
+            assert.ok(count > 0, `${selector} is present at ${viewport.width}px`);
+            for (let index = 0; index < count; index += 1) {
+              const locator = page.locator(selector).nth(index);
+              await locator.scrollIntoViewIfNeeded();
+              const box = await locator.boundingBox();
+              assert.ok(box && box.width > 0 && box.height > 0, `${selector} #${index} has a non-zero box at ${viewport.width}px (got ${JSON.stringify(box)})`);
+            }
+          }
+          const widths = await page.evaluate(() => ({ scroll: document.documentElement.scrollWidth, client: document.documentElement.clientWidth }));
+          assert.ok(widths.scroll <= widths.client, `no horizontal scroll on Ledger at ${viewport.width}px (scrollWidth ${widths.scroll} > ${widths.client})`);
+          session.assertClean();
+        } finally {
+          await session.close();
+        }
+      }
+    }
+  },
+
+  {
+    name: "Crew U4 pre-migration database: the Ledger names supabase/crew-balance.sql, shows no balances and locks the payment form",
+    async run({ browser }) {
+      const { seed } = hostModeSeed();
+      const stub = hostModeStub(seed, { crewBalance: false });
+      const payments404 = (message) => resourceStatusError(message, 404, (url) => url.includes("/rest/v1/rnmb_payments?"));
+      const session = await openPage(browser, { routes: stub.routes, allowConsole: payments404 });
+      const { page } = session;
+      try {
+        await session.waitForToast("Connected to Supabase.");
+        assert.equal(await page.evaluate(() => window.__rnmb.crewBalanceAvailable), false);
+        await page.click('.tab-button[data-tab="ledger"]');
+        assert.equal(await page.isVisible("#balanceNotice"), true, "the notice is on screen");
+        assert.equal(squash(await page.textContent("#balanceNotice")), CREW_BALANCE_SQL_MESSAGE);
+        assert.equal(await page.locator("#balanceList .balance-row").count(), 0, "no balances are shown while they would be wrong");
+        assert.match(await page.textContent("#balanceList"), /Balances show up here once crew balances are set up/);
+        assert.match(await page.textContent("#paymentSuggestions"), /No suggestions until then/);
+        assert.match(await page.textContent("#paymentList"), /Payments can be recorded once crew balances are set up/);
+        assert.equal(squash(await page.textContent("#balanceSummary")), "");
+        for (const selector of ["#paymentForm [name='fromPersonId']", "#paymentForm [name='toPersonId']", "#paymentForm [name='amount']", "#paymentSubmit"]) {
+          assert.equal(await page.isDisabled(selector), true, `${selector} is locked`);
+        }
+        assert.deepEqual(stub.unexpected, [], "no payment call was sent");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Crew U5 quick log at 400px: two taps log a 1.5 oz pour at cost, and the bottle becomes that person's usual",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404, viewport: { width: 400, height: 900 } });
+      const { page } = session;
+      try {
+        const bottle = await page.evaluate(() => window.__rnmb.state.bottles.find((entry) => entry.nickname === "The Briefing Bottle"));
+        await page.click('.tab-button[data-tab="tonight"]');
+        assert.match(await page.textContent("#quickLogItems"), /Tap a name to see their usual/);
+        assert.match(await page.textContent("#quickLogNight"), /Logging to Friday Recon\./);
+
+        // Tap one: who is drinking. Tap two: what they are drinking.
+        await page.click(`#quickLogPeople [data-quick-person="${await personIdOf(page, "Sam")}"]`);
+        assert.match(await page.textContent("#quickLogItemsLabel"), /Nothing logged for Sam yet, so here is the shelf/);
+        const button = page.locator(`#quickLogItems [data-quick-bottle="${bottle.id}"]`);
+        assert.equal(squash(await button.textContent()), "The Briefing Bottle1.5 oz · $2.07", "the tap shows what it pours and what it costs");
+        await clickForToast(session, `#quickLogItems [data-quick-bottle="${bottle.id}"]`, "Logged 1.5 oz of The Briefing Bottle for Sam · $2.07 at cost.");
+
+        const logged = await page.evaluate((bottleId) => {
+          const r = window.__rnmb;
+          const night = r.state.nights.find((entry) => entry.id === r.state.activeNightId);
+          return {
+            pours: night.pours.length,
+            pour: night.pours[0],
+            remaining: r.state.bottles.find((entry) => entry.id === bottleId).remaining,
+            stored: JSON.parse(localStorage.getItem("rnmb-command-center-v1")).nights.flatMap((entry) => entry.pours).length
+          };
+        }, bottle.id);
+        assert.equal(logged.pours, 1, "one tap, one pour");
+        assert.equal(logged.stored, 1);
+        assert.equal(logged.pour.ounces, 1.5);
+        assert.equal(logged.pour.costCents, 207);
+        assert.equal(logged.remaining, 17.7, "the bottle drops by the poured measure");
+        // Alex bought the Briefing Bottle, so the cost moves from Sam to Alex.
+        assert.deepEqual(await balanceCents(page), { Alex: 207, Jordan: 0, Sam: -207, Casey: 0 });
+
+        await page.click('.tab-button[data-tab="tonight"]');
+        assert.match(await page.textContent("#quickLogItemsLabel"), /Sam's usual/);
+        assert.deepEqual(
+          await page.locator("#quickLogItems button").evaluateAll((buttons) => buttons.map((entry) => entry.querySelector("strong").textContent)),
+          ["The Briefing Bottle"],
+          "what they logged is what they are offered next time"
+        );
+        const widths = await page.evaluate(() => ({ scroll: document.documentElement.scrollWidth, client: document.documentElement.clientWidth }));
+        assert.ok(widths.scroll <= widths.client, `no horizontal scroll on Tonight at 400px (scrollWidth ${widths.scroll} > ${widths.client})`);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Crew U5 quick log controls have non-zero bounding boxes at 1440 and 400 widths, with no horizontal scroll",
+    async run({ browser }) {
+      for (const viewport of [{ width: 1440, height: 1000 }, { width: 400, height: 900 }]) {
+        const session = await openPage(browser, { allowConsole: apiConfig404, viewport });
+        const { page } = session;
+        try {
+          await page.click('.tab-button[data-tab="tonight"]');
+          await page.click(`#quickLogPeople [data-quick-person="${await personIdOf(page, "Casey")}"]`);
+          for (const selector of ["#quickLogPeople [data-quick-person]", "#quickLogItems button", "#quickLogNight", "#quickLogItemsLabel"]) {
+            const count = await page.locator(selector).count();
+            assert.ok(count > 0, `${selector} is present at ${viewport.width}px`);
+            for (let index = 0; index < count; index += 1) {
+              const locator = page.locator(selector).nth(index);
+              await locator.scrollIntoViewIfNeeded();
+              const box = await locator.boundingBox();
+              assert.ok(box && box.width > 0 && box.height > 0, `${selector} #${index} has a non-zero box at ${viewport.width}px (got ${JSON.stringify(box)})`);
+              if (selector.includes("button") || selector.includes("quick-person")) {
+                assert.ok(box.height >= 44, `${selector} #${index} is a thumb-sized target at ${viewport.width}px (height ${box.height})`);
+              }
+            }
+          }
+          const widths = await page.evaluate(() => ({ scroll: document.documentElement.scrollWidth, client: document.documentElement.clientWidth }));
+          assert.ok(widths.scroll <= widths.client, `no horizontal scroll on Tonight at ${viewport.width}px (scrollWidth ${widths.scroll} > ${widths.client})`);
+          session.assertClean();
+        } finally {
+          await session.close();
+        }
+      }
+    }
+  },
+
+  {
+    name: "Crew U5 a margarita quick-logged on a crew night is one crew ring-up drawing three bottles; a split ingredient is refused, never auto-split",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404, viewport: { width: 400, height: 900 } });
+      const { page } = session;
+      try {
+        const types = await addAe1Margarita(session);
+        const stock = await page.evaluate(() => Object.fromEntries(window.__rnmb.state.bottles.map((bottle) => [bottle.nickname, bottle.remaining])));
+
+        await quickLog(session, "Alex", "Margarita", "Logged Margarita for Alex · $3.28 at cost.");
+        const result = await page.evaluate(() => {
+          const r = window.__rnmb;
+          const ringUp = r.state.ringUps[0];
+          return {
+            count: r.state.ringUps.length,
+            ringUp,
+            nightKind: r.state.nights.find((night) => night.id === ringUp.nightId).kind,
+            stock: Object.fromEntries(r.state.bottles.map((bottle) => [bottle.nickname, bottle.remaining])),
+            pours: r.state.nights.flatMap((night) => night.pours).length
+          };
+        });
+        assert.equal(result.count, 1, "one tap, one crew ring-up");
+        assert.equal(result.pours, 0, "a menu item is a ring-up, not a pour");
+        assert.equal(result.nightKind, "crew", "crew ring-ups are allowed on a crew night");
+        assert.equal(result.ringUp.kind, "crew");
+        assert.equal(result.ringUp.personName, "Alex");
+        assert.equal(result.ringUp.priceCents, null, "a crew drink carries no guest price");
+        assert.equal(result.ringUp.lines.length, 3, "one line per ingredient");
+        assert.deepEqual(result.ringUp.lines.map((line) => line.buyerName).sort(), ["Alex", "Jordan", "Sam"]);
+        assert.equal(result.stock["Sam's tequila"], Math.round((stock["Sam's tequila"] - 2) * 100) / 100);
+        assert.equal(result.stock["Alex's triple sec"], Math.round((stock["Alex's triple sec"] - 1) * 100) / 100);
+        assert.equal(result.stock["Jordan's lime"], Math.round((stock["Jordan's lime"] - 1) * 100) / 100);
+        // Tequila $2.37, triple sec $0.79, lime $0.12 of cost: Alex pays $3.28 and gets $0.79 of it back.
+        assert.deepEqual(await balanceCents(page), { Alex: -249, Jordan: 12, Sam: 237, Casey: 0 });
+        assert.equal(Object.values(await balanceCents(page)).reduce((sum, value) => sum + value, 0), 0, "balances still sum to zero");
+
+        // Only 1 oz left in each tequila bottle: together they cover the 2 oz, but no single
+        // bottle does, and quick log never splits an ingredient on its own (KTD10).
+        const second = await addPricedStockViaForm(session, { typeId: types.tequila.id, nickname: "Backup tequila", size: 25.36, price: 30, buyerName: "Casey" });
+        const tequilaId = await page.evaluate(() => window.__rnmb.state.bottles.find((bottle) => bottle.nickname === "Sam's tequila").id);
+        await setLevel(page, tequilaId, 1);
+        await setLevel(page, second.id, 1);
+        await page.click('.tab-button[data-tab="tonight"]');
+        await page.click(`#quickLogPeople [data-quick-person="${await personIdOf(page, "Jordan")}"]`);
+        await clickForToast(
+          session,
+          '#quickLogItems button:has-text("Margarita")',
+          "Tequila is short 1 oz in every single bottle, so Margarita was not logged. Ring it up on the register to split it, or top that bottle's level up."
+        );
+        assert.equal(await page.evaluate(() => window.__rnmb.state.ringUps.length), 1, "nothing was logged and nothing was split");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Crew U5 the register refuses a write-off with nobody named, and charges the crew member who writes it off",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await startHostNightViaForm(session, "Write-off night");
+        await openRegister(session);
+        await openTabViaRegister(session, "Quinn");
+        await ringUpToTab(session, "Bourbon Neat", "Quinn");
+
+        const tabId = await tabCard(page, "Quinn").getAttribute("data-tab-id");
+        assert.equal(
+          squash(await tabCard(page, "Quinn").locator("[data-write-off-tab]").textContent()),
+          "Write off $2.76",
+          "the button shows what the write-off costs, not the guest price"
+        );
+        await clickForToast(
+          session,
+          `#registerTabList [data-write-off-tab="${tabId}"]`,
+          "Pick who is writing off Quinn's tab. Whoever writes it off covers what its drinks cost."
+        );
+        assert.equal((await tabOf(page, "Quinn")).status, "open", "nothing closed without an author");
+
+        const confirmText = await writeOffTabViaRegister(session, "Quinn", "Jordan");
+        assert.match(confirmText, /Write off Quinn's tab \(\$3\.00\)\? Jordan is charged \$2\.76, what its drinks cost\./);
+        const tab = await tabOf(page, "Quinn");
+        assert.equal(tab.status, "written_off");
+        assert.equal(tab.writtenOffByName, "Jordan");
+        assert.equal(tab.writtenOffBy, await personIdOf(page, "Jordan"));
+        // The bourbon is Alex's, so Jordan covers its cost and Alex is made whole.
+        assert.deepEqual(await balanceCents(page), { Alex: 276, Jordan: -276, Sam: 0, Casey: 0 });
+        assert.deepEqual(await suggestionTexts(page), ["Jordan pays Alex $2.76"]);
         session.assertClean();
       } finally {
         await session.close();
