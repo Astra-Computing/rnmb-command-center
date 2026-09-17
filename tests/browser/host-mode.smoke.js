@@ -87,6 +87,70 @@ async function startLocalHostNightWithTab(page) {
   });
 }
 
+const SOLD_BOTTLE_MESSAGE = "Drinks have been sold from this stock item, so it cannot be deleted. Set its remaining level to empty instead.";
+
+/** Click, then wait for a toast shown after the click (a repeated message cannot match an earlier one). */
+async function clickForToast(session, selector, text) {
+  const { page } = session;
+  const count = (await session.toasts()).length;
+  await page.click(selector);
+  await page.waitForFunction(
+    ({ count, text }) => window.__toasts.slice(count).includes(text),
+    { count, text },
+    { timeout: 10000 }
+  );
+}
+
+/** Add a beverage type through the Inventory tab's Add Type form; returns the saved type. */
+async function addTypeViaForm(session, { name, category, measure = "oz", abv, unitOz }) {
+  const { page } = session;
+  await page.click('.tab-button[data-tab="inventory"]');
+  await page.fill("#typeForm [name='name']", name);
+  await page.selectOption("#typeForm [name='category']", category);
+  await page.selectOption("#typeForm [name='measure']", measure);
+  if (unitOz !== undefined) await page.fill("#typeForm [name='unitOz']", String(unitOz));
+  await page.fill("#typeForm [name='abv']", String(abv));
+  await clickForToast(session, "#typeForm button[type='submit']", "Beverage type added.");
+  const type = await page.evaluate((typeName) => window.__rnmb.state.types.find((entry) => entry.name === typeName), name);
+  assert.ok(type, `type ${name} was saved`);
+  return type;
+}
+
+/** Add stock through the Add Stock form; returns the saved bottle. Leave size undefined to keep the form's default. */
+async function addStockViaForm(session, { typeId, nickname, size }) {
+  const { page } = session;
+  await page.click('.tab-button[data-tab="inventory"]');
+  await page.selectOption("#bottleForm [name='typeId']", typeId);
+  await page.fill("#bottleForm [name='nickname']", nickname);
+  if (size !== undefined) await page.fill("#bottleForm [name='sizeOz']", String(size));
+  await clickForToast(session, "#bottleForm button[type='submit']", "Bottle added to inventory.");
+  const bottle = await page.evaluate((name) => window.__rnmb.state.bottles.find((entry) => entry.nickname === name), nickname);
+  assert.ok(bottle, `stock ${nickname} was saved`);
+  return bottle;
+}
+
+/** A counted Lager can type with a case of 12, and a Mixer with a 32 oz bottle, all through the forms. */
+async function addCanAndMixer(session) {
+  const can = await addTypeViaForm(session, { name: "Lager can", category: "Beer", measure: "unit", unitOz: 12, abv: 5 });
+  const canStock = await addStockViaForm(session, { typeId: can.id, nickname: "Can case", size: 12 });
+  const mixer = await addTypeViaForm(session, { name: "Lime juice", category: "Mixer", abv: 0 });
+  const mixerStock = await addStockViaForm(session, { typeId: mixer.id, nickname: "Lime bottle", size: 32 });
+  return { can, canStock, mixer, mixerStock };
+}
+
+const cardText = (page, bottleId) => page.textContent(`#inventoryList [data-bottle-id="${bottleId}"]`);
+
+/** Log a crew pour through the Tonight tab's form. */
+async function logPourViaForm(session, { personName, bottleId, amount }) {
+  const { page } = session;
+  await page.click('.tab-button[data-tab="tonight"]');
+  const personId = await page.evaluate((name) => window.__rnmb.state.people.find((person) => person.name === name).id, personName);
+  await page.selectOption("#pourForm [name='personId']", personId);
+  await page.selectOption("#pourForm [name='bottleId']", bottleId);
+  if (amount !== undefined) await page.fill("#pourForm [name='ounces']", String(amount));
+  await clickForToast(session, "#pourForm button[type='submit']", "Pour logged.");
+}
+
 const scenarios = [
   {
     name: "U3 local boot with no /api/config, Reload demo, Export carries every host-mode collection",
@@ -354,6 +418,283 @@ const scenarios = [
         session.assertClean();
       } finally {
         await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U4 a counted type \"Lager can\" (12 oz unit volume) with 12 units of stock shows \"12 of 12 units\"",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await page.click('.tab-button[data-tab="inventory"]');
+        assert.equal(await page.isVisible("#typeUnitOzField"), false, "unit volume is hidden for poured types");
+        await page.selectOption("#typeForm [name='measure']", "unit");
+        assert.equal(await page.isVisible("#typeUnitOzField"), true, "unit volume shows for counted types");
+        await page.selectOption("#typeForm [name='measure']", "oz");
+
+        const can = await addTypeViaForm(session, { name: "Lager can", category: "Beer", measure: "unit", unitOz: 12, abv: 5 });
+        assert.equal(can.measure, "unit");
+        assert.equal(can.unitOz, 12);
+        assert.equal(can.abv, 5);
+
+        await page.selectOption("#bottleForm [name='typeId']", can.id);
+        assert.equal((await page.textContent("#bottleSizeLabel")).trim(), "Size units");
+        assert.equal(await page.inputValue("#bottleForm [name='sizeOz']"), "12", "counted stock defaults to 12 units");
+        assert.equal(await page.getAttribute("#bottleForm [name='sizeOz']", "step"), "1");
+
+        const stock = await addStockViaForm(session, { typeId: can.id, nickname: "Can case", size: 12 });
+        assert.equal(stock.size, 12);
+        assert.equal(stock.remaining, 12);
+        const text = await cardText(page, stock.id);
+        assert.match(text, /12 of 12 units/);
+        assert.match(text, /12\.0 standard drinks left/, "12 cans x 12 oz x 5% = 12.0 standard drinks");
+
+        // Switching back to a poured type restores the ounce label and default.
+        const bourbonId = await page.evaluate(() => window.__rnmb.state.types.find((type) => type.name === "House Bourbon").id);
+        await page.selectOption("#bottleForm [name='typeId']", bourbonId);
+        assert.equal((await page.textContent("#bottleSizeLabel")).trim(), "Size oz");
+        assert.equal(await page.inputValue("#bottleForm [name='sizeOz']"), "25.36");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U4 a Mixer type with ABV 0 saves and its stock shows no standard drinks",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const drinksBefore = await page.textContent("#metricInventoryMeta");
+        const mixer = await addTypeViaForm(session, { name: "Lime juice", category: "Mixer", abv: 0 });
+        assert.equal(mixer.abv, 0);
+        assert.equal(mixer.category, "Mixer");
+        assert.equal(mixer.measure, "oz");
+        const stock = await addStockViaForm(session, { typeId: mixer.id, nickname: "Lime bottle", size: 32 });
+        const text = await cardText(page, stock.id);
+        assert.match(text, /32\.0 of 32\.0 oz/);
+        assert.doesNotMatch(text, /standard drink/i);
+        assert.match(text, /no alcohol/);
+        assert.equal(await page.textContent("#metricInventoryMeta"), drinksBefore, "a mixer adds no standard drinks to the Overview");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U4 AE5 setting a triple sec bottle from 0.5 to 20 oz updates the card, records one adjustment and makes the margarita available",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const tripleSec = await addTypeViaForm(session, { name: "Triple Sec", category: "Liqueur", abv: 30 });
+        const bottle = await addStockViaForm(session, { typeId: tripleSec.id, nickname: "Shelf triple sec" });
+        assert.equal(bottle.size, 25.36);
+
+        // The record says 0.5 oz, and a margarita needs 1 oz of triple sec.
+        const setup = await page.evaluate(async ({ bottleId, typeId }) => {
+          const r = window.__rnmb;
+          const low = await r.hostAction("", (db) => db.correctStock({ bottleId, newRemaining: 0.5 }));
+          const menu = await r.hostAction("", (db) => db.saveMenuItem({ name: "Margarita", kind: "cocktail", ingredients: [{ typeId, amount: 1 }] }));
+          const item = r.state.menuItems.find((entry) => entry.name === "Margarita");
+          return { low, menu, available: window.RNMBDomain.menuItemAvailability(item, r.state.bottles).available, adjustments: r.state.stockAdjustments.length };
+        }, { bottleId: bottle.id, typeId: tripleSec.id });
+        assert.deepEqual(setup, { low: true, menu: true, available: false, adjustments: 1 });
+        assert.match(await cardText(page, bottle.id), /0\.5 of 25\.4 oz/);
+
+        const form = `#inventoryList [data-bottle-id="${bottle.id}"] .level-form`;
+        assert.equal(await page.inputValue(`${form} input[name='level']`), "0.5", "the control starts at the recorded level");
+        await page.fill(`${form} input[name='level']`, "20");
+        await clickForToast(session, `${form} button[type='submit']`, "Stock level set.");
+
+        assert.match(await cardText(page, bottle.id), /20\.0 of 25\.4 oz/);
+        const after = await page.evaluate((bottleId) => {
+          const r = window.__rnmb;
+          const item = r.state.menuItems.find((entry) => entry.name === "Margarita");
+          return {
+            remaining: r.state.bottles.find((entry) => entry.id === bottleId).remaining,
+            adjustments: r.state.stockAdjustments.filter((entry) => entry.bottleId === bottleId),
+            available: window.RNMBDomain.menuItemAvailability(item, r.state.bottles).available,
+            ringUps: r.state.ringUps.length,
+            pours: r.state.nights.reduce((sum, night) => sum + night.pours.length, 0)
+          };
+        }, bottle.id);
+        assert.equal(after.remaining, 20);
+        assert.equal(after.adjustments.length, 2, "one adjustment for the setup, exactly one for the set-level control");
+        assert.equal(after.adjustments[1].previousRemaining, 0.5);
+        assert.equal(after.adjustments[1].newRemaining, 20);
+        assert.equal(after.available, true, "the margarita becomes available");
+        assert.equal(after.ringUps, 0, "a correction is not a sale");
+        assert.equal(after.pours, 0, "a correction is not a pour");
+
+        // Setting the level it already has records nothing.
+        await page.fill(`${form} input[name='level']`, "20");
+        await clickForToast(session, `${form} button[type='submit']`, "That stock item is already at that level.");
+        assert.equal(await page.evaluate(() => window.__rnmb.state.stockAdjustments.length), 2);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U4 removing a bottle a ring-up used shows the refusal toast and the bottle remains",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const { nightId, tabId } = await startLocalHostNightWithTab(page);
+        const bourbonId = await page.evaluate(async ({ nightId, tabId }) => {
+          const r = window.__rnmb;
+          const item = r.state.menuItems.find((entry) => entry.name === "Bourbon Neat");
+          const bourbon = r.state.bottles.find((bottle) => bottle.typeId === item.ingredients[0].typeId);
+          const record = r.buildRingUp({ nightId, kind: "guest", tabId, menuItemId: item.id, sources: [{ bottleId: bourbon.id, amount: 2 }] });
+          const rang = await r.hostAction("Rung up.", (db) => db.ringUp(record));
+          if (!rang) throw new Error("ring-up failed");
+          return bourbon.id;
+        }, { nightId, tabId });
+
+        await page.click('.tab-button[data-tab="inventory"]');
+        const bottlesBefore = await page.evaluate(() => window.__rnmb.state.bottles.length);
+        await clickForToast(session, `#inventoryList [data-bottle-id="${bourbonId}"] [data-remove-bottle]`, SOLD_BOTTLE_MESSAGE);
+        const after = await page.evaluate((id) => ({
+          count: window.__rnmb.state.bottles.length,
+          kept: window.__rnmb.state.bottles.some((bottle) => bottle.id === id)
+        }), bourbonId);
+        assert.deepEqual(after, { count: bottlesBefore, kept: true });
+        assert.equal(await page.locator(`#inventoryList [data-bottle-id="${bourbonId}"]`).count(), 1, "the card is still shown");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U4 the crew pour form excludes the mixer and, for the can, logs 1 unit and deducts 1 unit",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const { canStock, mixerStock } = await addCanAndMixer(session);
+        await page.click('.tab-button[data-tab="tonight"]');
+        const options = await page.$$eval("#pourForm [name='bottleId'] option", (list) => list.map((option) => option.value));
+        assert.ok(!options.includes(mixerStock.id), "the mixer is not offered as a pour");
+        assert.ok(options.includes(canStock.id), "the can is offered");
+
+        await page.selectOption("#pourForm [name='bottleId']", canStock.id);
+        assert.equal((await page.textContent("#pourAmountLabel")).trim(), "Units consumed");
+        assert.equal(await page.getAttribute("#pourForm [name='ounces']", "step"), "1");
+        assert.equal(await page.inputValue("#pourForm [name='ounces']"), "1");
+
+        await logPourViaForm(session, { personName: "Alex", bottleId: canStock.id, amount: 1 });
+        const result = await page.evaluate((bottleId) => {
+          const r = window.__rnmb;
+          const night = r.state.nights.find((entry) => entry.id === r.state.activeNightId);
+          return { remaining: r.state.bottles.find((bottle) => bottle.id === bottleId).remaining, pours: night.pours };
+        }, canStock.id);
+        assert.equal(result.remaining, 11);
+        assert.equal(result.pours.length, 1);
+        assert.equal(result.pours[0].ounces, 1, "the pour is stored in the type's measure (units)");
+        assert.equal(result.pours[0].abv, 5);
+        assert.match(await page.textContent("#pourTimeline"), /Alex logged 1 unit/);
+
+        await page.click('.tab-button[data-tab="inventory"]');
+        assert.match(await cardText(page, canStock.id), /11 of 12 units/);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U4 logging 1 Lager can (12 oz, 5%) adds 1.0 standard drink and 12.0 oz to that person's Tonight card",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const { canStock } = await addCanAndMixer(session);
+        const bourbonId = await page.evaluate(() => window.__rnmb.state.bottles.find((bottle) => bottle.nickname === "The Briefing Bottle").id);
+        // A 1.5 oz bourbon pour first, so the can's figures add to an existing total.
+        await logPourViaForm(session, { personName: "Jordan", bottleId: bourbonId, amount: 1.5 });
+        const card = () => page.locator("#personConsumption .consumption-card", { hasText: "Jordan" }).textContent();
+        assert.match(await card(), /1\.5 oz total/);
+        assert.match(await card(), /1\.1\b/, "1.5 oz of 45% bourbon is 1.1 standard drinks");
+
+        await logPourViaForm(session, { personName: "Jordan", bottleId: canStock.id, amount: 1 });
+        assert.match(await card(), /13\.5 oz total/, "12.0 oz added");
+        assert.match(await card(), /2\.1\b/, "1.0 standard drink added");
+        assert.match(await page.textContent("#metricConsumed"), /^2\.1$/);
+        assert.match(await page.textContent("#pourTimeline"), /Lager can · 1\.0 standard drinks/);
+        assert.match(await page.textContent("#recentNights"), /2\.1 standard drinks/);
+
+        await page.click('.tab-button[data-tab="inventory"]');
+        assert.match(await cardText(page, canStock.id), /11 of 12 units · 11\.0 standard drinks left/);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U4 new stock controls have non-zero bounding boxes at 1440 and 400 widths",
+    async run({ browser }) {
+      for (const viewport of [{ width: 1440, height: 1000 }, { width: 400, height: 900 }]) {
+        const session = await openPage(browser, { allowConsole: apiConfig404, viewport });
+        const { page } = session;
+        try {
+          const { canStock } = await addCanAndMixer(session);
+          await page.click('.tab-button[data-tab="inventory"]');
+          await page.selectOption("#typeForm [name='measure']", "unit");
+          await page.selectOption("#bottleForm [name='typeId']", await page.evaluate((id) => window.__rnmb.state.bottles.find((b) => b.id === id).typeId, canStock.id));
+          const selectors = [
+            "#typeForm [name='measure']",
+            "#typeForm [name='unitOz']",
+            "#typeForm [name='abv']",
+            "#bottleSizeLabel",
+            "#bottleForm [name='sizeOz']"
+          ];
+          const cards = await page.$$eval("#inventoryList .inventory-card", (list) => list.map((card) => card.dataset.bottleId));
+          assert.ok(cards.length >= 5, "every stock item has a card");
+          cards.forEach((id) => {
+            selectors.push(`#inventoryList [data-bottle-id="${id}"] .level-form input[name='level']`);
+            selectors.push(`#inventoryList [data-bottle-id="${id}"] .level-form button[type='submit']`);
+            selectors.push(`#inventoryList [data-bottle-id="${id}"] [data-remove-bottle]`);
+          });
+          for (const selector of selectors) {
+            await page.locator(selector).scrollIntoViewIfNeeded();
+            const box = await page.locator(selector).boundingBox();
+            assert.ok(box && box.width > 0 && box.height > 0, `${selector} has a non-zero box at ${viewport.width}px (got ${JSON.stringify(box)})`);
+          }
+          // The level control stays inside its card.
+          const overflow = await page.$$eval("#inventoryList .inventory-card", (list) => list
+            .map((card) => {
+              const cardBox = card.getBoundingClientRect();
+              const button = card.querySelector(".level-form button").getBoundingClientRect();
+              return button.right <= cardBox.right + 0.5 ? null : card.dataset.bottleId;
+            })
+            .filter(Boolean));
+          assert.deepEqual(overflow, [], `level controls overflow their cards at ${viewport.width}px`);
+
+          await page.click('.tab-button[data-tab="tonight"]');
+          for (const selector of ["#pourAmountLabel", "#pourForm [name='ounces']"]) {
+            await page.locator(selector).scrollIntoViewIfNeeded();
+            const box = await page.locator(selector).boundingBox();
+            assert.ok(box && box.width > 0 && box.height > 0, `${selector} has a non-zero box at ${viewport.width}px`);
+          }
+          session.assertClean();
+        } finally {
+          await session.close();
+        }
       }
     }
   }

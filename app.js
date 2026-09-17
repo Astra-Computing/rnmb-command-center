@@ -1,6 +1,5 @@
 const STORAGE_KEY = "rnmb-command-center-v1";
 const ACCESS_STORAGE_KEY = "rnmb-access-key";
-const STANDARD_DRINK_OZ = 0.6;
 
 // The local calendar date, never the UTC one. toISOString() reports UTC, so
 // slicing it returns tomorrow from 8pm Eastern onward -- which dated every night
@@ -1200,8 +1199,38 @@ function activeNight() {
   return state.nights.find((night) => night.id === state.activeNightId) || state.nights[0];
 }
 
-function standardDrinks(ounces, abv) {
-  return (Number(ounces) || 0) * ((Number(abv) || 0) / 100) / STANDARD_DRINK_OZ;
+/*
+ * Amounts are in the stock type's measure: ounces for poured stock, whole units
+ * for counted stock (KTD5). Every ounce and standard-drink figure goes through
+ * RNMBDomain.measureAmount, so a can counts as its unit volume, not as "1 oz".
+ */
+function isCounted(type) {
+  return type?.measure === RNMBDomain.MEASURE_UNIT;
+}
+
+/** "1.5 oz", "1 unit", "12 units". */
+function amountText(type, amount) {
+  if (!isCounted(type)) return `${oneDecimal(amount)} oz`;
+  const count = Math.round(Number(amount) || 0);
+  return `${count} ${count === 1 ? "unit" : "units"}`;
+}
+
+/** "19.2 of 25.4 oz" or "11 of 12 units". */
+function levelText(type, remaining, size) {
+  const figure = isCounted(type) ? String(Math.round(Number(remaining) || 0)) : oneDecimal(remaining);
+  return `${figure} of ${amountText(type, size)}`;
+}
+
+/** A crew pour in ounces and standard drinks. Its ABV snapshot wins; a missing (0) snapshot falls back to the type. */
+function measurePour(pour) {
+  const type = typeById(bottleById(pour.bottleId)?.typeId);
+  const snapshot = Number(pour.abv) > 0 ? Number(pour.abv) : undefined;
+  return RNMBDomain.measureAmount(type, pour.ounces, snapshot);
+}
+
+/** What is left in a stock item, in ounces and standard drinks. */
+function measureRemaining(bottle) {
+  return RNMBDomain.measureAmount(typeById(bottle.typeId), bottle.remaining);
 }
 
 function bottleLabel(bottle) {
@@ -1215,10 +1244,7 @@ function totalSpend() {
 }
 
 function totalRemainingStandardDrinks() {
-  return state.bottles.reduce((sum, bottle) => {
-    const type = typeById(bottle.typeId);
-    return sum + standardDrinks(bottle.remaining, type?.abv || 0);
-  }, 0);
+  return state.bottles.reduce((sum, bottle) => sum + measureRemaining(bottle).standardDrinks, 0);
 }
 
 function activeNightTotals() {
@@ -1228,15 +1254,13 @@ function activeNightTotals() {
   let allOunces = 0;
 
   night?.pours?.forEach((pour) => {
-    const bottle = bottleById(pour.bottleId);
-    const type = typeById(bottle?.typeId);
-    const drinks = standardDrinks(pour.ounces, type?.abv || pour.abv || 0);
+    const measured = measurePour(pour);
     const current = totals.get(pour.personId) || { ounces: 0, drinks: 0 };
-    current.ounces += Number(pour.ounces || 0);
-    current.drinks += drinks;
+    current.ounces += measured.ounces;
+    current.drinks += measured.standardDrinks;
     totals.set(pour.personId, current);
-    allDrinks += drinks;
-    allOunces += Number(pour.ounces || 0);
+    allDrinks += measured.standardDrinks;
+    allOunces += measured.ounces;
   });
 
   return { byPerson: totals, allDrinks, allOunces };
@@ -1324,16 +1348,68 @@ function renderForms() {
   setOptions(document.querySelector("#nightSelect"), state.nights, (night) => `${night.date} · ${night.name}`, "No nights yet");
   document.querySelector("#nightSelect").value = state.activeNightId || "";
 
-  document.querySelectorAll("select[name='personId'], select[name='buyerId']").forEach((select) => {
+  document.querySelectorAll("#pourForm select[name='personId'], #bottleForm select[name='buyerId']").forEach((select) => {
     setOptions(select, state.people, (person) => person.name, "Add people first");
   });
-  setOptions(document.querySelector("select[name='typeId']"), state.types, (type) => `${type.name} · ${type.abv}%`, "Add types first");
+  // Options are rebuilt on every render; keep the chosen type and bottle when they still exist.
+  const typeSelect = document.querySelector("#bottleForm select[name='typeId']");
+  const chosenType = typeSelect.value;
+  setOptions(typeSelect, state.types, (type) => `${type.name} · ${type.abv}%${isCounted(type) ? " · counted" : ""}`, "Add types first");
+  if (state.types.some((type) => type.id === chosenType)) typeSelect.value = chosenType;
+  syncBottleSizeField();
+
+  // Crew pours are alcohol only (mixers are ingredients, not drinks), and only from stock that has some left.
+  const bottleSelect = document.querySelector("#pourForm select[name='bottleId']");
+  const chosenBottle = bottleSelect.value;
+  const pourable = state.bottles.filter((bottle) => Number(typeById(bottle.typeId)?.abv) > 0 && Number(bottle.remaining) > 0);
   setOptions(
-    document.querySelector("select[name='bottleId']"),
-    state.bottles.filter((bottle) => Number(bottle.remaining) > 0),
-    (bottle) => `${bottleLabel(bottle)} · ${oneDecimal(bottle.remaining)} oz left`,
+    bottleSelect,
+    pourable,
+    (bottle) => `${bottleLabel(bottle)} · ${amountText(typeById(bottle.typeId), bottle.remaining)} left`,
     "No stocked bottles"
   );
+  if (pourable.some((bottle) => bottle.id === chosenBottle)) bottleSelect.value = chosenBottle;
+  syncPourAmountField();
+}
+
+const POURED_SIZE_DEFAULT = 25.36;
+const COUNTED_SIZE_DEFAULT = 12;
+
+/** Add Stock: the size is ounces for poured types and whole units for counted ones. */
+function syncBottleSizeField() {
+  const form = document.querySelector("#bottleForm");
+  const input = form.querySelector("[name='sizeOz']");
+  const counted = isCounted(typeById(form.querySelector("[name='typeId']").value));
+  const measure = counted ? RNMBDomain.MEASURE_UNIT : RNMBDomain.MEASURE_OZ;
+  // Swap the default only when the measure changes, so a typed size survives a re-render.
+  if (input.dataset.measure !== measure) input.value = counted ? COUNTED_SIZE_DEFAULT : POURED_SIZE_DEFAULT;
+  input.dataset.measure = measure;
+  input.min = "1";
+  input.step = counted ? "1" : "0.01";
+  document.querySelector("#bottleSizeLabel").textContent = counted ? "Size units" : "Size oz";
+}
+
+/** Log Consumption: a count for counted stock, ounces for poured stock. */
+function syncPourAmountField() {
+  const form = document.querySelector("#pourForm");
+  const input = form.querySelector("[name='ounces']");
+  const counted = isCounted(typeById(bottleById(form.querySelector("[name='bottleId']").value)?.typeId));
+  const measure = counted ? RNMBDomain.MEASURE_UNIT : RNMBDomain.MEASURE_OZ;
+  if (input.dataset.measure !== measure) input.value = counted ? 1 : 1.5;
+  input.dataset.measure = measure;
+  input.min = counted ? "1" : "0.1";
+  input.step = counted ? "1" : "0.1";
+  document.querySelector("#pourAmountLabel").textContent = counted ? "Units consumed" : "Ounces consumed";
+}
+
+/** Add Type: unit volume is shown, required and submitted only for counted types. */
+function syncTypeMeasureField() {
+  const form = document.querySelector("#typeForm");
+  const counted = form.querySelector("[name='measure']").value === RNMBDomain.MEASURE_UNIT;
+  const unitOz = form.querySelector("[name='unitOz']");
+  document.querySelector("#typeUnitOzField").hidden = !counted;
+  unitOz.disabled = !counted;
+  unitOz.required = counted;
 }
 
 function renderOverview() {
@@ -1408,7 +1484,7 @@ function renderLowSupply() {
   low.forEach(({ bottle, ratio }) => {
     const item = document.createElement("div");
     item.className = "stack-item";
-    item.innerHTML = `<strong>${escapeHtml(bottleLabel(bottle))}</strong><br><small>${oneDecimal(bottle.remaining)} oz left · ${Math.round(ratio * 100)}%</small>`;
+    item.innerHTML = `<strong>${escapeHtml(bottleLabel(bottle))}</strong><br><small>${amountText(typeById(bottle.typeId), bottle.remaining)} left · ${Math.round(ratio * 100)}%</small>`;
     target.append(item);
   });
 }
@@ -1424,11 +1500,7 @@ function renderRecentNights() {
   }
 
   nights.forEach((night) => {
-    const drinks = night.pours.reduce((sum, pour) => {
-      const bottle = bottleById(pour.bottleId);
-      const type = typeById(bottle?.typeId);
-      return sum + standardDrinks(pour.ounces, type?.abv || pour.abv || 0);
-    }, 0);
+    const drinks = night.pours.reduce((sum, pour) => sum + measurePour(pour).standardDrinks, 0);
     const item = document.createElement("button");
     item.type = "button";
     item.className = "stack-item";
@@ -1486,8 +1558,8 @@ function renderTonight() {
     item.className = "timeline-item";
     item.innerHTML = `
       <div>
-        <strong>${escapeHtml(person?.name || "Unknown")} logged ${oneDecimal(pour.ounces)} oz</strong>
-        <small>${escapeHtml(type?.name || "Unknown")} · ${oneDecimal(standardDrinks(pour.ounces, type?.abv || pour.abv || 0))} standard drinks</small>
+        <strong>${escapeHtml(person?.name || "Unknown")} logged ${amountText(type, pour.ounces)}</strong>
+        <small>${escapeHtml(type?.name || "Unknown")} · ${oneDecimal(measurePour(pour).standardDrinks)} standard drinks</small>
       </div>
       <button class="remove-button" type="button" data-remove-pour="${pour.id}" aria-label="Remove pour">×</button>
     `;
@@ -1508,8 +1580,15 @@ function renderInventory() {
       const type = typeById(bottle.typeId);
       const buyer = personById(bottle.buyerId);
       const fill = Math.max(0, Math.min(100, (Number(bottle.remaining || 0) / Number(bottle.size || 1)) * 100));
+      const counted = isCounted(type);
+      // Mixers carry no alcohol, so they get no standard-drink figure at all (1.3.2).
+      const drinksLeft = Number(type?.abv) > 0
+        ? `${oneDecimal(measureRemaining(bottle).standardDrinks)} standard drinks left`
+        : "no alcohol";
+      const level = counted ? Math.round(Number(bottle.remaining) || 0) : Math.round((Number(bottle.remaining) || 0) * 100) / 100;
       const card = document.createElement("article");
       card.className = "inventory-card";
+      card.dataset.bottleId = bottle.id;
       card.innerHTML = `
         <header>
           <div>
@@ -1519,9 +1598,16 @@ function renderInventory() {
           <span class="pill">${oneDecimal(type?.abv || 0)}%</span>
         </header>
         <div class="progress"><span style="--fill: ${fill}%"></span></div>
-        <small>${oneDecimal(bottle.remaining)} of ${oneDecimal(bottle.size)} oz · ${oneDecimal(standardDrinks(bottle.remaining, type?.abv || 0))} standard drinks left</small>
+        <small>${levelText(type, bottle.remaining, bottle.size)} · ${drinksLeft}</small>
         <small>${money(bottle.price)} paid by ${escapeHtml(buyer?.name || "Unknown")}</small>
-        <button class="remove-button" type="button" data-remove-bottle="${bottle.id}" aria-label="Remove bottle">×</button>
+        <form class="level-form" data-level-form="${escapeHtml(bottle.id)}">
+          <label>
+            <span>Set level (${counted ? "units" : "oz"})</span>
+            <input name="level" type="number" min="0" max="${Number(bottle.size) || 0}" step="${counted ? "1" : "0.01"}" value="${level}" required>
+          </label>
+          <button type="submit">Set</button>
+        </form>
+        <button class="remove-button" type="button" data-remove-bottle="${escapeHtml(bottle.id)}" aria-label="Remove bottle">×</button>
       `;
       inventory.append(card);
     });
@@ -1535,7 +1621,8 @@ function renderInventory() {
     state.types.forEach((type) => {
       const chip = document.createElement("div");
       chip.className = "type-chip";
-      chip.innerHTML = `<strong>${escapeHtml(type.name)}</strong><br><small>${escapeHtml(type.category)} · ${oneDecimal(type.abv)}% ABV</small>`;
+      const measure = isCounted(type) ? ` · counted, ${oneDecimal(type.unitOz)} oz each` : "";
+      chip.innerHTML = `<strong>${escapeHtml(type.name)}</strong><br><small>${escapeHtml(type.category)} · ${oneDecimal(type.abv)}% ABV${measure}</small>`;
       typeList.append(chip);
     });
   }
@@ -1665,18 +1752,49 @@ document.querySelector("#personForm").addEventListener("submit", async (event) =
 
 document.querySelector("#typeForm").addEventListener("submit", async (event) => {
   event.preventDefault();
-  const data = new FormData(event.currentTarget);
-  const type = {
+  const form = event.currentTarget;
+  const data = new FormData(form);
+  const measure = data.get("measure") === RNMBDomain.MEASURE_UNIT ? RNMBDomain.MEASURE_UNIT : RNMBDomain.MEASURE_OZ;
+  const abv = Number(data.get("abv"));
+  const unitOz = measure === RNMBDomain.MEASURE_UNIT ? Number(data.get("unitOz")) : null;
+  if (!Number.isFinite(abv) || abv < 0 || abv > 95) {
+    showToast("ABV must be between 0 and 95 percent.");
+    return;
+  }
+  if (measure === RNMBDomain.MEASURE_UNIT && !(Number.isFinite(unitOz) && unitOz > 0)) {
+    showToast("A counted type needs the volume of one unit, in ounces.");
+    return;
+  }
+  // A database without supabase/host-mode.sql has no measure column and still
+  // requires ABV above 0, so a counted type would silently save as poured (KTD8).
+  if (syncMode === "supabase" && !hostModeAvailable && (measure === RNMBDomain.MEASURE_UNIT || abv === 0)) {
+    showToast(HOST_MODE_SQL_MESSAGE);
+    return;
+  }
+  const type = RNMBDomain.normalizeType({
     id: uid(),
     name: data.get("name").trim(),
     category: data.get("category"),
-    abv: Number(data.get("abv"))
-  };
-  state.types.push(RNMBDomain.normalizeType(type));
-  event.currentTarget.reset();
-  event.currentTarget.abv.value = 40;
+    abv,
+    measure,
+    unitOz
+  });
+  state.types.push(type);
+  form.reset();
+  form.abv.value = 40;
+  syncTypeMeasureField();
   await saveState("Beverage type added.", (db) => db.addType(type));
 });
+
+document.querySelector("#typeForm [name='measure']").addEventListener("change", syncTypeMeasureField);
+
+// A mixer has no alcohol; start its ABV at 0 rather than the spirit default.
+document.querySelector("#typeForm [name='category']").addEventListener("change", (event) => {
+  if (event.target.value === "Mixer") event.currentTarget.form.abv.value = 0;
+});
+
+document.querySelector("#bottleForm [name='typeId']").addEventListener("change", syncBottleSizeField);
+document.querySelector("#pourForm [name='bottleId']").addEventListener("change", syncPourAmountField);
 
 document.querySelector("#bottleForm").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -1687,6 +1805,15 @@ document.querySelector("#bottleForm").addEventListener("submit", async (event) =
   const data = new FormData(event.currentTarget);
   // The form field keeps its old name; the amount is in the type's measure (KTD5).
   const size = Number(data.get("sizeOz"));
+  const stockType = typeById(data.get("typeId"));
+  if (!stockType || !Number.isFinite(size) || size <= 0) {
+    showToast("Pick a type and a size above zero.");
+    return;
+  }
+  if (isCounted(stockType) && !Number.isInteger(size)) {
+    showToast(`${stockType.name} is counted stock, so its size is a whole number of units.`);
+    return;
+  }
   const bottle = {
     id: uid(),
     typeId: data.get("typeId"),
@@ -1699,7 +1826,8 @@ document.querySelector("#bottleForm").addEventListener("submit", async (event) =
   };
   state.bottles.push(bottle);
   event.currentTarget.reset();
-  event.currentTarget.sizeOz.value = 25.36;
+  event.currentTarget.sizeOz.value = POURED_SIZE_DEFAULT;
+  event.currentTarget.sizeOz.dataset.measure = RNMBDomain.MEASURE_OZ;
   event.currentTarget.price.value = 0;
   event.currentTarget.date.value = today();
   await saveState("Bottle added to inventory.", (db) => db.addBottle(bottle));
@@ -1731,9 +1859,19 @@ document.querySelector("#pourForm").addEventListener("submit", async (event) => 
   const data = new FormData(event.currentTarget);
   const bottle = bottleById(data.get("bottleId"));
   const type = typeById(bottle?.typeId);
+  // In the type's measure: ounces, or a count for counted stock (KTD5). The
+  // field keeps its old name, and so does the pour's `ounces` property.
   const ounces = Number(data.get("ounces"));
-  if (!bottle || !type || ounces <= 0) {
+  if (!bottle || !type || !(ounces > 0)) {
     showToast("Pick a stocked bottle and a valid pour.");
+    return;
+  }
+  if (!(Number(type.abv) > 0)) {
+    showToast(`${type.name} has no alcohol, so it is not logged as a pour.`);
+    return;
+  }
+  if (isCounted(type) && !Number.isInteger(ounces)) {
+    showToast(`${type.name} is counted stock, so log a whole number of units.`);
     return;
   }
   if (ounces > Number(bottle.remaining)) {
@@ -1805,6 +1943,35 @@ document.body.addEventListener("click", async (event) => {
     }));
     await saveState("Person removed.", (db) => db.removePerson(personId));
   }
+});
+
+// Set level on an inventory card (1.3.4, KTD12). The cards are rebuilt on every
+// render, so listen once on the body. The repository validates, records the
+// adjustment and changes the level, so state is not touched here first.
+document.body.addEventListener("submit", async (event) => {
+  const form = event.target.closest?.("[data-level-form]");
+  if (!form) return;
+  event.preventDefault();
+  const bottle = bottleById(form.dataset.levelForm);
+  if (!bottle) return;
+  const type = typeById(bottle.typeId);
+  const raw = form.querySelector("[name='level']").value.trim();
+  const newRemaining = Number(raw);
+  if (raw === "" || !Number.isFinite(newRemaining) || newRemaining < 0 || newRemaining > Number(bottle.size)) {
+    showToast(`Set a level from 0 to ${amountText(type, bottle.size)}.`);
+    return;
+  }
+  if (isCounted(type) && !Number.isInteger(newRemaining)) {
+    showToast(`${type.name} is counted stock, so its level is a whole number of units.`);
+    return;
+  }
+  if (Math.abs(newRemaining - Number(bottle.remaining)) < RNMBDomain.AMOUNT_EPSILON) {
+    showToast("That stock item is already at that level.");
+    return;
+  }
+  // No second tap while the call is out; render() rebuilds the card either way.
+  form.querySelector("button[type='submit']").disabled = true;
+  await hostAction("Stock level set.", (db) => db.correctStock({ bottleId: bottle.id, newRemaining }));
 });
 
 function bottleHasSales(bottleId) {
