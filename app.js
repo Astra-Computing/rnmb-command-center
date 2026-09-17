@@ -111,8 +111,14 @@ const registerWriters = new Map();
 // true while one tap's save is out, so a double tap logs one drink.
 let quickLogPersonId = null;
 let quickLogPending = false;
+// The night quick log writes to. Normally the active night; the recap's "Add a
+// missed drink" pins the night it is showing, so a drink added while fixing up
+// one night can never land on another (0.4.3).
+let quickLogNightId = null;
 // Settle-up (0.5.4): true while a payment or a void is being saved.
 let paymentPending = false;
+// End of night (0.4.3): true while ending a night or voiding from the recap.
+let recapPending = false;
 // One id per draft (KTD14): a tap or payment that fails keeps its id, so retrying
 // the same drink or payment can never save it twice. Forgotten once saved.
 const quickLogDraftIds = new Map();
@@ -1626,6 +1632,7 @@ function render() {
   renderOverview();
   renderQuickLog();
   renderTonight();
+  renderNightRecap();
   renderInventory();
   renderMenu();
   renderLedger();
@@ -1895,8 +1902,15 @@ function quickLogMenuOffer(menuItem) {
   }
 }
 
+/** The night quick log writes to: the recap's pinned night while it still exists, else the active one. */
+function quickLogNight() {
+  const pinned = quickLogNightId ? state.nights.find((night) => night.id === quickLogNightId) : null;
+  if (!pinned) quickLogNightId = null;
+  return pinned || activeNight();
+}
+
 function renderQuickLog() {
-  const night = activeNight();
+  const night = quickLogNight();
   const peopleTarget = document.querySelector("#quickLogPeople");
   const itemsTarget = document.querySelector("#quickLogItems");
   const label = document.querySelector("#quickLogItemsLabel");
@@ -1968,9 +1982,12 @@ function renderQuickLog() {
   });
 }
 
-/** The night a quick-logged drink goes on, or a refusal toast explaining why there is none. */
-function quickLogTarget() {
-  const night = activeNight();
+/**
+ * The night a quick-logged drink goes on, or a refusal toast explaining why there
+ * is none. `night` names one explicitly: the recap passes the night it is showing
+ * so a missed drink lands there, whatever the active night is by the time of the tap.
+ */
+function quickLogTarget(night = quickLogNight()) {
   if (!night) {
     showToast("Start a night log first, then tap away.");
     return null;
@@ -1983,8 +2000,8 @@ function quickLogTarget() {
 }
 
 /** One tap on a bottle: a crew pour of one measure, through the same path as the pour form. */
-async function quickLogBottle(bottleId) {
-  const target = quickLogTarget();
+async function quickLogBottle(bottleId, onNight) {
+  const target = quickLogTarget(onNight);
   const bottle = bottleById(bottleId);
   if (!target || !bottle) return;
   const { night, person } = target;
@@ -2016,8 +2033,8 @@ async function quickLogBottle(bottleId) {
 }
 
 /** One tap on a menu item: a crew ring-up on the active night, drawing every ingredient at once (0.7.9). */
-async function quickLogMenuItem(menuItemId) {
-  const target = quickLogTarget();
+async function quickLogMenuItem(menuItemId, onNight) {
+  const target = quickLogTarget(onNight);
   const menuItem = state.menuItems.find((entry) => entry.id === menuItemId);
   if (!target || !menuItem) return;
   const { night, person } = target;
@@ -2058,6 +2075,22 @@ async function quickLogMenuItem(menuItemId) {
   renderQuickLog();
 }
 
+/**
+ * Where a crew drink's liquor came from, for the Tonight timeline. Nothing records
+ * whether a drink was rung up at the register or tapped into quick log, so the
+ * timeline used to call every one of them "Bar register", which was often untrue.
+ * It names the stock it drew instead — which is both known and more useful.
+ */
+function crewDrinkSource(ringUp) {
+  const names = [];
+  (ringUp.lines || []).forEach((line) => {
+    const bottle = bottleById(line.bottleId);
+    const name = bottle ? stockLabel(bottle) : typeById(line.typeId)?.name;
+    if (name && !names.includes(name)) names.push(name);
+  });
+  return names.length ? names.join(", ") : "Crew drink";
+}
+
 function renderTonight() {
   const target = document.querySelector("#personConsumption");
   const timeline = document.querySelector("#pourTimeline");
@@ -2089,7 +2122,8 @@ function renderTonight() {
 
   timeline.innerHTML = "";
   const pours = [...(night?.pours || [])].reverse().slice(0, 12);
-  // Crew drinks rung up on the register, newest first. They are voided on the register (Crew drinks), not removed here.
+  // Crew drinks rung up on the register or tapped into quick log, newest first. They are
+  // voided on the register (Crew drinks) or in the night's recap, not removed here.
   const registerDrinks = night
     ? state.ringUps.filter((ringUp) => ringUp.kind === "crew" && ringUp.nightId === night.id && !ringUp.voidedAt).reverse().slice(0, 12)
     : [];
@@ -2123,11 +2157,178 @@ function renderTonight() {
     item.innerHTML = `
       <div>
         <strong>${escapeHtml(person?.name || ringUp.personName || "Unknown")} had ${escapeHtml(ringUp.menuItemName || "a drink")}</strong>
-        <small>Bar register · ${oneDecimal(RNMBDomain.linesConsumption(ringUp.lines, state.types).standardDrinks)} standard drinks</small>
+        <small>${escapeHtml(crewDrinkSource(ringUp))} · ${oneDecimal(RNMBDomain.linesConsumption(ringUp.lines, state.types).standardDrinks)} standard drinks</small>
       </div>
     `;
     timeline.append(item);
   });
+}
+
+/*
+ * End of night and recap (0.4.3, KTD7). Ending a crew night is a review step, not a
+ * confirmation gate: every balance already moved when each drink was logged, and an
+ * ended crew night stays editable so the recap can add a missed drink or void a
+ * wrong one. Host nights are not touched here — they end in the register, where
+ * ending still needs every tab closed and locks the night afterwards.
+ */
+
+/** The active night when it is a crew night, else null (a host night has no recap here). */
+function recapNight() {
+  const night = activeNight();
+  return night && night.kind !== "host" ? night : null;
+}
+
+/** What one recap line says: what was drunk, how much of it, and what it charged. */
+function recapDrinkLines(drink) {
+  const cost = drink.costCents === null ? "no charge" : `${centsText(drink.costCents)} at cost`;
+  if (drink.kind === "pour") {
+    const bottle = bottleById(drink.bottleId);
+    return {
+      name: bottle ? stockLabel(bottle) : "Stock since removed",
+      detail: `${amountText(typeById(drink.typeId), drink.amount)} · ${cost}`
+    };
+  }
+  return { name: drink.name || "Drink", detail: `${oneDecimal(drink.ounces)} oz · ${cost}` };
+}
+
+function renderNightRecap() {
+  const panel = document.querySelector("#nightRecapPanel");
+  const night = recapNight();
+  panel.hidden = !night;
+  if (!night) return;
+
+  const ended = Boolean(night.endedAt);
+  const endButton = document.querySelector("#endCrewNight");
+  const note = document.querySelector("#nightRecapNote");
+  const list = document.querySelector("#nightRecapList");
+  endButton.hidden = ended;
+  endButton.disabled = recapPending;
+  list.innerHTML = "";
+  list.hidden = !ended;
+
+  if (!ended) {
+    note.textContent = `Ending ${night.name} opens the recap: every drink, who drank it and what it cost, with a tap to add a missed one or void a wrong one. Balances are already up to date, so nothing is waiting on this.`;
+    return;
+  }
+
+  note.textContent = `${night.name} ended. Add a missed drink or void a wrong one — an ended crew night stays editable, and every fix moves the balances straight away.`;
+  const recap = RNMBDomain.nightRecap(state, night.id);
+  if (!recap.length) {
+    list.classList.add("empty-state");
+    list.textContent = "Nobody logged a drink on this night.";
+    return;
+  }
+  list.classList.remove("empty-state");
+
+  recap.forEach((entry) => {
+    const person = personById(entry.personId);
+    const card = document.createElement("article");
+    card.className = "recap-card";
+    card.dataset.recapPerson = entry.personId || "";
+    const drinkCount = `${entry.drinks.length} ${entry.drinks.length === 1 ? "drink" : "drinks"}`;
+    const lines = entry.drinks.map((drink) => {
+      const text = recapDrinkLines(drink);
+      return `
+        <li class="recap-drink" data-recap-drink="${escapeHtml(drink.id)}">
+          <div class="recap-drink-copy">
+            <strong>${escapeHtml(text.name)}</strong>
+            <small>${escapeHtml(text.detail)}</small>
+          </div>
+          <button type="button" class="secondary-button" data-recap-void="${escapeHtml(drink.id)}" data-recap-kind="${drink.kind}"${recapPending ? " disabled" : ""}>Void</button>
+        </li>`;
+    }).join("");
+    // Someone removed from the roster keeps their drinks here under the name the
+    // records snapshotted, but there is nobody left to log a new drink for.
+    const add = person
+      ? `<button type="button" class="secondary-button recap-add" data-recap-add="${escapeHtml(person.id)}"${recapPending ? " disabled" : ""}>Add a missed drink</button>`
+      : `<small class="form-note">No longer on the crew, so nothing new can be logged for them.</small>`;
+    card.innerHTML = `
+      <header class="recap-header">
+        <div class="person-card">
+          <span class="avatar" style="--person-color: ${safeColor(person?.color)}">${initials(entry.name || "?")}</span>
+          <div class="person-copy">
+            <strong>${escapeHtml(entry.name || "Unknown")}</strong>
+            <small data-recap-meta>${drinkCount} · ${oneDecimal(entry.ounces)} oz · ${oneDecimal(entry.standardDrinks)} standard drinks</small>
+          </div>
+        </div>
+        <strong class="recap-total" data-recap-cost>${centsText(entry.costCents)}</strong>
+      </header>
+      <ul class="recap-drinks">${lines}</ul>
+      ${add}
+    `;
+    list.append(card);
+  });
+}
+
+/** End a crew night: confirm, then open the recap. Nothing is locked (KTD7). */
+async function endCrewNight() {
+  const night = recapNight();
+  if (!night || night.endedAt || recapPending) return;
+  if (!crewBalanceAvailable) {
+    showToast(CREW_BALANCE_SQL_MESSAGE);
+    return;
+  }
+  if (!confirm(`End ${night.name}? The recap opens so you can add a missed drink or void a wrong one — an ended crew night stays editable, and every balance is already up to date.`)) return;
+  recapPending = true;
+  renderNightRecap();
+  try {
+    await hostAction(`${night.name} ended. Check the recap for anything missed.`, (db) => db.endNight(night.id));
+  } finally {
+    recapPending = false;
+  }
+  renderNightRecap();
+}
+
+/** Void one drink from the recap: a pour comes back through removePour, a crew ring-up through voidRingUp. */
+async function voidRecapDrink(id, kind) {
+  const night = recapNight();
+  if (!night || recapPending) return;
+
+  if (kind === "ringUp") {
+    const ringUp = state.ringUps.find((entry) => entry.id === id);
+    if (!ringUp) return;
+    const name = ringUp.personName || personById(ringUp.personId)?.name || "crew";
+    if (!confirm(`Void ${ringUp.menuItemName || "this drink"} for ${name}? What it poured goes back into stock, and ${name}'s balance goes back to where it was.`)) return;
+    recapPending = true;
+    renderNightRecap();
+    try {
+      await hostAction("Drink voided. Stock and balances are back to where they were.", (db) => db.voidRingUp(ringUp.id));
+    } finally {
+      recapPending = false;
+    }
+    renderNightRecap();
+    return;
+  }
+
+  const pour = (night.pours || []).find((entry) => entry.id === id);
+  const bottle = bottleById(pour?.bottleId);
+  if (!pour || !bottle) return;
+  const name = personById(pour.personId)?.name || "crew";
+  const measure = amountText(typeById(bottle.typeId), pour.ounces);
+  if (!confirm(`Void ${measure} of ${stockLabel(bottle)} for ${name}? It goes back into stock, and ${name}'s balance goes back to where it was.`)) return;
+  recapPending = true;
+  renderNightRecap();
+  try {
+    // saveState's pattern: change state first, then persist. A failure reloads it.
+    bottle.remaining = round6(Math.min(Number(bottle.size), Number(bottle.remaining) + Number(pour.ounces)));
+    night.pours = night.pours.filter((entry) => entry.id !== id);
+    await saveState("Drink voided. Stock and balances are back to where they were.", (db) => db.removePour(pour, bottle.remaining));
+  } finally {
+    recapPending = false;
+  }
+  renderNightRecap();
+}
+
+/** Point quick log at one person and at the night the recap is showing, then scroll to it. */
+function addMissedDrink(personId) {
+  const night = recapNight();
+  const person = personById(personId);
+  if (!night || !person) return;
+  quickLogPersonId = person.id;
+  quickLogNightId = night.id;
+  renderQuickLog();
+  document.querySelector("#quickLogItems").scrollIntoView({ block: "center" });
+  showToast(`Quick log is ready for ${person.name}. Tap what they had and it lands on ${night.name}.`);
 }
 
 function renderInventory() {
@@ -3377,6 +3578,7 @@ document.querySelector("#nightForm").addEventListener("submit", async (event) =>
 
 document.querySelector("#nightSelect").addEventListener("change", async (event) => {
   state.activeNightId = event.target.value;
+  quickLogNightId = null;
   await saveState("Active night switched.", (db) => db.updateSettings(state, ["active_night_id"]));
 });
 
@@ -3609,14 +3811,33 @@ document.querySelector("#quickLogPeople").addEventListener("click", (event) => {
   if (!button || button.disabled) return;
   // Tapping the chosen person again clears the choice, so the panel never logs to the wrong one.
   quickLogPersonId = quickLogPersonId === button.dataset.quickPerson ? null : button.dataset.quickPerson;
+  // Choosing a person here is a fresh start, so any night the recap pinned is let go.
+  quickLogNightId = null;
   renderQuickLog();
 });
 
 document.querySelector("#quickLogItems").addEventListener("click", async (event) => {
   const button = event.target.closest("button");
   if (!button || button.disabled || quickLogPending) return;
-  if (button.dataset.quickBottle) await quickLogBottle(button.dataset.quickBottle);
-  else if (button.dataset.quickMenu) await quickLogMenuItem(button.dataset.quickMenu);
+  // Read the night once, here, so a refresh mid-tap cannot move the drink to another night.
+  const night = quickLogNight();
+  if (button.dataset.quickBottle) await quickLogBottle(button.dataset.quickBottle, night);
+  else if (button.dataset.quickMenu) await quickLogMenuItem(button.dataset.quickMenu, night);
+});
+
+// ---- Tonight: end of night and recap (0.4.3) ----
+document.querySelector("#nightRecapPanel").addEventListener("click", async (event) => {
+  const control = event.target.closest("button");
+  if (!control || control.disabled || recapPending) return;
+  if (control.id === "endCrewNight") {
+    await endCrewNight();
+    return;
+  }
+  if (control.dataset.recapAdd) {
+    addMissedDrink(control.dataset.recapAdd);
+    return;
+  }
+  if (control.dataset.recapVoid) await voidRecapDrink(control.dataset.recapVoid, control.dataset.recapKind);
 });
 
 // ---- Ledger: settle up (0.5.4, 0.9.2) ----

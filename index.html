@@ -197,6 +197,20 @@
             </section>
           </div>
 
+          <!-- End of night and recap (0.4.3, KTD7). A review, never a gate: balances
+               are already live, and an ended crew night stays editable. -->
+          <section class="panel" id="nightRecapPanel" aria-labelledby="nightRecapTitle" hidden>
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">Wrap Up</span>
+                <h3 id="nightRecapTitle">End of Night</h3>
+              </div>
+              <button type="button" id="endCrewNight" class="secondary-button">End night</button>
+            </div>
+            <p id="nightRecapNote" class="form-note"></p>
+            <div id="nightRecapList" class="recap-grid"></div>
+          </section>
+
           <section class="panel">
             <div class="panel-heading">
               <div>

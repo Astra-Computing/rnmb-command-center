@@ -1551,3 +1551,98 @@ test("balanceChangesOnRemoval names everyone whose balance would move if a perso
   assert.deepEqual(D.balanceChangesOnRemoval({}, "p-casey"), []);
   assert.equal(drankAndPaid.nights[0].pours.length, 1, "the input state is not changed");
 });
+
+test("nightRecap groups one night's drinks by who drank them, with the cents each one charges (0.4.3)", () => {
+  const roster = [...people, { id: "p-casey", name: "Casey" }];
+  const bottles = [
+    { id: "b-rye", typeId: "t-tequila", size: 25, remaining: 20, price: 40, buyerId: "p-sam" },
+    { id: "b-lager", typeId: "t-lager", size: 12, remaining: 10, price: 24, buyerId: "p-alex" },
+    { id: "b-nobody", typeId: "t-tequila", size: 25, remaining: 25, price: 50, buyerId: "" }
+  ];
+  const pour = (id, personId, bottleId, amount, at, extra = {}) => Object.assign(
+    { id, personId, bottleId, ounces: amount, abv: 40, timestamp: at, costCents: null, buyerId: null, buyerName: "" },
+    extra
+  );
+  const line = (typeId, amount, costCents, buyerId, buyerName) => ({ typeId, amount, abv: 40, costCents, buyerId, buyerName });
+  const crew = (id, nightId, personId, personName, menuItemName, at, lines, extra = {}) => Object.assign(
+    { id, nightId, kind: "crew", personId, personName, menuItemId: "m1", menuItemName, rungAt: at, voidedAt: null, lines },
+    extra
+  );
+
+  const state = {
+    people: roster,
+    types,
+    bottles,
+    nights: [
+      {
+        id: "n1",
+        kind: "crew",
+        pours: [
+          // Alex drinks 1.5 oz of Sam's rye: 160c an ounce, so 240c to Sam.
+          pour("po1", "p-alex", "b-rye", 1.5, "2026-09-17T20:00:00Z", { costCents: 240, buyerId: "p-sam", buyerName: "Sam" }),
+          // One counted lager: 200c to Alex, who bought it, so it nets to nothing.
+          pour("po2", "p-alex", "b-lager", 1, "2026-09-17T22:00:00Z", { costCents: 200, buyerId: "p-alex", buyerName: "Alex" }),
+          // Nobody bought this bottle, so the pour charges nobody at all.
+          pour("po3", "p-jordan", "b-nobody", 2, "2026-09-17T21:00:00Z", { costCents: 400 })
+        ]
+      },
+      { id: "n2", kind: "crew", pours: [pour("po4", "p-sam", "b-rye", 3, "2026-09-16T20:00:00Z", { costCents: 480, buyerId: "p-sam", buyerName: "Sam" })] }
+    ],
+    ringUps: [
+      crew("r1", "n1", "p-jordan", "Jordan", "Margarita", "2026-09-17T21:30:00Z", [line("t-tequila", 2, 320, "p-sam", "Sam"), line("t-lime", 1, 12, "p-jordan", "Jordan")]),
+      crew("r2", "n1", "p-alex", "Alex", "Voided one", "2026-09-17T23:00:00Z", [line("t-tequila", 2, 320, "p-sam", "Sam")], { voidedAt: "2026-09-17T23:01:00Z" }),
+      crew("r3", "n2", "p-casey", "Casey", "Other night", "2026-09-16T21:00:00Z", [line("t-tequila", 2, 320, "p-sam", "Sam")]),
+      { id: "g1", nightId: "n1", kind: "guest", tabId: "tab1", personId: null, personName: "", menuItemName: "Guest drink", rungAt: "2026-09-17T20:30:00Z", voidedAt: null, lines: [line("t-tequila", 2, 320, "p-sam", "Sam")] }
+    ],
+    guestTabs: [],
+    payments: []
+  };
+
+  const recap = D.nightRecap(state, "n1");
+  assert.deepEqual(recap.map((entry) => entry.name), ["Alex", "Jordan"], "roster order, and only people who drank that night");
+
+  const alex = recap[0];
+  assert.deepEqual(alex.drinks.map((drink) => [drink.kind, drink.id, drink.costCents]), [["pour", "po1", 240], ["pour", "po2", 200]], "oldest first; the voided ring-up is gone");
+  assert.equal(alex.drinks[0].bottleId, "b-rye");
+  assert.equal(alex.drinks[0].typeId, "t-tequila");
+  assert.equal(alex.drinks[0].amount, 1.5);
+  assert.equal(alex.drinks[0].ounces, 1.5);
+  assert.equal(alex.drinks[1].ounces, 12, "a counted unit measures as its unit volume");
+  assert.equal(alex.costCents, 440);
+  assert.equal(alex.ounces, 13.5);
+
+  const jordan = recap[1];
+  assert.deepEqual(jordan.drinks.map((drink) => [drink.kind, drink.id, drink.costCents]), [["pour", "po3", null], ["ringUp", "r1", 332]], "a pour of nobody's bottle charges nobody");
+  assert.equal(jordan.drinks[1].name, "Margarita");
+  assert.equal(jordan.drinks[1].menuItemId, "m1");
+  assert.equal(jordan.drinks[1].ounces, 3, "the ring-up's lines measured together");
+  assert.equal(jordan.costCents, 332, "an uncharged drink adds nothing to the total");
+  assert.equal(jordan.ounces, 5);
+
+  // What the recap says each person was charged is exactly what crewBalances took off them.
+  const oneNight = Object.assign({}, state, { nights: [state.nights[0]], ringUps: state.ringUps.filter((entry) => entry.nightId === "n1") });
+  const owed = Object.fromEntries(D.crewBalances(oneNight).map((entry) => [entry.name, entry.cents]));
+  assert.equal(owed.Alex, -240, "Alex is charged 440c and credited 200c for their own lager");
+  assert.equal(owed.Jordan, -320, "Jordan is charged 332c and credited 12c for their own lime");
+
+  assert.deepEqual(D.nightRecap(state, "n2").map((entry) => [entry.name, entry.drinks.length]), [["Sam", 1], ["Casey", 1]]);
+  assert.deepEqual(D.nightRecap(state, "missing"), []);
+  assert.deepEqual(D.nightRecap({}, "n1"), []);
+  assert.deepEqual(D.nightRecap(), []);
+  assert.equal(state.nights[0].pours.length, 3, "the input state is not changed");
+});
+
+test("nightRecap keeps a drinker who has left the roster, after everyone still on it (0.4.3)", () => {
+  const state = {
+    people: [{ id: "p-sam", name: "Sam" }],
+    types,
+    bottles: [],
+    nights: [{ id: "n1", kind: "crew", pours: [] }],
+    ringUps: [
+      { id: "r1", nightId: "n1", kind: "crew", personId: null, personName: "Zoe", menuItemName: "Shot", rungAt: "2026-09-17T20:00:00Z", voidedAt: null, lines: [{ typeId: "t-tequila", amount: 1.5, abv: 40, costCents: 100, buyerId: "p-sam", buyerName: "Sam" }] },
+      { id: "r2", nightId: "n1", kind: "crew", personId: null, personName: "Ada", menuItemName: "Shot", rungAt: "2026-09-17T21:00:00Z", voidedAt: null, lines: [{ typeId: "t-tequila", amount: 1.5, abv: 40, costCents: 100, buyerId: "p-sam", buyerName: "Sam" }] },
+      { id: "r3", nightId: "n1", kind: "crew", personId: "p-sam", personName: "Sam", menuItemName: "Shot", rungAt: "2026-09-17T22:00:00Z", voidedAt: null, lines: [{ typeId: "t-tequila", amount: 1.5, abv: 40, costCents: 100, buyerId: "p-sam", buyerName: "Sam" }] }
+    ]
+  };
+  assert.deepEqual(D.nightRecap(state, "n1").map((entry) => [entry.name, entry.personId]), [["Sam", "p-sam"], ["Ada", null], ["Zoe", null]], "the roster first, then anyone removed since, by name");
+});
