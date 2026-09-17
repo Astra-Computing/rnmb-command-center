@@ -92,7 +92,7 @@
  *   normalizeNight / normalizeMenuItem / normalizeTab / normalizeRingUp / normalizeAdjustment /
  *   normalizePayment(record) -> the record with every field present in a fixed order (nulls, numbers, defaults)
  *   normalizePour(pour) -> the pour with costCents (number|null), buyerId and buyerName (null when absent)
- *   normalizeState(input) -> full browser state: people, types, bottles, nights (kind, endedAt, pours
+ *   normalizeState(input) -> full browser state: people, types, bottles, nights (kind, endedAt on both kinds, pours
  *               normalized, startedLocally only when true), menuItems, guestTabs, ringUps,
  *               stockAdjustments, payments, activeNightId, responsibleMode, markupPercent,
  *               roundingIncrementCents
@@ -100,6 +100,13 @@
  *   nightRow(night, hostModeAvailable) -> rnmb_nights row
  *   settingsRow(settings, hostModeAvailable) -> rnmb_settings row
  *   bottleRow(bottle) -> rnmb_bottles row (size/remaining written to size_oz/remaining_oz)
+ *   pourRow(pour, nightId, crewBalanceAvailable) -> rnmb_pours row; cost_cents, buyer_id, buyer_name
+ *               only when crewBalanceAvailable === true
+ *   paymentRow(payment) -> rnmb_payments row
+ *   stampPour(pour, bottle, people) -> copy of the pour with costCents (pourCostCents of pour.ounces),
+ *               buyerId and buyerName (null unless the bottle's buyer is on the roster)
+ *   hasCrewBalanceRecords(state) -> true when state holds payments, cost-stamped pours, write-off
+ *               authors or an ended crew night (records a pre-crew-balance database cannot keep)
  *
  * The row builders add the host-mode columns (measure, unit_oz, kind, ended_at,
  * markup_percent, rounding_increment_cents) only when hostModeAvailable is literally
@@ -1014,7 +1021,10 @@ var RNMBDomain = (function () {
     return copy;
   }
 
-  /** startedLocally is a browser-only mark (KTD9): kept only when literally true, never sent to the database. */
+  /**
+   * startedLocally is a browser-only mark (KTD9): kept only when literally true, never sent to the database.
+   * Both kinds keep endedAt: a crew night can end too (crew-balance KTD7).
+   */
   function normalizeNight(night) {
     var source = night || {};
     var kind = source.kind === "host" ? "host" : "crew";
@@ -1023,7 +1033,7 @@ var RNMBDomain = (function () {
       name: source.name,
       date: source.date,
       kind: kind,
-      endedAt: kind === "host" ? orNull(source.endedAt) : null,
+      endedAt: orNull(source.endedAt),
       pours: listOf(source.pours).map(normalizePour)
     };
     if (source.startedLocally === true) result.startedLocally = true;
@@ -1183,6 +1193,77 @@ var RNMBDomain = (function () {
     return row;
   }
 
+  /**
+   * The rnmb_pours row for a crew pour. cost_cents, buyer_id and buyer_name are added
+   * only when crewBalanceAvailable is literally true (supabase/crew-balance.sql has run).
+   */
+  function pourRow(pour, nightId, crewBalanceAvailable) {
+    var row = {
+      id: pour.id,
+      night_id: nightId,
+      person_id: pour.personId,
+      bottle_id: pour.bottleId,
+      ounces: pour.ounces,
+      abv_snapshot: pour.abv,
+      poured_at: pour.timestamp
+    };
+    if (crewBalanceAvailable === true) {
+      row.cost_cents = numberOrNull(pour.costCents);
+      row.buyer_id = orNull(pour.buyerId);
+      row.buyer_name = orNull(pour.buyerName);
+    }
+    return row;
+  }
+
+  function paymentRow(payment) {
+    var normalized = normalizePayment(payment);
+    return {
+      id: normalized.id,
+      from_person_id: normalized.fromPersonId,
+      from_name: normalized.fromName,
+      to_person_id: normalized.toPersonId,
+      to_name: normalized.toName,
+      amount_cents: normalized.amountCents,
+      paid_at: normalized.paidAt,
+      voided_at: normalized.voidedAt
+    };
+  }
+
+  /**
+   * A copy of the pour stamped the way rnmb_add_crew_pour stamps it (KTD2): whole-cent
+   * cost from the bottle's price and size, and the bottle buyer's id and name when that
+   * buyer is on the roster (otherwise nobody is credited).
+   */
+  function stampPour(pour, bottle, people) {
+    var buyerId = bottle && bottle.buyerId;
+    var buyer = buyerId ? byId(people).get(buyerId) : null;
+    return Object.assign({}, pour, {
+      costCents: pourCostCents(bottle, pour.ounces),
+      buyerId: buyer ? buyer.id : null,
+      buyerName: buyer ? buyer.name : null
+    });
+  }
+
+  /**
+   * True when the state holds anything a database without supabase/crew-balance.sql has
+   * no column or table for: payments, cost-stamped pours, write-off authors, or an
+   * ended crew night. Replacing such a database with this state would lose them.
+   */
+  function hasCrewBalanceRecords(state) {
+    var source = state || {};
+    if (listOf(source.payments).length) return true;
+    var nights = listOf(source.nights);
+    if (nights.some(function (night) { return night && night.kind !== "host" && orNull(night.endedAt) !== null; })) return true;
+    if (nights.some(function (night) {
+      return listOf(night && night.pours).some(function (pour) {
+        return numberOrNull(pour && pour.costCents) !== null || orNull(pour && pour.buyerId) !== null;
+      });
+    })) return true;
+    return listOf(source.guestTabs).some(function (tab) {
+      return orNull(tab && tab.writtenOffBy) !== null || orNull(tab && tab.writtenOffByName) !== null;
+    });
+  }
+
   function bottleRow(bottle) {
     var normalized = normalizeBottle(bottle);
     return {
@@ -1247,7 +1328,11 @@ var RNMBDomain = (function () {
     typeRow: typeRow,
     nightRow: nightRow,
     settingsRow: settingsRow,
-    bottleRow: bottleRow
+    bottleRow: bottleRow,
+    pourRow: pourRow,
+    paymentRow: paymentRow,
+    stampPour: stampPour,
+    hasCrewBalanceRecords: hasCrewBalanceRecords
   });
 })();
 

@@ -158,8 +158,11 @@ async function logPourViaForm(session, { personName, bottleId, amount }) {
  * host-mode tables answer 404, and any write carrying a host-mode column gets 400.
  */
 function preMigrationStub() {
-  const NEW_TABLES = ["rnmb_menu_items", "rnmb_recipe_ingredients", "rnmb_guest_tabs", "rnmb_ring_ups", "rnmb_ring_up_lines", "rnmb_stock_adjustments"];
+  // rnmb_payments comes from supabase/crew-balance.sql, which needs host-mode.sql first.
+  const NEW_TABLES = ["rnmb_menu_items", "rnmb_recipe_ingredients", "rnmb_guest_tabs", "rnmb_ring_ups", "rnmb_ring_up_lines", "rnmb_stock_adjustments", "rnmb_payments"];
   const NEW_COLUMNS = /"(measure|unit_oz|kind|ended_at|markup_percent|rounding_increment_cents)"\s*:/;
+  // crew-balance.sql columns (buyer_id alone is not one: rnmb_bottles has always had it).
+  const CREW_BALANCE_COLUMNS = /"(cost_cents|buyer_name|written_off_by|written_off_by_name)"\s*:/;
   const store = {
     rnmb_people: [], rnmb_beverage_types: [], rnmb_bottles: [], rnmb_nights: [], rnmb_pours: [],
     rnmb_settings: [{ id: true, active_night_id: null, responsible_mode: true }]
@@ -194,10 +197,16 @@ function preMigrationStub() {
         unexpected.push(`${method} ${path}`);
         return json(404, { code: "PGRST205", message: "unknown table" });
       }
-      if (method === "GET") return json(200, store[path]);
+      if (method === "GET") {
+        if (/cost_cents|buyer_name/.test(url.searchParams.get("select") || "")) {
+          served400.push(`${method} ${path}${url.search}`);
+          return json(400, { code: "42703", message: `column ${path}.cost_cents does not exist` });
+        }
+        return json(200, store[path]);
+      }
 
       const body = request.postData() || "";
-      if (NEW_COLUMNS.test(body)) {
+      if (NEW_COLUMNS.test(body) || (path === "rnmb_pours" && CREW_BALANCE_COLUMNS.test(body))) {
         served400.push(`${method} ${path} ${body}`);
         return json(400, { code: "PGRST204", message: "Could not find a new column in the schema cache" });
       }
@@ -402,15 +411,19 @@ async function exitRegisterTo(page, tab) {
  * merge-duplicates upserts, return=representation), and every request is kept
  * in `log` in order. Set `stub.fail = (entry) => status | null` to fail a request.
  */
-function hostModeStub(seed = {}) {
+function hostModeStub(seed = {}, { crewBalance = true, pourCostColumns = crewBalance } = {}) {
+  // crewBalance: false = supabase/crew-balance.sql not run (rnmb_payments answers 404).
+  // pourCostColumns: false = rnmb_pours has no cost_cents/buyer_id/buyer_name (a select naming them answers 400).
+  // stub.rpc[name] = (payload) => result answers POST rpc/<name>; any other function is unexpected.
   const TABLES = [
     "rnmb_people", "rnmb_beverage_types", "rnmb_bottles", "rnmb_nights", "rnmb_pours", "rnmb_settings",
-    "rnmb_menu_items", "rnmb_recipe_ingredients", "rnmb_guest_tabs", "rnmb_ring_ups", "rnmb_ring_up_lines", "rnmb_stock_adjustments"
+    "rnmb_menu_items", "rnmb_recipe_ingredients", "rnmb_guest_tabs", "rnmb_ring_ups", "rnmb_ring_up_lines", "rnmb_stock_adjustments",
+    ...(crewBalance ? ["rnmb_payments"] : [])
   ];
   const store = Object.fromEntries(TABLES.map((table) => [table, JSON.parse(JSON.stringify(seed[table] || []))]));
   const log = [];
   const unexpected = [];
-  const stub = { store, log, unexpected, fail: null };
+  const stub = { store, log, unexpected, fail: null, rpc: {} };
 
   const matches = (row, params) => Array.from(params.entries()).every(([key, value]) => {
     if (["select", "order", "on_conflict"].includes(key)) return true;
@@ -450,6 +463,14 @@ function hostModeStub(seed = {}) {
         const { id, name, date } = entry.body.payload;
         store.rnmb_nights.push({ id, name, date, kind: "host", ended_at: null });
         return json(200, id);
+      }
+      const rpcName = path.startsWith("rpc/") ? path.slice(4) : null;
+      if (rpcName && stub.rpc[rpcName]) return json(200, stub.rpc[rpcName](entry.body.payload));
+      if (!crewBalance && path === "rnmb_payments") {
+        return json(404, { code: "PGRST205", message: "Could not find the table 'public.rnmb_payments' in the schema cache" });
+      }
+      if (!pourCostColumns && path === "rnmb_pours" && method === "GET" && /cost_cents/.test(url.searchParams.get("select") || "")) {
+        return json(400, { code: "42703", message: "column rnmb_pours.cost_cents does not exist" });
       }
       if (path.startsWith("rpc/") || !TABLES.includes(path)) {
         unexpected.push(`${method} ${path}`);
@@ -2439,6 +2460,462 @@ const scenarios = [
         assert.ok(!(await session.toasts()).includes("Pricing saved."), "no pricing save was reported");
         await setPricingViaForm(session, { markupPercent: "12.35", increment: "0.50" });
         assert.equal(await page.evaluate(() => window.__rnmb.state.markupPercent), 12.35, "two decimals are still accepted");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  // ---------- crew running balance: U3 state and repositories ----------
+
+  {
+    name: "Crew U3 local: recording then voiding a payment moves both balances by the amount and returns crewBalances to their start; refusals save nothing",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        assert.equal(await page.evaluate(() => window.__rnmb.crewBalanceAvailable), true, "local mode always has crew balances");
+        const result = await page.evaluate(async () => {
+          const r = window.__rnmb;
+          const idOf = (name) => r.state.people.find((person) => person.name === name).id;
+          const cents = () => Object.fromEntries(r.crewBalances().map((entry) => [entry.name, entry.cents]));
+          const stored = () => JSON.parse(localStorage.getItem("rnmb-command-center-v1")).payments;
+          const alex = idOf("Alex");
+          const sam = idOf("Sam");
+          const id = crypto.randomUUID();
+          const start = cents();
+          const recorded = await r.hostAction("Payment recorded.", (db) => db.recordPayment({ id, fromPersonId: alex, toPersonId: sam, amountCents: 320 }));
+          const middle = cents();
+          const storedMiddle = stored();
+          const refusals = [];
+          for (const attempt of [
+            { id, fromPersonId: alex, toPersonId: sam, amountCents: 320 },
+            { id: crypto.randomUUID(), fromPersonId: alex, toPersonId: alex, amountCents: 320 },
+            { id: crypto.randomUUID(), fromPersonId: alex, toPersonId: sam, amountCents: 0 },
+            { id: crypto.randomUUID(), fromPersonId: alex, toPersonId: sam, amountCents: 12.5 },
+            { id: crypto.randomUUID(), fromPersonId: alex, toPersonId: crypto.randomUUID(), amountCents: 100 }
+          ]) {
+            refusals.push(await r.hostAction("Payment recorded.", (db) => db.recordPayment(attempt)));
+          }
+          const afterRefusals = { count: r.state.payments.length, cents: cents() };
+          const voided = await r.hostAction("Payment voided.", (db) => db.voidPayment(id));
+          const voidTwice = await r.hostAction("Payment voided.", (db) => db.voidPayment(id));
+          return { start, recorded, middle, storedMiddle, refusals, afterRefusals, voided, voidTwice, end: cents(), payments: r.state.payments, storedEnd: stored(), alex, sam };
+        });
+        assert.equal(result.recorded, true);
+        assert.equal(result.middle.Alex, result.start.Alex + 320, "the payer's balance rises by the amount");
+        assert.equal(result.middle.Sam, result.start.Sam - 320, "the payee's balance falls by the amount");
+        assert.equal(result.storedMiddle.length, 1, "localStorage holds the payment");
+        assert.deepEqual(result.refusals, [false, false, false, false, false]);
+        assert.deepEqual(result.afterRefusals, { count: 1, cents: result.middle }, "refused payments changed nothing");
+        assert.equal(result.voided, true);
+        assert.equal(result.voidTwice, false);
+        assert.deepEqual(result.end, result.start, "voiding returns every balance to its start");
+        assert.equal(result.payments.length, 1, "the voided payment stays in the history");
+        const [payment] = result.payments;
+        assert.deepEqual(
+          { ...payment, paidAt: typeof payment.paidAt, voidedAt: typeof payment.voidedAt },
+          { id: payment.id, fromPersonId: result.alex, fromName: "Alex", toPersonId: result.sam, toName: "Sam", amountCents: 320, paidAt: "string", voidedAt: "string" }
+        );
+        assert.ok(result.storedEnd[0].voidedAt, "localStorage holds the void");
+        const toasts = await session.toasts();
+        for (const message of [
+          "That payment was already recorded.",
+          "A payment must be between two different crew members.",
+          "A payment needs an amount above zero, in whole cents.",
+          "The crew member who was paid does not exist.",
+          "That payment was already voided."
+        ]) {
+          assert.ok(toasts.includes(message), `refusal toast "${message}" shown`);
+        }
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Crew U3 local: a crew pour logged through the form is stamped with its cost and buyer from the bottle, debiting the drinker and crediting the buyer",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const bottle = await page.evaluate(() => window.__rnmb.state.bottles.find((entry) => entry.nickname === "The Briefing Bottle"));
+        const before = await page.evaluate(() => Object.fromEntries(window.__rnmb.crewBalances().map((entry) => [entry.name, entry.cents])));
+        await logPourViaForm(session, { personName: "Sam", bottleId: bottle.id, amount: 1.5 });
+        const result = await page.evaluate((bottleId) => {
+          const r = window.__rnmb;
+          const night = r.state.nights.find((entry) => entry.id === r.state.activeNightId);
+          const pour = night.pours.find((entry) => entry.bottleId === bottleId);
+          const stored = JSON.parse(localStorage.getItem("rnmb-command-center-v1"));
+          const storedPour = stored.nights.flatMap((entry) => entry.pours).find((entry) => entry.id === pour.id);
+          return {
+            pour,
+            storedPour,
+            alexId: r.state.people.find((person) => person.name === "Alex").id,
+            cents: Object.fromEntries(r.crewBalances().map((entry) => [entry.name, entry.cents]))
+          };
+        }, bottle.id);
+        // $34.99 / 25.36 oz x 1.5 oz = 206.96 cents, rounded half-up once.
+        assert.equal(result.pour.costCents, 207);
+        assert.equal(result.pour.buyerId, result.alexId);
+        assert.equal(result.pour.buyerName, "Alex");
+        assert.deepEqual(
+          { costCents: result.storedPour.costCents, buyerId: result.storedPour.buyerId, buyerName: result.storedPour.buyerName },
+          { costCents: 207, buyerId: result.alexId, buyerName: "Alex" },
+          "localStorage keeps the stamp"
+        );
+        assert.equal(result.cents.Sam, before.Sam - 207);
+        assert.equal(result.cents.Alex, before.Alex + 207);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Crew U3 local: an ended crew night still takes crew ring-ups, voids and pours but never guest drinks; an ended host night stays locked; a write-off records its author",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const crew = await page.evaluate(async () => {
+          const r = window.__rnmb;
+          const D = window.RNMBDomain;
+          const nightId = r.state.activeNightId;
+          const jordan = r.state.people.find((person) => person.name === "Jordan").id;
+          const item = r.state.menuItems.find((entry) => entry.name === "Bourbon Neat");
+          const sources = () => D.preselectSources(item, r.state.bottles).flatMap((ingredient) => ingredient.sources);
+          const crewDrink = () => r.buildRingUp({ nightId, kind: "crew", personId: jordan, menuItemId: item.id, sources: sources() });
+          const first = crewDrink();
+          const openRingUp = await r.hostAction("Crew drink.", (db) => db.ringUp(first));
+          const ended = await r.hostAction("Night ended.", (db) => db.endNight(nightId));
+          const endedAt = r.state.nights.find((night) => night.id === nightId).endedAt;
+          const endTwice = await r.hostAction("Night ended.", (db) => db.endNight(nightId));
+          const late = crewDrink();
+          const lateRingUp = await r.hostAction("Crew drink.", (db) => db.ringUp(late));
+          const lateVoid = await r.hostAction("Voided.", (db) => db.voidRingUp(late.id));
+          const guest = r.buildRingUp({ nightId, kind: "guest", tabId: crypto.randomUUID(), menuItemId: item.id, sources: sources() });
+          const guestRingUp = await r.hostAction("Guest drink.", (db) => db.ringUp(guest));
+          const saved = r.state.ringUps.find((entry) => entry.id === first.id);
+          return {
+            openRingUp, ended, endedAt, endTwice, lateRingUp, lateVoid, guestRingUp,
+            lateVoided: Boolean(r.state.ringUps.find((entry) => entry.id === late.id)?.voidedAt),
+            firstLineCosts: saved.lines.map((line) => line.costCents),
+            guestSaved: r.state.ringUps.some((entry) => entry.id === guest.id),
+            jordanCents: r.crewBalances().find((entry) => entry.name === "Jordan").cents,
+            storedEndedAt: JSON.parse(localStorage.getItem("rnmb-command-center-v1")).nights.find((night) => night.id === nightId).endedAt
+          };
+        });
+        assert.equal(crew.openRingUp, true, "a crew ring-up on an open crew night is accepted");
+        assert.equal(crew.ended, true);
+        assert.ok(crew.endedAt, "the crew night has an end time");
+        assert.equal(crew.storedEndedAt, crew.endedAt, "localStorage keeps the crew night's end time");
+        assert.equal(crew.endTwice, false);
+        assert.equal(crew.lateRingUp, true, "an ended crew night still takes a crew ring-up");
+        assert.equal(crew.lateVoid, true, "and voids it");
+        assert.equal(crew.lateVoided, true);
+        assert.equal(crew.guestRingUp, false, "a guest ring-up on a crew night is refused");
+        assert.equal(crew.guestSaved, false);
+        assert.ok(crew.firstLineCosts.every((cost) => cost > 0), "crew lines carry their cost");
+        assert.ok(crew.jordanCents < 0, "the crew drink debits Jordan");
+
+        // The active night is the ended crew night: the pour form still logs to it.
+        const bottle = await page.evaluate(() => window.__rnmb.state.bottles.find((entry) => entry.nickname === "The Briefing Bottle"));
+        await logPourViaForm(session, { personName: "Casey", bottleId: bottle.id, amount: 1 });
+
+        const { nightId, tabId, started, opened } = await startLocalHostNightWithTab(page);
+        assert.equal(started && opened, true);
+        const host = await page.evaluate(async ({ nightId, tabId }) => {
+          const r = window.__rnmb;
+          const D = window.RNMBDomain;
+          const casey = r.state.people.find((person) => person.name === "Casey").id;
+          const skyId = crypto.randomUUID();
+          const skyOpened = await r.hostAction("Tab opened.", (db) => db.openTab({ id: skyId, nightId, guestName: "Sky" }));
+          const unknownAuthor = await r.hostAction("Written off.", (db) => db.closeTab({ id: tabId, status: "written_off", writtenOffBy: crypto.randomUUID() }));
+          const authored = await r.hostAction("Written off.", (db) => db.closeTab({ id: tabId, status: "written_off", writtenOffBy: casey }));
+          const riley = r.state.guestTabs.find((tab) => tab.id === tabId);
+          const noAuthor = await r.hostAction("Written off.", (db) => db.closeTab({ id: skyId, status: "written_off" }));
+          const sky = r.state.guestTabs.find((tab) => tab.id === skyId);
+          const ended = await r.hostAction("Host night ended.", (db) => db.endNight(nightId));
+          const item = r.state.menuItems.find((entry) => entry.name === "Bourbon Neat");
+          const sources = D.preselectSources(item, r.state.bottles).flatMap((ingredient) => ingredient.sources);
+          const lockedRingUp = await r.hostAction("Crew drink.", (db) => db.ringUp(r.buildRingUp({ nightId, kind: "crew", personId: casey, menuItemId: item.id, sources })));
+          let lockedPour = null;
+          try {
+            r.preparePour(r.state.nights.find((night) => night.id === nightId), { personId: casey, bottleId: sources[0].bottleId, ounces: 1 });
+          } catch (error) {
+            lockedPour = error.userMessage;
+          }
+          return {
+            skyOpened, unknownAuthor, authored, noAuthor, ended, lockedRingUp, lockedPour, casey,
+            riley: { status: riley.status, writtenOffBy: riley.writtenOffBy, writtenOffByName: riley.writtenOffByName },
+            sky: { status: sky.status, writtenOffBy: sky.writtenOffBy, writtenOffByName: sky.writtenOffByName }
+          };
+        }, { nightId, tabId });
+        assert.equal(host.skyOpened, true);
+        assert.equal(host.unknownAuthor, false, "an unknown author is refused");
+        assert.equal(host.authored, true);
+        assert.deepEqual(host.riley, { status: "written_off", writtenOffBy: host.casey, writtenOffByName: "Casey" });
+        assert.equal(host.noAuthor, true, "until the register asks for one, a write-off without an author is still accepted");
+        assert.deepEqual(host.sky, { status: "written_off", writtenOffBy: null, writtenOffByName: null });
+        assert.equal(host.ended, true, "endNight ends a host night once its tabs are closed");
+        assert.equal(host.lockedRingUp, false, "an ended host night takes no crew ring-up");
+        assert.equal(host.lockedPour, "This host night has ended, so no more pours can be logged.");
+
+        const toasts = await session.toasts();
+        for (const message of [
+          "This crew night has already ended.",
+          "Drinks and guest tabs only exist on a host night.",
+          "The crew member writing off the tab does not exist.",
+          "This host night has ended, so nothing more can be changed on it."
+        ]) {
+          assert.ok(toasts.includes(message), `refusal toast "${message}" shown`);
+        }
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Crew U3 pre-migration database: rnmb_payments 404 turns crew balances off, a logged pour sends no cost columns, and payments and replacing with payment history are refused",
+    async run({ browser }) {
+      const { store, served400, unexpected, writes, routes, expected404 } = preMigrationStub();
+      const sam = "11111111-1111-4111-8111-111111111111";
+      const rum = "22222222-2222-4222-8222-222222222222";
+      const bottleId = "33333333-3333-4333-8333-333333333333";
+      const nightId = "44444444-4444-4444-8444-444444444444";
+      store.rnmb_people.push({ id: sam, name: "Sam", color: "#ef4444" }, { id: "99999999-9999-4999-8999-999999999999", name: "Alex", color: "#f97316" });
+      store.rnmb_beverage_types.push({ id: rum, name: "Rum", category: "Rum", abv: 40 });
+      store.rnmb_bottles.push({ id: bottleId, type_id: rum, nickname: "Sam's rum", size_oz: 25, remaining_oz: 25, price: 40, buyer_id: sam, purchase_date: "2026-09-16" });
+      store.rnmb_nights.push({ id: nightId, name: "Crew night", date: "2026-09-16" });
+      store.rnmb_settings[0].active_night_id = nightId;
+      const CREW_BALANCE_SQL_MESSAGE = "Crew balances are not set up on the shared database yet. Run supabase/crew-balance.sql in Supabase, then reload.";
+      const session = await openPage(browser, { routes, allowConsole: expected404 });
+      const { page } = session;
+      try {
+        await session.waitForToast("Connected to Supabase.");
+        assert.deepEqual(
+          await page.evaluate(() => [window.__rnmb.syncMode, window.__rnmb.hostModeAvailable, window.__rnmb.crewBalanceAvailable]),
+          ["supabase", false, false]
+        );
+
+        await logPourViaForm(session, { personName: "Alex", bottleId, amount: 2 });
+        const pourWrites = writes.filter((write) => write.table === "rnmb_pours");
+        assert.equal(pourWrites.length, 1, "the pour was inserted");
+        assert.deepEqual(Object.keys(pourWrites[0].rows[0]).sort(), ["abv_snapshot", "bottle_id", "id", "night_id", "ounces", "person_id", "poured_at"]);
+        const pour = await page.evaluate(() => window.__rnmb.state.nights[0].pours[0]);
+        assert.deepEqual([pour.costCents, pour.buyerId, pour.buyerName], [null, null, null], "no cost stamp the database cannot keep");
+
+        const outcome = await page.evaluate(async () => {
+          const r = window.__rnmb;
+          const [a, b] = r.state.people;
+          const recorded = await r.hostAction("Payment recorded.", (db) => db.recordPayment({ id: crypto.randomUUID(), fromPersonId: a.id, toPersonId: b.id, amountCents: 100 }));
+          const endCrew = await r.hostAction("Night ended.", (db) => db.endNight(r.state.activeNightId));
+          let replaceRefusal = null;
+          try {
+            await r.repository.saveAll({
+              ...r.state,
+              payments: [window.RNMBDomain.normalizePayment({ id: crypto.randomUUID(), fromPersonId: a.id, fromName: a.name, toPersonId: b.id, toName: b.name, amountCents: 100 })]
+            });
+          } catch (error) {
+            replaceRefusal = error.userMessage;
+          }
+          return { recorded, endCrew, replaceRefusal, payments: r.state.payments.length };
+        });
+        assert.equal(outcome.recorded, false);
+        assert.equal(outcome.endCrew, false);
+        assert.equal(outcome.payments, 0);
+        assert.equal(
+          outcome.replaceRefusal,
+          `This data includes crew balance records (payments, drink costs, write-off authors or an ended crew night). ${CREW_BALANCE_SQL_MESSAGE}`
+        );
+        const toasts = await session.toasts();
+        assert.ok(toasts.includes(CREW_BALANCE_SQL_MESSAGE), "the payment refusal names crew-balance.sql");
+        assert.ok(toasts.includes(HOST_MODE_SQL_MESSAGE), "ending a crew night without host mode names host-mode.sql");
+        assert.ok(!toasts.some((text) => /Save failed/.test(text)), `no failed save, saw: ${toasts.join(" | ")}`);
+        assert.deepEqual(served400, [], "no payload or read named a crew-balance column");
+        assert.deepEqual(unexpected, [], "no function call, payments write or delete was sent");
+        assert.ok(!writes.some((write) => write.table === "rnmb_payments"));
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Crew U3 host-mode database without crew-balance.sql: payments 404 or missing pour cost columns turn crew balances off; ending a host night uses rnmb_end_host_night and a write-off sends no author",
+    async run({ browser }) {
+      const CREW_BALANCE_SQL_MESSAGE = "Crew balances are not set up on the shared database yet. Run supabase/crew-balance.sql in Supabase, then reload.";
+      const { ids, seed } = hostModeSeed();
+      const stub = hostModeStub(seed, { crewBalance: false });
+      stub.rpc.rnmb_open_tab = (payload) => {
+        stub.store.rnmb_guest_tabs.push({ id: payload.id, night_id: payload.night_id, guest_name: payload.guest_name, status: "open", opened_at: payload.opened_at });
+        return payload.id;
+      };
+      stub.rpc.rnmb_close_tab = (payload) => {
+        Object.assign(stub.store.rnmb_guest_tabs.find((tab) => tab.id === payload.id), { status: payload.status, closed_at: new Date().toISOString() });
+        return payload.id;
+      };
+      stub.rpc.rnmb_end_host_night = (payload) => {
+        stub.store.rnmb_nights.find((night) => night.id === payload.id).ended_at = new Date().toISOString();
+        return payload.id;
+      };
+      const payments404 = (message) => resourceStatusError(message, 404, (url) => url.includes("/rest/v1/rnmb_payments?"));
+      const session = await openPage(browser, { routes: stub.routes, allowConsole: payments404 });
+      const { page } = session;
+      try {
+        await session.waitForToast("Connected to Supabase.");
+        assert.deepEqual(await page.evaluate(() => [window.__rnmb.hostModeAvailable, window.__rnmb.crewBalanceAvailable]), [true, false]);
+        const outcome = await page.evaluate(async ({ crewNightId }) => {
+          const r = window.__rnmb;
+          const sam = r.state.people[0].id;
+          const nightId = crypto.randomUUID();
+          const tabId = crypto.randomUUID();
+          const steps = [];
+          steps.push(await r.hostAction("Host night started.", (db) => db.startHostNight({ id: nightId, name: "Party" })));
+          steps.push(await r.hostAction("Tab opened.", (db) => db.openTab({ id: tabId, nightId, guestName: "Riley" })));
+          steps.push(await r.hostAction("Written off.", (db) => db.closeTab({ id: tabId, status: "written_off", writtenOffBy: sam })));
+          const tab = r.state.guestTabs.find((entry) => entry.id === tabId);
+          steps.push(await r.hostAction("Host night ended.", (db) => db.endNight(nightId)));
+          const endCrew = await r.hostAction("Night ended.", (db) => db.endNight(crewNightId));
+          const recorded = await r.hostAction("Payment recorded.", (db) => db.recordPayment({ id: crypto.randomUUID(), fromPersonId: sam, toPersonId: sam, amountCents: 1 }));
+          return {
+            steps, endCrew, recorded,
+            tab: [tab.status, tab.writtenOffBy, tab.writtenOffByName],
+            hostEnded: Boolean(r.state.nights.find((night) => night.id === nightId).endedAt)
+          };
+        }, { crewNightId: ids.nightOne });
+        assert.deepEqual(outcome.steps, [true, true, true, true]);
+        assert.deepEqual(outcome.tab, ["written_off", null, null], "no author is kept where the database has no column for it");
+        assert.equal(outcome.hostEnded, true);
+        assert.equal(outcome.endCrew, false, "a crew night cannot end before crew-balance.sql");
+        assert.equal(outcome.recorded, false);
+        const rpcCalls = stub.log.filter((entry) => entry.path.startsWith("rpc/"));
+        assert.deepEqual(rpcCalls.map((entry) => entry.path), ["rpc/rnmb_start_host_night", "rpc/rnmb_open_tab", "rpc/rnmb_close_tab", "rpc/rnmb_end_host_night"]);
+        assert.deepEqual(Object.keys(rpcCalls[2].body.payload).sort(), ["id", "status"], "the write-off sends no author");
+        const toasts = await session.toasts();
+        assert.equal(toasts.filter((text) => text === CREW_BALANCE_SQL_MESSAGE).length, 2, "the crew night end and the payment name crew-balance.sql");
+        assert.deepEqual(stub.unexpected, []);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+
+      // Payments present but rnmb_pours lacks the cost columns: still off.
+      const partial = hostModeStub(hostModeSeed().seed, { pourCostColumns: false });
+      const probe400 = (message) => resourceStatusError(message, 400, (url) => url.includes("/rest/v1/rnmb_pours?select=cost_cents"));
+      const second = await openPage(browser, { routes: partial.routes, allowConsole: probe400 });
+      try {
+        await second.waitForToast("Connected to Supabase.");
+        assert.deepEqual(await second.page.evaluate(() => [window.__rnmb.hostModeAvailable, window.__rnmb.crewBalanceAvailable]), [true, false]);
+        assert.deepEqual(partial.unexpected, []);
+        second.assertClean();
+      } finally {
+        await second.close();
+      }
+    }
+  },
+
+  {
+    name: "Crew U3 migrated database: payments, pour costs and write-off authors load into state; record, void and end-night call the new functions; replacing the data rewrites payments around people",
+    async run({ browser }) {
+      const { ids, seed } = hostModeSeed();
+      const alex = "99999999-9999-4999-8999-999999999999";
+      const bottle = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const hostNight = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      const payment = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+      seed.rnmb_people.push({ id: alex, name: "Alex", color: "#f97316" });
+      seed.rnmb_bottles = [{ id: bottle, type_id: ids.rum, nickname: "Sam's rum", size_oz: 25, remaining_oz: 23, price: 40, buyer_id: ids.sam, purchase_date: "2026-09-15" }];
+      seed.rnmb_pours = [{
+        id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", night_id: ids.nightOne, person_id: alex, bottle_id: bottle, ounces: 2, abv_snapshot: 40,
+        poured_at: "2026-09-15T21:00:00Z", cost_cents: 320, buyer_id: ids.sam, buyer_name: "Sam"
+      }];
+      seed.rnmb_nights.push({ id: hostNight, name: "Old party", date: "2026-09-10", kind: "host", ended_at: "2026-09-11T03:00:00Z" });
+      seed.rnmb_guest_tabs = [{
+        id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", night_id: hostNight, guest_name: "Quinn", status: "written_off", collector_id: null, collector_name: null,
+        amount_cents: null, written_off_by: alex, written_off_by_name: "Alex", opened_at: "2026-09-10T20:00:00Z", closed_at: "2026-09-11T01:00:00Z"
+      }];
+      seed.rnmb_payments = [{
+        id: payment, from_person_id: ids.sam, from_name: "Sam", to_person_id: alex, to_name: "Alex", amount_cents: 500, paid_at: "2026-09-12T12:00:00Z", voided_at: null
+      }];
+      const stub = hostModeStub(seed);
+      const personName = (id) => stub.store.rnmb_people.find((person) => person.id === id).name;
+      stub.rpc.rnmb_record_payment = (p) => {
+        stub.store.rnmb_payments.push({ id: p.id, from_person_id: p.from_person_id, from_name: personName(p.from_person_id), to_person_id: p.to_person_id, to_name: personName(p.to_person_id), amount_cents: p.amount_cents, paid_at: new Date().toISOString(), voided_at: null });
+        return p.id;
+      };
+      stub.rpc.rnmb_void_payment = (p) => {
+        stub.store.rnmb_payments.find((row) => row.id === p.id).voided_at = new Date().toISOString();
+        return p.id;
+      };
+      stub.rpc.rnmb_end_night = (p) => {
+        stub.store.rnmb_nights.find((night) => night.id === p.id).ended_at = new Date().toISOString();
+        return p.id;
+      };
+      const session = await openPage(browser, { routes: stub.routes });
+      const { page } = session;
+      try {
+        await session.waitForToast("Connected to Supabase.");
+        const loaded = await page.evaluate(({ nightOne }) => {
+          const r = window.__rnmb;
+          return {
+            flags: [r.hostModeAvailable, r.crewBalanceAvailable],
+            payments: r.state.payments,
+            pour: r.state.nights.find((night) => night.id === nightOne).pours[0],
+            tab: r.state.guestTabs[0],
+            cents: Object.fromEntries(r.crewBalances().map((entry) => [entry.name, entry.cents]))
+          };
+        }, { nightOne: ids.nightOne });
+        assert.deepEqual(loaded.flags, [true, true]);
+        assert.deepEqual(loaded.payments, [{ id: payment, fromPersonId: ids.sam, fromName: "Sam", toPersonId: alex, toName: "Alex", amountCents: 500, paidAt: "2026-09-12T12:00:00Z", voidedAt: null }]);
+        assert.deepEqual([loaded.pour.costCents, loaded.pour.buyerId, loaded.pour.buyerName], [320, ids.sam, "Sam"]);
+        assert.deepEqual([loaded.tab.writtenOffBy, loaded.tab.writtenOffByName], [alex, "Alex"]);
+        assert.deepEqual(loaded.cents, { Sam: 820, Alex: -820 }, "Sam paid Alex $5.00 and Alex drank $3.20 of Sam's rum");
+
+        const logStart = stub.log.length;
+        const actions = await page.evaluate(async ({ sam, alex, nightOne }) => {
+          const r = window.__rnmb;
+          const cents = () => Object.fromEntries(r.crewBalances().map((entry) => [entry.name, entry.cents]));
+          const id = crypto.randomUUID();
+          const recorded = await r.hostAction("Payment recorded.", (db) => db.recordPayment({ id, fromPersonId: alex, toPersonId: sam, amountCents: 820 }));
+          const settled = cents();
+          const voided = await r.hostAction("Payment voided.", (db) => db.voidPayment(id));
+          const unsettled = cents();
+          const ended = await r.hostAction("Night ended.", (db) => db.endNight(nightOne));
+          return { id, recorded, settled, voided, unsettled, ended, endedAt: r.state.nights.find((night) => night.id === nightOne).endedAt };
+        }, { sam: ids.sam, alex, nightOne: ids.nightOne });
+        assert.deepEqual([actions.recorded, actions.voided, actions.ended], [true, true, true]);
+        assert.deepEqual(actions.settled, { Sam: 0, Alex: 0 });
+        assert.deepEqual(actions.unsettled, { Sam: 820, Alex: -820 });
+        assert.ok(actions.endedAt, "the crew night ended");
+        const calls = stub.log.slice(logStart);
+        assert.deepEqual(calls.map((entry) => entry.path), ["rpc/rnmb_record_payment", "rpc/rnmb_void_payment", "rpc/rnmb_end_night"]);
+        assert.deepEqual(calls[0].body.payload, { id: actions.id, from_person_id: alex, to_person_id: ids.sam, amount_cents: 820 });
+        assert.deepEqual(calls[1].body.payload, { id: actions.id });
+        assert.deepEqual(calls[2].body.payload, { id: ids.nightOne });
+
+        const replaceStart = stub.log.length;
+        await page.evaluate(() => window.__rnmb.repository.saveAll(window.__rnmb.state));
+        const replace = stub.log.slice(replaceStart).map((entry) => ({ ...entry, key: `${entry.method} ${entry.path}` }));
+        const at = (key) => replace.findIndex((entry) => entry.key === key);
+        assert.ok(at("DELETE rnmb_payments") >= 0 && at("DELETE rnmb_payments") < at("DELETE rnmb_people"), "payments are deleted before people");
+        assert.ok(at("POST rnmb_payments") > at("POST rnmb_people"), "payments are inserted after people");
+        const paymentRows = replace[at("POST rnmb_payments")].body;
+        assert.equal(paymentRows.length, 2, "both payments, the voided one included, are written back");
+        assert.deepEqual(Object.keys(paymentRows[0]), ["id", "from_person_id", "from_name", "to_person_id", "to_name", "amount_cents", "paid_at", "voided_at"]);
+        const pourRow = replace[at("POST rnmb_pours")].body[0];
+        assert.deepEqual([pourRow.cost_cents, pourRow.buyer_id, pourRow.buyer_name], [320, ids.sam, "Sam"]);
+        const tabRow = replace[at("POST rnmb_guest_tabs")].body[0];
+        assert.deepEqual([tabRow.written_off_by, tabRow.written_off_by_name], [alex, "Alex"]);
+        assert.equal(stub.store.rnmb_payments.length, 2);
+        assert.deepEqual(stub.unexpected, []);
         session.assertClean();
       } finally {
         await session.close();
