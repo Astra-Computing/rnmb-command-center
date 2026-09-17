@@ -325,6 +325,75 @@ async function addTwoTequilas(session) {
   return { tequila, sams, alexs };
 }
 
+// ---------- U7 close-out helpers ---------------------------------------------------------
+
+const REGISTER_CLOSED_MESSAGE = "No host night is running. Start one from Tonight on the dashboard, then open the register.";
+const hostNightCard = (page, name) => page.locator("#hostNightList .host-night-card", { hasText: name });
+const squash = (text) => text.replace(/\s+/g, " ").trim();
+const personIdOf = (page, name) => page.evaluate((personName) => window.__rnmb.state.people.find((person) => person.name === personName).id, name);
+const tabOf = (page, guestName) => page.evaluate((name) => window.__rnmb.state.guestTabs.find((tab) => tab.guestName === name), guestName);
+
+/** Ring up a menu item to a guest's open tab from the register. */
+async function ringUpToTab(session, itemName, guestName) {
+  const { page } = session;
+  await registerItem(page, itemName).click();
+  await registerTab(page, guestName).click();
+  await clickForToast(session, "#registerConfirm", `${itemName} rung up to ${guestName}.`);
+}
+
+/** Close a tab as paid from its register card; returns the confirm text. */
+async function payTabViaRegister(session, guestName, collectorName) {
+  const { page } = session;
+  const card = tabCard(page, guestName);
+  const tabId = await card.getAttribute("data-tab-id");
+  const total = (await card.locator("[data-tab-total]").textContent()).trim();
+  await card.locator("select[name='collectorId']").selectOption(await personIdOf(page, collectorName));
+  let dialogMessage = "";
+  page.once("dialog", (dialog) => { dialogMessage = dialog.message(); });
+  await clickForToast(session, `#registerTabList [data-pay-tab="${tabId}"]`, `${guestName}'s tab paid: ${total} collected by ${collectorName}.`);
+  return dialogMessage;
+}
+
+/** Write a tab off from its register card; returns the confirm text. */
+async function writeOffTabViaRegister(session, guestName) {
+  const { page } = session;
+  const tabId = await tabCard(page, guestName).getAttribute("data-tab-id");
+  let dialogMessage = "";
+  page.once("dialog", (dialog) => { dialogMessage = dialog.message(); });
+  await clickForToast(session, `#registerTabList [data-write-off-tab="${tabId}"]`, `${guestName}'s tab written off.`);
+  return dialogMessage;
+}
+
+/** The buyer lines under a collector (or under the write-off) in a host night's Ledger card, whitespace squashed. */
+async function hostNightRows(page, nightName, groupSelector) {
+  return (await hostNightCard(page, nightName).locator(`${groupSelector} li`).allTextContents()).map(squash);
+}
+
+/** The AE1 margarita at 50% markup and $0.50 rounding. */
+async function addAe1Margarita(session) {
+  const types = await addAe1Stock(session);
+  await setPricingViaForm(session, { markupPercent: 50, increment: "0.50" });
+  await saveMenuItemAndLevels(session.page, {
+    menuItem: {
+      name: "Margarita",
+      kind: "cocktail",
+      ingredients: [
+        { typeId: types.tequila.id, amount: 2 },
+        { typeId: types.tripleSec.id, amount: 1 },
+        { typeId: types.lime.id, amount: 1 }
+      ]
+    }
+  });
+  return types;
+}
+
+/** Leave the register for a dashboard tab. */
+async function exitRegisterTo(page, tab) {
+  await page.click("#exitRegister");
+  await page.waitForSelector(".app-shell", { state: "visible" });
+  await page.click(`.tab-button[data-tab="${tab}"]`);
+}
+
 const scenarios = [
   {
     name: "U3 local boot with no /api/config, Reload demo, Export carries every host-mode collection",
@@ -1648,6 +1717,343 @@ const scenarios = [
           assert.ok(checked.length >= 25, `checked ${checked.length} controls`);
           const widths = await page.evaluate(() => ({ scroll: document.documentElement.scrollWidth, client: document.documentElement.clientWidth }));
           assert.ok(widths.scroll <= widths.client, `no horizontal scroll at ${viewport.width}px (scrollWidth ${widths.scroll} > ${widths.client})`);
+          session.assertClean();
+        } finally {
+          await session.close();
+        }
+      }
+    }
+  },
+
+  {
+    name: "U7 AE6 ending the night with open tabs is refused and names those guests; after closing them it ends and the register shows closed",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const { night } = await startHostNightViaForm(session, "Porch party");
+        await openRegister(session);
+        await openTabViaRegister(session, "Riley");
+        await ringUpToTab(session, "Bourbon Neat", "Riley");
+        await openTabViaRegister(session, "Sky");
+
+        // Paid needs a collector first; nothing closes without one.
+        const rileyId = await tabCard(page, "Riley").getAttribute("data-tab-id");
+        await clickForToast(session, `#registerTabList [data-pay-tab="${rileyId}"]`, "Pick who collected the money for Riley's tab.");
+        assert.equal((await tabOf(page, "Riley")).status, "open");
+        assert.match(squash(await tabCard(page, "Riley").locator("[data-pay-tab]").textContent()), /^Paid \$3\.00$/, "Paid shows the tab total");
+
+        await clickForToast(session, "#registerEndNight", "Close every tab before ending the night. Still open: Riley, Sky.");
+        assert.equal(await page.evaluate((id) => window.__rnmb.state.nights.find((entry) => entry.id === id).endedAt, night.id), null, "the night is still running");
+        assert.equal(await page.isVisible("#registerWork"), true);
+        assert.equal(squash(await hostNightCard(page, "Porch party").locator("[data-host-night-status]").textContent()), "Running · 2 open tabs");
+
+        const writeOffText = await writeOffTabViaRegister(session, "Sky");
+        assert.match(writeOffText, /Write off Sky's tab \(\$0\.00\)\?/);
+        assert.equal(await tabCard(page, "Sky").count(), 0, "a closed tab leaves the open list");
+        assert.equal((await tabOf(page, "Sky")).status, "written_off");
+        await clickForToast(session, "#registerEndNight", "Close every tab before ending the night. Still open: Riley.");
+        assert.equal(await page.evaluate((id) => window.__rnmb.state.nights.find((entry) => entry.id === id).endedAt, night.id), null);
+
+        const payText = await payTabViaRegister(session, "Riley", "Casey");
+        assert.equal(payText, "Close Riley's tab as paid: $3.00 collected by Casey?");
+        assert.equal(await tabCard(page, "Riley").count(), 0);
+        const riley = await tabOf(page, "Riley");
+        assert.deepEqual({ status: riley.status, amountCents: riley.amountCents, collectorName: riley.collectorName }, { status: "paid", amountCents: 300, collectorName: "Casey" });
+        assert.match(await page.textContent("#registerTabList"), /No open tabs/);
+
+        let endText = "";
+        page.once("dialog", (dialog) => { endText = dialog.message(); });
+        await clickForToast(session, "#registerEndNight", "Porch party ended. Its summary is under Host nights in Ledger.");
+        assert.match(endText, /End "Porch party"\?/);
+        const ended = await page.evaluate((id) => window.__rnmb.state.nights.find((entry) => entry.id === id), night.id);
+        assert.ok(ended.endedAt, "the night has an ended time");
+        await page.waitForSelector("#registerClosed", { state: "visible" });
+        assert.equal(await page.isVisible("#registerWork"), false, "the register shows its closed state");
+        assert.equal((await page.textContent("#registerClosedMessage")).trim(), REGISTER_CLOSED_MESSAGE);
+        assert.equal(await page.isVisible("#registerLocalBanner"), true, "the banner stays on the closed register");
+        assert.equal(squash(await hostNightCard(page, "Porch party").locator("[data-host-night-status]").textContent()), "Ended");
+        assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem("rnmb-command-center-v1")).nights.find((entry) => entry.kind === "host").endedAt !== null), true, "stored");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U7 AE8 a paid and a written-off tab show the collector's money by buyer and the write-off by buyer; Settle Up reads exactly as before",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await page.click('.tab-button[data-tab="ledger"]');
+        const settleBefore = { lines: (await page.locator("#settleList .stack-item").allTextContents()).map(squash), html: await page.innerHTML("#settleList") };
+        assert.ok(settleBefore.lines.length >= 4, "demo Settle Up has a line per person");
+        assert.match(await page.textContent("#hostNightList"), /No host nights yet/);
+
+        await startHostNightViaForm(session, "Guest party");
+        await openRegister(session);
+        await openTabViaRegister(session, "Morgan");
+        await ringUpToTab(session, "Boilermaker", "Morgan");
+        await ringUpToTab(session, "Bourbon Neat", "Morgan");
+        await openTabViaRegister(session, "Riley");
+        await ringUpToTab(session, "Glass of Red", "Riley");
+        await payTabViaRegister(session, "Morgan", "Jordan");
+        const writeOffText = await writeOffTabViaRegister(session, "Riley");
+        assert.match(writeOffText, /Write off Riley's tab \(\$3\.75\)\?/);
+        await clickForToast(session, "#registerEndNight", "Guest party ended. Its summary is under Host nights in Ledger.");
+
+        await exitRegisterTo(page, "ledger");
+        assert.equal(await page.locator("#hostNightList .host-night-card").count(), 1, "only host nights are listed");
+        const card = hostNightCard(page, "Guest party");
+        assert.equal(squash(await card.locator("[data-host-night-status]").textContent()), "Ended");
+        assert.match(squash(await card.locator("header").textContent()), /2 of 2 tabs closed/);
+        // Boilermaker $4.00: bourbon (Alex) 206.96c and lager (Jordan) 187.5c of cost -> 210 / 190. Bourbon Neat $3.00 -> Alex.
+        assert.equal(squash(await card.locator('[data-collector="Jordan"] [data-collector-total]').textContent()), "$7.00");
+        assert.deepEqual(await hostNightRows(page, "Guest party", '[data-collector="Jordan"]'), ["for Alex $5.10", "for Jordan $1.90"]);
+        // Glass of Red $3.75 from Sam's red.
+        assert.equal(squash(await card.locator("[data-written-off-total]").textContent()), "$3.75");
+        assert.deepEqual(await hostNightRows(page, "Guest party", "[data-written-off-group]"), ["from Sam's stock $3.75"]);
+
+        const settleAfter = { lines: (await page.locator("#settleList .stack-item").allTextContents()).map(squash), html: await page.innerHTML("#settleList") };
+        assert.deepEqual(settleAfter.lines, settleBefore.lines, "every Settle Up line reads the same");
+        assert.equal(settleAfter.html, settleBefore.html, "Settle Up output is byte-identical");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U7 AE1 paying the margarita tab attributes $5.00 as Sam $3.61, Alex $1.20, Jordan $0.19 under the collector",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await addAe1Margarita(session);
+        await startHostNightViaForm(session, "Margarita night");
+        await openRegister(session);
+        await openTabViaRegister(session, "Quinn");
+        assert.match(await registerItem(page, "Margarita").textContent(), /\$5\.00/);
+        await ringUpToTab(session, "Margarita", "Quinn");
+        assert.equal((await tabCard(page, "Quinn").locator("[data-tab-total]").textContent()).trim(), "$5.00");
+        await payTabViaRegister(session, "Quinn", "Casey");
+        assert.equal((await tabOf(page, "Quinn")).amountCents, 500);
+
+        await exitRegisterTo(page, "ledger");
+        const card = hostNightCard(page, "Margarita night");
+        assert.equal(squash(await card.locator("[data-host-night-status]").textContent()), "Running · 0 open tabs", "not ended yet");
+        assert.equal(squash(await card.locator('[data-collector="Casey"] [data-collector-total]').textContent()), "$5.00");
+        assert.deepEqual(await hostNightRows(page, "Margarita night", '[data-collector="Casey"]'), ["for Sam $3.61", "for Alex $1.20", "for Jordan $0.19"]);
+        assert.match(squash(await card.locator("[data-written-off]").textContent()), /Nothing written off/);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U7 AE2 editing the tequila price and the markup after ring-up leaves the open tab total and the attribution unchanged",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await addAe1Margarita(session);
+        await startHostNightViaForm(session, "Price change night");
+        await openRegister(session);
+        await openTabViaRegister(session, "Quinn");
+        await ringUpToTab(session, "Margarita", "Quinn");
+
+        // The tequila's purchase price doubles (as a sync from another device would), and the markup drops to 0%.
+        await exitRegisterTo(page, "menu");
+        await page.evaluate(() => {
+          const r = window.__rnmb;
+          r.state.bottles.find((bottle) => bottle.nickname === "Sam's tequila").price = 60;
+          localStorage.setItem("rnmb-command-center-v1", JSON.stringify(r.state));
+          r.render();
+        });
+        await setPricingViaForm(session, { markupPercent: 0, increment: "0.50" });
+        // 2 oz of $60 tequila 473.2c + triple sec 78.9c + lime 12.5c = 564.6c -> $6.00 at 0%.
+        assert.equal((await menuCard(page, "Margarita").locator("[data-menu-price]").textContent()).trim(), "$6.00", "new ring-ups use the new figures");
+
+        await openRegister(session);
+        assert.match(await registerItem(page, "Margarita").textContent(), /\$6\.00/);
+        assert.equal((await tabCard(page, "Quinn").locator("[data-tab-total]").textContent()).trim(), "$5.00", "the open tab still shows $5.00");
+        assert.match(await registerTab(page, "Quinn").textContent(), /\$5\.00/);
+        assert.match(squash(await tabCard(page, "Quinn").locator("[data-pay-tab]").textContent()), /^Paid \$5\.00$/);
+        await payTabViaRegister(session, "Quinn", "Casey");
+        assert.equal((await tabOf(page, "Quinn")).amountCents, 500);
+
+        await exitRegisterTo(page, "ledger");
+        assert.deepEqual(await hostNightRows(page, "Price change night", '[data-collector="Casey"]'), ["for Sam $3.61", "for Alex $1.20", "for Jordan $0.19"], "the attribution is unchanged");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U7 a crew register shot raises Tonight, Overview, Recent Logs and Crew counts; guest and voided crew ring-ups add nothing",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await startHostNightViaForm(session, "Crew check night");
+        const figures = async () => {
+          await page.click('.tab-button[data-tab="tonight"]');
+          const casey = page.locator("#personConsumption .consumption-card", { hasText: "Casey" });
+          return {
+            casey: (await casey.count()) ? squash(await casey.locator(":scope > strong").textContent()) : null,
+            consumptionEmpty: /No pours logged for the active night/.test(await page.textContent("#personConsumption")),
+            timeline: squash(await page.textContent("#pourTimeline")),
+            consumed: (await page.textContent("#metricConsumed")).trim(),
+            recent: squash(await page.locator("#recentNights .stack-item", { hasText: "Crew check night" }).textContent()),
+            crew: squash(await page.locator("#personList .person-card", { hasText: "Casey" }).textContent()),
+            meta: squash(await page.textContent("#activeNightMeta"))
+          };
+        };
+        const before = await figures();
+        assert.equal(before.consumptionEmpty, true);
+        assert.equal(before.consumed, "0.0");
+        assert.match(before.recent, /0\.0 standard drinks/);
+        assert.match(before.crew, /· 0 pours/);
+
+        // A guest's Bourbon Neat is not crew consumption.
+        await openRegister(session);
+        await openTabViaRegister(session, "Riley");
+        await ringUpToTab(session, "Bourbon Neat", "Riley");
+        await exitRegisterTo(page, "tonight");
+        assert.deepEqual(await figures(), before, "a guest ring-up changes no crew figure");
+
+        // Casey's Bourbon Neat on the register: 2 oz at 45% = 1.5 standard drinks.
+        await openRegister(session);
+        await registerItem(page, "Bourbon Neat").click();
+        await registerCrew(page, "Casey").click();
+        await clickForToast(session, "#registerConfirm", "Bourbon Neat poured for Casey. No charge.");
+        await exitRegisterTo(page, "tonight");
+        const after = await figures();
+        assert.equal(after.consumptionEmpty, false);
+        assert.equal(after.casey, "1.5", "Casey's Tonight standard drinks");
+        assert.equal(after.consumed, "1.5", "Overview Tonight Consumed");
+        assert.match(after.recent, /1\.5 standard drinks/, "Recent Logs night total");
+        assert.match(after.crew, /· 1 pours/, "one register drink is one pour");
+        assert.match(after.meta, /1 pours logged/);
+        assert.match(after.timeline, /Casey had Bourbon Neat Bar register · 1\.5 standard drinks/);
+
+        // A second crew shot, voided, contributes nothing.
+        const second = await page.evaluate(async () => {
+          const r = window.__rnmb;
+          const night = r.state.nights.find((entry) => entry.kind === "host" && !entry.endedAt);
+          const casey = r.state.people.find((person) => person.name === "Casey");
+          const bottle = r.state.bottles.find((entry) => entry.nickname === "The Briefing Bottle");
+          const menuItem = r.state.menuItems.find((item) => item.name === "Bourbon Neat");
+          const record = r.buildRingUp({ nightId: night.id, kind: "crew", personId: casey.id, menuItemId: menuItem.id, sources: [{ bottleId: bottle.id, amount: 2 }] });
+          const rung = await r.hostAction("", (db) => db.ringUp(record));
+          return { id: record.id, rung };
+        });
+        assert.equal(second.rung, true);
+        assert.equal((await figures()).casey, "3.0", "the second shot counts while it stands");
+        assert.equal(await page.evaluate((id) => window.__rnmb.hostAction("", (db) => db.voidRingUp(id)), second.id), true);
+        assert.deepEqual(await figures(), after, "a voided crew ring-up contributes nothing");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U7 a voided guest item contributes nothing to the tab total, the amount collected or the summary",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await startHostNightViaForm(session, "Void night");
+        await openRegister(session);
+        await openTabViaRegister(session, "Riley");
+        await ringUpToTab(session, "Bourbon Neat", "Riley");
+        await ringUpToTab(session, "Boilermaker", "Riley");
+        await openTabViaRegister(session, "Sky");
+        await ringUpToTab(session, "Glass of Red", "Sky");
+
+        const voidItem = async (name) => {
+          const id = await page.evaluate((itemName) => window.__rnmb.state.ringUps.find((ringUp) => ringUp.menuItemName === itemName).id, name);
+          await clickForToast(session, `#registerTabList [data-void-ring-up="${id}"]`, "Item voided and its stock restored.");
+        };
+        await voidItem("Boilermaker");
+        await voidItem("Glass of Red");
+        assert.equal((await tabCard(page, "Riley").locator("[data-tab-total]").textContent()).trim(), "$3.00");
+        await payTabViaRegister(session, "Riley", "Jordan");
+        assert.equal((await tabOf(page, "Riley")).amountCents, 300, "the voided Boilermaker is not collected");
+        await writeOffTabViaRegister(session, "Sky");
+
+        await exitRegisterTo(page, "ledger");
+        assert.equal(squash(await hostNightCard(page, "Void night").locator('[data-collector="Jordan"] [data-collector-total]').textContent()), "$3.00");
+        assert.deepEqual(await hostNightRows(page, "Void night", '[data-collector="Jordan"]'), ["for Alex $3.00"], "no lager share from the voided Boilermaker");
+        assert.match(squash(await hostNightCard(page, "Void night").locator("[data-written-off]").textContent()), /Nothing written off/, "the voided red is worth nothing written off");
+        assert.equal(await hostNightCard(page, "Void night").locator("[data-written-off-group]").count(), 0);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "U7 close-out, end-night and Host nights controls have non-zero bounding boxes at 1440 and 400 widths, with no horizontal scroll",
+    async run({ browser }) {
+      for (const viewport of [{ width: 1440, height: 1000 }, { width: 400, height: 900 }]) {
+        const session = await openPage(browser, { allowConsole: apiConfig404, viewport });
+        const { page } = session;
+        try {
+          const checked = [];
+          const check = async (selector) => {
+            const count = await page.locator(selector).count();
+            assert.ok(count > 0, `${selector} is present at ${viewport.width}px`);
+            for (let index = 0; index < count; index += 1) {
+              const locator = page.locator(selector).nth(index);
+              await locator.scrollIntoViewIfNeeded();
+              const box = await locator.boundingBox();
+              assert.ok(box && box.width > 0 && box.height > 0, `${selector} #${index} has a non-zero box at ${viewport.width}px (got ${JSON.stringify(box)})`);
+              checked.push(selector);
+            }
+          };
+          const noHorizontalScroll = async (where) => {
+            const widths = await page.evaluate(() => ({ scroll: document.documentElement.scrollWidth, client: document.documentElement.clientWidth }));
+            assert.ok(widths.scroll <= widths.client, `no horizontal scroll on ${where} at ${viewport.width}px (scrollWidth ${widths.scroll} > ${widths.client})`);
+          };
+
+          await startHostNightViaForm(session, "A host night with a rather long name for narrow screens");
+          await openRegister(session);
+          await openTabViaRegister(session, "Riley Montgomery-Fitzgerald");
+          await ringUpToTab(session, "Boilermaker", "Riley Montgomery-Fitzgerald");
+          await openTabViaRegister(session, "Sky");
+          await ringUpToTab(session, "Glass of Red", "Sky");
+          for (const selector of ["#registerEndNight", "#registerTabList select[name='collectorId']", "#registerTabList [data-pay-tab]", "#registerTabList [data-write-off-tab]"]) {
+            await check(selector);
+          }
+          await noHorizontalScroll("the register");
+
+          await payTabViaRegister(session, "Riley Montgomery-Fitzgerald", "Jordan");
+          await writeOffTabViaRegister(session, "Sky");
+          await exitRegisterTo(page, "ledger");
+          for (const selector of [
+            "#hostNightList .host-night-card",
+            "#hostNightList [data-host-night-status]",
+            "#hostNightList [data-collector] [data-collector-total]",
+            "#hostNightList [data-collector] li",
+            "#hostNightList [data-written-off-total]",
+            "#hostNightList [data-written-off-group] li",
+            "#settleList .stack-item"
+          ]) {
+            await check(selector);
+          }
+          assert.ok(checked.length >= 13, `checked ${checked.length} elements`);
+          await noHorizontalScroll("Ledger");
           session.assertClean();
         } finally {
           await session.close();
