@@ -317,7 +317,7 @@ do $$
 declare
   v_err text;
 begin
-  perform public.rnmb_close_tab('{"id": "60000000-0000-4000-8000-000000000002", "status": "written_off"}'::jsonb);
+  perform public.rnmb_close_tab('{"id": "60000000-0000-4000-8000-000000000002", "status": "written_off", "written_off_by": "10000000-0000-4000-8000-000000000001"}'::jsonb);
   if not exists (
     select 1 from public.rnmb_guest_tabs
      where id = '60000000-0000-4000-8000-000000000002' and status = 'written_off' and closed_at is not null
@@ -834,7 +834,7 @@ begin
     raise exception 'CHECK FAILED (end with open tab): the night was ended anyway.';
   end if;
 
-  perform public.rnmb_close_tab('{"id": "60000000-0000-4000-8000-000000000003", "status": "written_off"}'::jsonb);
+  perform public.rnmb_close_tab('{"id": "60000000-0000-4000-8000-000000000003", "status": "written_off", "written_off_by": "10000000-0000-4000-8000-000000000001"}'::jsonb);
   perform public.rnmb_end_host_night('{"id": "50000000-0000-4000-8000-000000000001"}'::jsonb);
   if not exists (select 1 from public.rnmb_nights where id = '50000000-0000-4000-8000-000000000001' and ended_at is not null) then
     raise exception 'CHECK FAILED (end night): ended_at was not set after the last tab closed.';

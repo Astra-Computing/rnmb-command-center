@@ -1,203 +1,126 @@
-create extension if not exists pgcrypto;
+-- RNMB Command Center — crew running balance: drink costs, payments between
+-- crew members, who wrote a tab off, and crew nights that can end.
+--
+-- Run this once in the Supabase SQL editor (Dashboard → SQL Editor → New query),
+-- BEFORE deploying the version of the dashboard that shows crew balances. It is
+-- safe to re-run: every statement either checks whether its object already
+-- exists or replaces it, and no existing row is deleted or changed.
+--
+-- It needs NO edits. There is no passphrase in this file; every new table and
+-- function reuses the passphrase you already set, through rnmb_authorized().
+-- Run rls-passphrase.sql and host-mode.sql first if you never have.
+--
+-- Afterwards, run supabase/checks/crew-balance-checks.sql to prove it works.
+-- That script changes nothing: it rolls everything back at the end.
+--
+-- If you ever re-run host-mode.sql after this file, run this file again right
+-- after it: host-mode.sql puts back the older night rules and functions that
+-- this file replaces.
+--
+-- What it adds:
+--   * Crew pours learn what they cost, in whole cents, and whose bottle they
+--     came from. Both are fixed when the pour is logged, so editing a bottle's
+--     price later never rewrites an old balance. Pours logged before this file
+--     ran have no cost (the column stays empty for them).
+--   * A payments table: one crew member paying another back. A payment is
+--     never deleted; a mistake is voided, which keeps it in the history.
+--   * Guest tabs learn which crew member wrote them off. A write-off now needs
+--     that person.
+--   * Crew nights can end, like host nights. An ended crew night still takes
+--     crew drinks and voids, so a missed drink can be added afterwards; an
+--     ended host night stays locked.
+--   * Crew drinks can be rung up from a menu item on a crew night (open or
+--     ended) as well as on a running host night. Guest drinks stay host-only.
 
--- Fresh projects only: this file creates every table at its current shape. A
--- database created from an older copy of this file is brought up to date by
--- supabase/rls-passphrase.sql, supabase/host-mode.sql and
--- supabase/crew-balance.sql (run in that order) instead, and those three files
--- must end at the same result as this one.
+-- 0. Refuse to run before the passphrase gate and host mode exist, with a
+--    readable reason.
+do $$
+begin
+  if to_regprocedure('public.rnmb_authorized()') is null then
+    raise exception 'Run supabase/rls-passphrase.sql before supabase/crew-balance.sql: rnmb_authorized() does not exist yet.';
+  end if;
+  if to_regclass('public.rnmb_ring_ups') is null
+     or to_regclass('public.rnmb_guest_tabs') is null
+     or to_regprocedure('public.rnmb_ring_up(jsonb)') is null then
+    raise exception 'Run supabase/host-mode.sql before supabase/crew-balance.sql: the host mode tables and functions do not exist yet.';
+  end if;
+end;
+$$;
 
-create table if not exists public.rnmb_people (
-  id uuid primary key default gen_random_uuid(),
-  name text not null check (char_length(trim(name)) > 0),
-  color text not null default '#ef4444',
-  created_at timestamptz not null default now()
-);
+-- 1. Crew pours: cost in whole cents and a buyer snapshot.
+--    Columns are added without inline checks or references, and each
+--    constraint is dropped and re-added by name, so a second run never stacks
+--    duplicate constraints. The foreign key names are the ones Postgres gives
+--    the inline references in schema.sql.
+alter table public.rnmb_pours add column if not exists cost_cents integer;
+alter table public.rnmb_pours add column if not exists buyer_id uuid;
+alter table public.rnmb_pours add column if not exists buyer_name text;
 
-create table if not exists public.rnmb_beverage_types (
-  id uuid primary key default gen_random_uuid(),
-  name text not null check (char_length(trim(name)) > 0),
-  category text not null,
-  abv numeric(5, 2) not null check (abv >= 0 and abv <= 95),
-  created_at timestamptz not null default now(),
-  measure text not null default 'oz',
-  unit_oz numeric(8, 2),
-  constraint rnmb_beverage_types_measure check (measure in ('oz', 'unit')),
-  constraint rnmb_beverage_types_unit_volume
-    check ((unit_oz is null or unit_oz > 0) and (measure = 'oz' or unit_oz is not null))
-);
+alter table public.rnmb_pours drop constraint if exists rnmb_pours_buyer_id_fkey;
+alter table public.rnmb_pours add constraint rnmb_pours_buyer_id_fkey
+  foreign key (buyer_id) references public.rnmb_people(id) on delete set null;
+alter table public.rnmb_pours drop constraint if exists rnmb_pours_cost_cents;
+alter table public.rnmb_pours add constraint rnmb_pours_cost_cents
+  check (cost_cents is null or cost_cents >= 0);
 
-create table if not exists public.rnmb_nights (
-  id uuid primary key default gen_random_uuid(),
-  name text not null check (char_length(trim(name)) > 0),
-  date date not null,
-  created_at timestamptz not null default now(),
-  kind text not null default 'crew',
-  ended_at timestamptz,
-  constraint rnmb_nights_kind check (kind in ('crew', 'host'))
-);
-
--- A partial unique index: every open host night has the same value in the
--- indexed column, so a second open host night would be a duplicate.
-create unique index if not exists rnmb_nights_one_open_host
-  on public.rnmb_nights (kind)
-  where kind = 'host' and ended_at is null;
-
-create table if not exists public.rnmb_bottles (
-  id uuid primary key default gen_random_uuid(),
-  type_id uuid not null references public.rnmb_beverage_types(id) on delete cascade,
-  nickname text,
-  size_oz numeric(8, 2) not null check (size_oz > 0),
-  remaining_oz numeric(8, 2) not null check (remaining_oz >= 0),
-  price numeric(10, 2) not null default 0 check (price >= 0),
-  buyer_id uuid references public.rnmb_people(id) on delete set null,
-  purchase_date date not null,
-  created_at timestamptz not null default now(),
-  check (remaining_oz <= size_oz)
-);
-
-create table if not exists public.rnmb_pours (
-  id uuid primary key default gen_random_uuid(),
-  night_id uuid not null references public.rnmb_nights(id) on delete cascade,
-  person_id uuid not null references public.rnmb_people(id) on delete cascade,
-  bottle_id uuid not null references public.rnmb_bottles(id) on delete cascade,
-  ounces numeric(8, 2) not null check (ounces > 0),
-  abv_snapshot numeric(5, 2) not null check (abv_snapshot > 0 and abv_snapshot <= 95),
-  poured_at timestamptz not null default now(),
-  cost_cents integer,
-  buyer_id uuid references public.rnmb_people(id) on delete set null,
-  buyer_name text,
-  constraint rnmb_pours_cost_cents check (cost_cents is null or cost_cents >= 0)
-);
-
-create table if not exists public.rnmb_settings (
-  id boolean primary key default true,
-  active_night_id uuid references public.rnmb_nights(id) on delete set null,
-  responsible_mode boolean not null default true,
-  updated_at timestamptz not null default now(),
-  markup_percent numeric(6, 2) not null default 0,
-  rounding_increment_cents integer not null default 25,
-  constraint rnmb_settings_singleton check (id),
-  constraint rnmb_settings_markup_percent check (markup_percent >= 0),
-  constraint rnmb_settings_rounding_increment_cents check (rounding_increment_cents > 0)
-);
-
-comment on column public.rnmb_beverage_types.measure is
-  'oz = poured stock tracked in ounces; unit = counted stock tracked in whole units (cans, bottled drinks).';
-comment on column public.rnmb_beverage_types.unit_oz is
-  'Fluid ounces in one unit of a counted type, so standard drinks can still be computed. Required when measure = unit; ignored for poured types.';
-
--- The bottle and pour columns keep their original names so an older client and
--- a newer database (or the reverse) still agree during a deploy. The amounts in
--- them are in the type's measure.
-comment on column public.rnmb_bottles.size_oz is
-  'Full size of the stock item in its type''s measure: ounces for poured types, whole units for counted types.';
-comment on column public.rnmb_bottles.remaining_oz is
-  'Amount left in the stock item, in its type''s measure: ounces for poured types, whole units for counted types.';
-comment on column public.rnmb_pours.ounces is
-  'Amount of the crew pour in its type''s measure: ounces for poured types, whole units for counted types.';
 comment on column public.rnmb_pours.cost_cents is
   'What the pour drew, in whole cents (purchase price / size x amount, rounded half-up), fixed when logged. Null on pours logged before costs were recorded.';
 comment on column public.rnmb_pours.buyer_id is
   'Who bought the stock item the pour came from, fixed when logged.';
 comment on column public.rnmb_pours.buyer_name is
   'The buyer''s name when the pour was logged, kept after that person is removed.';
-comment on column public.rnmb_settings.rounding_increment_cents is
-  'Drink prices are rounded UP to a multiple of this many cents (25 = $0.25).';
 
--- Host mode tables (as supabase/host-mode.sql creates them, with the changes
--- supabase/crew-balance.sql makes).
---    Money is whole cents. Money history is never deleted: a stock item that a
---    ring-up drew from cannot be deleted (on delete restrict), and removing a
---    person keeps their name on past records through a name snapshot column
---    beside each person reference (on delete set null).
-create table if not exists public.rnmb_menu_items (
-  id uuid primary key default gen_random_uuid(),
-  name text not null check (char_length(trim(name)) > 0),
-  kind text not null check (kind in ('cocktail', 'straight', 'counted')),
-  created_at timestamptz not null default now()
-);
+-- 2. Nights: a crew night may carry ended_at too. The kind check and the
+--    one-open-host-night index are unchanged.
+alter table public.rnmb_nights drop constraint if exists rnmb_nights_ended_host_only;
 
-create table if not exists public.rnmb_recipe_ingredients (
-  id uuid primary key default gen_random_uuid(),
-  menu_item_id uuid not null references public.rnmb_menu_items(id) on delete cascade,
-  type_id uuid not null references public.rnmb_beverage_types(id) on delete restrict,
-  amount numeric(8, 2) not null check (amount > 0),
-  line_no integer not null default 0,
-  created_at timestamptz not null default now()
-);
+-- 3. Guest tabs: who wrote the tab off.
+alter table public.rnmb_guest_tabs add column if not exists written_off_by uuid;
+alter table public.rnmb_guest_tabs add column if not exists written_off_by_name text;
 
-create table if not exists public.rnmb_guest_tabs (
-  id uuid primary key default gen_random_uuid(),
-  night_id uuid not null references public.rnmb_nights(id) on delete restrict,
-  guest_name text not null check (char_length(trim(guest_name)) > 0),
-  status text not null default 'open' check (status in ('open', 'paid', 'written_off')),
-  collector_id uuid references public.rnmb_people(id) on delete set null,
-  collector_name text,
-  amount_cents integer check (amount_cents is null or amount_cents >= 0),
-  opened_at timestamptz not null default now(),
-  closed_at timestamptz,
-  written_off_by uuid references public.rnmb_people(id) on delete set null,
-  written_off_by_name text,
-  -- collector_name and written_off_by_name, not the ids, carry the rule, so the
-  -- row stays valid after that crew member is removed.
-  constraint rnmb_guest_tabs_close_state check (
-    (status = 'open' and closed_at is null and collector_id is null
-      and collector_name is null and amount_cents is null
-      and written_off_by is null and written_off_by_name is null)
-    or (status = 'paid' and closed_at is not null
-      and collector_name is not null and amount_cents is not null
-      and written_off_by is null and written_off_by_name is null)
-    or (status = 'written_off' and closed_at is not null and collector_id is null
-      and collector_name is null and amount_cents is null
-      and written_off_by_name is not null)
-  )
-);
+alter table public.rnmb_guest_tabs drop constraint if exists rnmb_guest_tabs_written_off_by_fkey;
+alter table public.rnmb_guest_tabs add constraint rnmb_guest_tabs_written_off_by_fkey
+  foreign key (written_off_by) references public.rnmb_people(id) on delete set null;
 
-create table if not exists public.rnmb_ring_ups (
-  id uuid primary key default gen_random_uuid(),
-  night_id uuid not null references public.rnmb_nights(id) on delete restrict,
-  kind text not null check (kind in ('guest', 'crew')),
-  tab_id uuid references public.rnmb_guest_tabs(id) on delete restrict,
-  person_id uuid references public.rnmb_people(id) on delete set null,
-  person_name text,
-  menu_item_id uuid references public.rnmb_menu_items(id) on delete set null,
-  menu_item_name text not null,
-  price_cents integer check (price_cents is null or price_cents >= 0),
-  rung_at timestamptz not null default now(),
-  voided_at timestamptz,
-  -- kind fixes the target, and person_name (not person_id) carries it, so the
-  -- rule still holds after a crew member is removed.
-  constraint rnmb_ring_ups_target check (
-    (kind = 'guest' and tab_id is not null and price_cents is not null
-      and person_id is null and person_name is null)
-    or (kind = 'crew' and tab_id is null and person_name is not null and price_cents is null)
-  )
-);
+-- written_off_by_name, not written_off_by, carries the rule, so the row stays
+-- valid after that crew member is removed.
+-- The constraint is added NOT VALID so that tabs written off before this file
+-- ran (which have no author) do not stop it from running; every new or changed
+-- row is still checked. The block after it validates the constraint when no
+-- such older tab exists, which leaves the database exactly like schema.sql.
+alter table public.rnmb_guest_tabs drop constraint if exists rnmb_guest_tabs_close_state;
+alter table public.rnmb_guest_tabs add constraint rnmb_guest_tabs_close_state check (
+  (status = 'open' and closed_at is null and collector_id is null
+    and collector_name is null and amount_cents is null
+    and written_off_by is null and written_off_by_name is null)
+  or (status = 'paid' and closed_at is not null
+    and collector_name is not null and amount_cents is not null
+    and written_off_by is null and written_off_by_name is null)
+  or (status = 'written_off' and closed_at is not null and collector_id is null
+    and collector_name is null and amount_cents is null
+    and written_off_by_name is not null)
+) not valid;
 
-create table if not exists public.rnmb_ring_up_lines (
-  id uuid primary key default gen_random_uuid(),
-  ring_up_id uuid not null references public.rnmb_ring_ups(id) on delete cascade,
-  line_no integer not null default 0,
-  bottle_id uuid not null references public.rnmb_bottles(id) on delete restrict,
-  type_id uuid not null references public.rnmb_beverage_types(id) on delete restrict,
-  amount numeric(8, 2) not null check (amount > 0),
-  cost_cents numeric not null default 0 check (cost_cents >= 0),
-  share_cents integer check (share_cents is null or share_cents >= 0),
-  buyer_id uuid references public.rnmb_people(id) on delete set null,
-  buyer_name text,
-  abv_snapshot numeric(5, 2) not null check (abv_snapshot >= 0 and abv_snapshot <= 95)
-);
+do $$
+begin
+  if not exists (
+    select 1 from public.rnmb_guest_tabs
+     where status = 'written_off' and written_off_by_name is null
+  ) then
+    alter table public.rnmb_guest_tabs validate constraint rnmb_guest_tabs_close_state;
+  end if;
+end;
+$$;
 
-create table if not exists public.rnmb_stock_adjustments (
-  id uuid primary key default gen_random_uuid(),
-  bottle_id uuid not null references public.rnmb_bottles(id) on delete cascade,
-  previous_remaining numeric(8, 2) not null check (previous_remaining >= 0),
-  new_remaining numeric(8, 2) not null check (new_remaining >= 0),
-  adjusted_at timestamptz not null default now()
-);
+comment on column public.rnmb_guest_tabs.written_off_by is
+  'The crew member who wrote the tab off. Null on open and paid tabs, and on tabs written off before this was recorded.';
+comment on column public.rnmb_guest_tabs.written_off_by_name is
+  'That crew member''s name when the tab was written off, kept after that person is removed.';
 
--- Crew balance: payments between crew members (identical to
--- supabase/crew-balance.sql). A wrong payment is voided, never deleted.
+-- 4. New table: payments between crew members.
+--    Money is whole cents. Money history is never deleted: a wrong payment is
+--    voided (voided_at), and removing a person keeps their name through the
+--    name snapshot beside each person reference (on delete set null).
 create table if not exists public.rnmb_payments (
   id uuid primary key default gen_random_uuid(),
   from_person_id uuid references public.rnmb_people(id) on delete set null,
@@ -211,164 +134,24 @@ create table if not exists public.rnmb_payments (
   constraint rnmb_payments_two_people check (from_person_id <> to_person_id)
 );
 
-comment on column public.rnmb_guest_tabs.written_off_by is
-  'The crew member who wrote the tab off. Null on open and paid tabs, and on tabs written off before this was recorded.';
-comment on column public.rnmb_guest_tabs.written_off_by_name is
-  'That crew member''s name when the tab was written off, kept after that person is removed.';
 comment on column public.rnmb_payments.amount_cents is
   'Amount paid from from_person to to_person, in whole cents.';
 comment on column public.rnmb_payments.voided_at is
   'Set when the payment was recorded by mistake. A voided payment moves no balance but stays in the history.';
 
-comment on column public.rnmb_recipe_ingredients.amount is
-  'Recipe amount in the type''s measure: ounces for poured types, whole units for counted types.';
-comment on column public.rnmb_ring_up_lines.amount is
-  'Amount drawn from the stock item, in its type''s measure.';
-comment on column public.rnmb_ring_up_lines.cost_cents is
-  'Unrounded ingredient cost in cents (purchase price / size x amount), fixed at ring-up.';
-comment on column public.rnmb_ring_up_lines.share_cents is
-  'This line''s whole-cent share of the guest price, fixed at ring-up. Null on crew ring-ups.';
-comment on column public.rnmb_ring_ups.price_cents is
-  'Guest price in cents, fixed at ring-up. Null on crew ring-ups.';
-comment on column public.rnmb_stock_adjustments.previous_remaining is
-  'Level before the hand correction, in the type''s measure.';
-comment on column public.rnmb_stock_adjustments.new_remaining is
-  'Level after the hand correction, in the type''s measure.';
-
--- Indexes for the foreign keys the app filters on, and that Postgres checks
--- when a stock item or person is deleted.
-create index if not exists rnmb_recipe_ingredients_menu_item_idx on public.rnmb_recipe_ingredients (menu_item_id);
-create index if not exists rnmb_guest_tabs_night_idx on public.rnmb_guest_tabs (night_id);
-create index if not exists rnmb_ring_ups_night_idx on public.rnmb_ring_ups (night_id);
-create index if not exists rnmb_ring_ups_tab_idx on public.rnmb_ring_ups (tab_id);
-create index if not exists rnmb_ring_up_lines_ring_up_idx on public.rnmb_ring_up_lines (ring_up_id);
-create index if not exists rnmb_ring_up_lines_bottle_idx on public.rnmb_ring_up_lines (bottle_id);
-create index if not exists rnmb_stock_adjustments_bottle_idx on public.rnmb_stock_adjustments (bottle_id);
+-- Indexes for the foreign keys that Postgres checks when a person is deleted.
 create index if not exists rnmb_payments_from_person_idx on public.rnmb_payments (from_person_id);
 create index if not exists rnmb_payments_to_person_idx on public.rnmb_payments (to_person_id);
 
-create or replace function public.rnmb_touch_settings_updated_at()
-returns trigger
-language plpgsql
-as $$
-begin
-  new.updated_at = now();
-  return new;
-end;
-$$;
-
-drop trigger if exists rnmb_settings_updated_at on public.rnmb_settings;
-create trigger rnmb_settings_updated_at
-before update on public.rnmb_settings
-for each row execute function public.rnmb_touch_settings_updated_at();
-
-alter table public.rnmb_people enable row level security;
-alter table public.rnmb_beverage_types enable row level security;
-alter table public.rnmb_nights enable row level security;
-alter table public.rnmb_bottles enable row level security;
-alter table public.rnmb_pours enable row level security;
-alter table public.rnmb_settings enable row level security;
-alter table public.rnmb_menu_items enable row level security;
-alter table public.rnmb_recipe_ingredients enable row level security;
-alter table public.rnmb_guest_tabs enable row level security;
-alter table public.rnmb_ring_ups enable row level security;
-alter table public.rnmb_ring_up_lines enable row level security;
-alter table public.rnmb_stock_adjustments enable row level security;
+-- 5. Row-level security: the same passphrase gate as every other table.
 alter table public.rnmb_payments enable row level security;
 
--- Access control: every table is gated behind a shared passphrase, which the
--- browser sends on the x-rnmb-key header. See supabase/rls-passphrase.sql for
--- the full explanation and for how to set or rotate the passphrase; that file
--- is also what you run against a database that already has the old open
--- policies. This block keeps a freshly created project from starting wide open.
-
-create table if not exists public.rnmb_access (
-  id boolean primary key default true check (id),
-  passphrase text not null,
-  updated_at timestamptz not null default now()
-);
-
--- No policies on purpose: RLS denies by default, so the publishable key can
--- never read this table. Only rnmb_authorized() sees it, via SECURITY DEFINER.
-alter table public.rnmb_access enable row level security;
-
-create or replace function public.rnmb_authorized()
-returns boolean
-language sql
-stable
-security definer
-set search_path = public
-as $$
-  select exists (
-    select 1
-    from public.rnmb_access
-    where passphrase <> ''
-      and passphrase = coalesce(
-        nullif(current_setting('request.headers', true), '')::json ->> 'x-rnmb-key',
-        ''
-      )
-  );
-$$;
-
-revoke all on function public.rnmb_authorized() from public;
-grant execute on function public.rnmb_authorized() to anon, authenticated;
-
-drop policy if exists "RNMB public read people" on public.rnmb_people;
-drop policy if exists "RNMB public write people" on public.rnmb_people;
-drop policy if exists "RNMB public read beverage types" on public.rnmb_beverage_types;
-drop policy if exists "RNMB public write beverage types" on public.rnmb_beverage_types;
-drop policy if exists "RNMB public read nights" on public.rnmb_nights;
-drop policy if exists "RNMB public write nights" on public.rnmb_nights;
-drop policy if exists "RNMB public read bottles" on public.rnmb_bottles;
-drop policy if exists "RNMB public write bottles" on public.rnmb_bottles;
-drop policy if exists "RNMB public read pours" on public.rnmb_pours;
-drop policy if exists "RNMB public write pours" on public.rnmb_pours;
-drop policy if exists "RNMB public read settings" on public.rnmb_settings;
-drop policy if exists "RNMB public write settings" on public.rnmb_settings;
-
-drop policy if exists "RNMB gated people" on public.rnmb_people;
-drop policy if exists "RNMB gated beverage types" on public.rnmb_beverage_types;
-drop policy if exists "RNMB gated nights" on public.rnmb_nights;
-drop policy if exists "RNMB gated bottles" on public.rnmb_bottles;
-drop policy if exists "RNMB gated pours" on public.rnmb_pours;
-drop policy if exists "RNMB gated settings" on public.rnmb_settings;
-drop policy if exists "RNMB gated menu items" on public.rnmb_menu_items;
-drop policy if exists "RNMB gated recipe ingredients" on public.rnmb_recipe_ingredients;
-drop policy if exists "RNMB gated guest tabs" on public.rnmb_guest_tabs;
-drop policy if exists "RNMB gated ring-ups" on public.rnmb_ring_ups;
-drop policy if exists "RNMB gated ring-up lines" on public.rnmb_ring_up_lines;
-drop policy if exists "RNMB gated stock adjustments" on public.rnmb_stock_adjustments;
 drop policy if exists "RNMB gated payments" on public.rnmb_payments;
 
-create policy "RNMB gated people" on public.rnmb_people
-  for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
-create policy "RNMB gated beverage types" on public.rnmb_beverage_types
-  for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
-create policy "RNMB gated nights" on public.rnmb_nights
-  for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
-create policy "RNMB gated bottles" on public.rnmb_bottles
-  for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
-create policy "RNMB gated pours" on public.rnmb_pours
-  for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
-create policy "RNMB gated settings" on public.rnmb_settings
-  for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
-create policy "RNMB gated menu items" on public.rnmb_menu_items
-  for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
-create policy "RNMB gated recipe ingredients" on public.rnmb_recipe_ingredients
-  for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
-create policy "RNMB gated guest tabs" on public.rnmb_guest_tabs
-  for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
-create policy "RNMB gated ring-ups" on public.rnmb_ring_ups
-  for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
-create policy "RNMB gated ring-up lines" on public.rnmb_ring_up_lines
-  for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
-create policy "RNMB gated stock adjustments" on public.rnmb_stock_adjustments
-  for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
 create policy "RNMB gated payments" on public.rnmb_payments
   for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
 
--- One-call functions (identical to supabase/host-mode.sql and, where that file
--- replaces or adds one, supabase/crew-balance.sql).
+-- 6. One-call functions.
 --    The browser calls each one as POST /rest/v1/rpc/<name> with the body
 --    {"payload": {...}}. They run as the CALLER (not SECURITY DEFINER), so the
 --    gated policies above still apply, and each one checks the passphrase
@@ -650,59 +433,6 @@ begin
 end;
 $$;
 
--- Open a guest tab on the running host night.
--- payload: id, night_id, guest_name, opened_at (optional)
-create or replace function public.rnmb_open_tab(payload jsonb)
-returns uuid
-language plpgsql
-set search_path = public
-as $$
-declare
-  v_id uuid;
-  v_night_id uuid;
-  v_guest_name text;
-  v_night record;
-begin
-  if not public.rnmb_authorized() then
-    raise exception 'RNMB: the passphrase is missing or wrong, so nothing was saved.'
-      using errcode = '42501';
-  end if;
-
-  v_id := nullif(payload ->> 'id', '')::uuid;
-  v_night_id := nullif(payload ->> 'night_id', '')::uuid;
-  v_guest_name := trim(coalesce(payload ->> 'guest_name', ''));
-
-  if v_id is null then
-    raise exception 'RNMB: a tab needs an id.';
-  end if;
-  if exists (select 1 from public.rnmb_guest_tabs where id = v_id) then
-    raise exception 'RNMB: tab % was already opened.', v_id;
-  end if;
-  if v_guest_name = '' then
-    raise exception 'RNMB: a tab needs the guest''s name.';
-  end if;
-
-  select * into v_night from public.rnmb_nights where id = v_night_id for share;
-  if not found then
-    raise exception 'RNMB: that night does not exist.';
-  end if;
-  if v_night.kind <> 'host' then
-    raise exception 'RNMB: guest tabs only exist on a host night.';
-  end if;
-  if v_night.ended_at is not null then
-    raise exception 'RNMB: this host night has ended, so no new tabs can be opened.';
-  end if;
-
-  insert into public.rnmb_guest_tabs (id, night_id, guest_name, status, opened_at)
-  values (
-    v_id, v_night_id, v_guest_name, 'open',
-    coalesce(nullif(payload ->> 'opened_at', '')::timestamptz, now())
-  );
-
-  return v_id;
-end;
-$$;
-
 -- Close a guest tab, as paid (the amount must equal the tab total of every
 -- item not voided, and the collecting crew member is recorded) or written off
 -- (the crew member who wrote it off is recorded).
@@ -793,48 +523,6 @@ begin
 end;
 $$;
 
--- Start a host night. Only one host night can be open at a time.
--- payload: id, name, date ('YYYY-MM-DD', optional, defaults to today)
-create or replace function public.rnmb_start_host_night(payload jsonb)
-returns uuid
-language plpgsql
-set search_path = public
-as $$
-declare
-  v_id uuid;
-  v_name text;
-begin
-  if not public.rnmb_authorized() then
-    raise exception 'RNMB: the passphrase is missing or wrong, so nothing was saved.'
-      using errcode = '42501';
-  end if;
-
-  v_id := nullif(payload ->> 'id', '')::uuid;
-  v_name := trim(coalesce(payload ->> 'name', ''));
-
-  if v_id is null then
-    raise exception 'RNMB: a night needs an id.';
-  end if;
-  if v_name = '' then
-    raise exception 'RNMB: a host night needs a name.';
-  end if;
-  if exists (select 1 from public.rnmb_nights where kind = 'host' and ended_at is null) then
-    raise exception 'RNMB: a host night is already running; end it before starting another.';
-  end if;
-
-  begin
-    insert into public.rnmb_nights (id, name, date, kind)
-    values (v_id, v_name, coalesce(nullif(payload ->> 'date', '')::date, current_date), 'host');
-  exception when unique_violation then
-    -- Two crew members pressed start at the same moment (rnmb_nights_one_open_host),
-    -- or the id is already taken.
-    raise exception 'RNMB: a host night is already running, or night % already exists.', v_id;
-  end;
-
-  return v_id;
-end;
-$$;
-
 -- End a night. A crew night ends straight away; a host night is refused while
 -- any of its tabs is still open.
 -- payload: id
@@ -906,54 +594,6 @@ begin
   end if;
 
   return public.rnmb_end_night(payload);
-end;
-$$;
-
--- Set a stock item's remaining level by hand, recorded as a correction.
--- payload: id (optional, the correction's id), bottle_id, new_remaining
-create or replace function public.rnmb_correct_stock(payload jsonb)
-returns uuid
-language plpgsql
-set search_path = public
-as $$
-declare
-  v_id uuid;
-  v_new numeric;
-  v_bottle record;
-begin
-  if not public.rnmb_authorized() then
-    raise exception 'RNMB: the passphrase is missing or wrong, so nothing was saved.'
-      using errcode = '42501';
-  end if;
-
-  v_id := coalesce(nullif(payload ->> 'id', '')::uuid, gen_random_uuid());
-  v_new := (payload ->> 'new_remaining')::numeric;
-
-  select b.id, b.size_oz, b.remaining_oz, t.name as type_name, t.measure
-    into v_bottle
-    from public.rnmb_bottles b
-    join public.rnmb_beverage_types t on t.id = b.type_id
-   where b.id = nullif(payload ->> 'bottle_id', '')::uuid
-     for update of b;
-  if not found then
-    raise exception 'RNMB: that stock item does not exist.';
-  end if;
-  if v_new is null or v_new < 0 or v_new > v_bottle.size_oz then
-    raise exception 'RNMB: the new level must be between 0 and % (the item''s size).', v_bottle.size_oz;
-  end if;
-  if v_new <> round(v_new, 2) then
-    raise exception 'RNMB: amounts are kept to two decimal places, and % has more.', v_new;
-  end if;
-  if v_bottle.measure = 'unit' and v_new <> trunc(v_new) then
-    raise exception 'RNMB: % is counted stock and is counted in whole units.', v_bottle.type_name;
-  end if;
-
-  insert into public.rnmb_stock_adjustments (id, bottle_id, previous_remaining, new_remaining)
-  values (v_id, v_bottle.id, v_bottle.remaining_oz, v_new);
-
-  update public.rnmb_bottles set remaining_oz = v_new where id = v_bottle.id;
-
-  return v_id;
 end;
 $$;
 
@@ -1063,40 +703,6 @@ begin
 end;
 $$;
 
--- Remove a crew pour and give back only that pour's amount (never above the
--- stock item's size).
--- payload: id
-create or replace function public.rnmb_remove_crew_pour(payload jsonb)
-returns uuid
-language plpgsql
-set search_path = public
-as $$
-declare
-  v_id uuid;
-  v_pour record;
-begin
-  if not public.rnmb_authorized() then
-    raise exception 'RNMB: the passphrase is missing or wrong, so nothing was saved.'
-      using errcode = '42501';
-  end if;
-
-  v_id := nullif(payload ->> 'id', '')::uuid;
-
-  select * into v_pour from public.rnmb_pours where id = v_id for update;
-  if not found then
-    raise exception 'RNMB: that pour does not exist (it may already have been removed).';
-  end if;
-
-  delete from public.rnmb_pours where id = v_id;
-
-  update public.rnmb_bottles
-     set remaining_oz = least(size_oz, remaining_oz + v_pour.ounces)
-   where id = v_pour.bottle_id;
-
-  return v_id;
-end;
-$$;
-
 -- Record a payment from one crew member to another. Names are snapshotted so
 -- the payment still reads correctly after either person is removed.
 -- payload: id, from_person_id, to_person_id, amount_cents (whole cents above
@@ -1195,38 +801,26 @@ end;
 $$;
 
 -- Same grants as rnmb_authorized(): nobody by default, then the two roles the
--- publishable key can act as.
+-- publishable key can act as. (Replacing a function keeps its grants; they are
+-- repeated here so this file reads complete.)
 revoke all on function public.rnmb_ring_up(jsonb) from public;
 revoke all on function public.rnmb_void_ring_up(jsonb) from public;
-revoke all on function public.rnmb_open_tab(jsonb) from public;
 revoke all on function public.rnmb_close_tab(jsonb) from public;
-revoke all on function public.rnmb_start_host_night(jsonb) from public;
 revoke all on function public.rnmb_end_night(jsonb) from public;
 revoke all on function public.rnmb_end_host_night(jsonb) from public;
-revoke all on function public.rnmb_correct_stock(jsonb) from public;
 revoke all on function public.rnmb_add_crew_pour(jsonb) from public;
-revoke all on function public.rnmb_remove_crew_pour(jsonb) from public;
 revoke all on function public.rnmb_record_payment(jsonb) from public;
 revoke all on function public.rnmb_void_payment(jsonb) from public;
 
 grant execute on function public.rnmb_ring_up(jsonb) to anon, authenticated;
 grant execute on function public.rnmb_void_ring_up(jsonb) to anon, authenticated;
-grant execute on function public.rnmb_open_tab(jsonb) to anon, authenticated;
 grant execute on function public.rnmb_close_tab(jsonb) to anon, authenticated;
-grant execute on function public.rnmb_start_host_night(jsonb) to anon, authenticated;
 grant execute on function public.rnmb_end_night(jsonb) to anon, authenticated;
 grant execute on function public.rnmb_end_host_night(jsonb) to anon, authenticated;
-grant execute on function public.rnmb_correct_stock(jsonb) to anon, authenticated;
 grant execute on function public.rnmb_add_crew_pour(jsonb) to anon, authenticated;
-grant execute on function public.rnmb_remove_crew_pour(jsonb) to anon, authenticated;
 grant execute on function public.rnmb_record_payment(jsonb) to anon, authenticated;
 grant execute on function public.rnmb_void_payment(jsonb) to anon, authenticated;
 
--- Set a real passphrase before anyone uses the dashboard.
-insert into public.rnmb_access (id, passphrase)
-values (true, 'CHANGE-ME')
-on conflict (id) do nothing;
-
-insert into public.rnmb_settings (id, responsible_mode)
-values (true, true)
-on conflict (id) do nothing;
+-- 7. Tell the API to pick up the new table, columns and functions straight
+--    away, instead of answering 404 until its schema cache refreshes.
+notify pgrst, 'reload schema';
