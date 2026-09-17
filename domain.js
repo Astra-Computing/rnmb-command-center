@@ -89,6 +89,15 @@
  *   suggestPayments(balances) -> [suggestedPayment]: the fewest payments (exact, up to 10 non-zero
  *               balances; largest debtor to largest creditor above that); order-independent, ties by
  *               name then id
+ *   crewDrinkCostCents(lines) -> whole cents a crew drink (or a written-off guest drink) charges: the owned
+ *               lines' cost rounded half-up once, exactly what crewBalances debits
+ *   balanceChangesOnRemoval(state, personId) -> [{ personId, name, beforeCents, afterCents }]: other roster people
+ *               whose balance would move if that person were deleted (their pours cascade, other references
+ *               are set null and keep their name snapshots)
+ *   dollarsToCents(value) -> whole cents for a typed dollar amount ("3.20", "$12", ".5"), else null
+ *   quickLogAmount(type) -> 1.5 (oz) for poured stock, 1 (unit) for counted stock
+ *   recentLogItems(state, personId, limit = 8) -> [{ kind: "bottle"|"menu", id }]: the distinct stock items a
+ *               person poured and menu items they had as unvoided crew ring-ups, newest first
  *   normalizeNight / normalizeMenuItem / normalizeTab / normalizeRingUp / normalizeAdjustment /
  *   normalizePayment(record) -> the record with every field present in a fixed order (nulls, numbers, defaults)
  *   normalizePour(pour) -> the pour with costCents (number|null), buyerId and buyerName (null when absent)
@@ -757,6 +766,27 @@ var RNMBDomain = (function () {
     return Boolean(line) && partyKey(line.buyerId, line.buyerName) !== null;
   }
 
+  /**
+   * What a crew drink's lines charge the drinker: only lines someone bought count
+   * (stock nobody bought credits nobody), a missing or negative cost counts as 0,
+   * and the total is rounded once and allocated back over those lines (KTD2).
+   */
+  function crewCharge(lines) {
+    var owned = listOf(lines).filter(isOwnedLine);
+    var cost = ringUpCostCents(
+      owned.map(function (line) {
+        var cents = Number(line.costCents);
+        return { costCents: Number.isFinite(cents) && cents > 0 ? cents : 0 };
+      })
+    );
+    return { owned: owned, totalCents: cost.totalCents, lineCents: cost.lineCents };
+  }
+
+  /** The whole cents crewBalances debits the drinker (or the tab's writer) for one drink's lines. */
+  function crewDrinkCostCents(lines) {
+    return crewCharge(lines).totalCents;
+  }
+
   function compareParties(a, b) {
     if (a.name !== b.name) return a.name < b.name ? -1 : 1;
     var idA = a.personId === null || a.personId === undefined ? "" : String(a.personId);
@@ -818,15 +848,9 @@ var RNMBDomain = (function () {
 
     function chargeCost(personId, personName, lines) {
       if (partyKey(personId, personName) === null) return;
-      var owned = (lines || []).filter(isOwnedLine);
-      var cost = ringUpCostCents(
-        owned.map(function (line) {
-          var cents = Number(line.costCents);
-          return { costCents: Number.isFinite(cents) && cents > 0 ? cents : 0 };
-        })
-      );
-      owned.forEach(function (line, index) {
-        move(personId, personName, line.buyerId, line.buyerName, cost.lineCents[index]);
+      var charge = crewCharge(lines);
+      charge.owned.forEach(function (line, index) {
+        move(personId, personName, line.buyerId, line.buyerName, charge.lineCents[index]);
       });
     }
 
@@ -986,6 +1010,122 @@ var RNMBDomain = (function () {
       settleGreedy(group).forEach(function (payment) { payments.push(payment); });
     });
     return payments;
+  }
+
+  /**
+   * The records as the database leaves them once a person is deleted: the pours they
+   * drank go with them (on delete cascade), and every other reference to them is set
+   * null while its name snapshot stays.
+   */
+  function withoutPerson(state, personId) {
+    var source = state || {};
+    var clear = function (id) { return id === personId ? null : id; };
+    return Object.assign({}, source, {
+      people: listOf(source.people).filter(function (person) { return person && person.id !== personId; }),
+      nights: listOf(source.nights).map(function (night) {
+        return Object.assign({}, night, {
+          pours: listOf(night && night.pours)
+            .filter(function (pour) { return pour && pour.personId !== personId; })
+            .map(function (pour) { return Object.assign({}, pour, { buyerId: clear(pour.buyerId) }); })
+        });
+      }),
+      ringUps: listOf(source.ringUps).map(function (ringUp) {
+        return Object.assign({}, ringUp, {
+          personId: clear(ringUp && ringUp.personId),
+          lines: listOf(ringUp && ringUp.lines).map(function (line) { return Object.assign({}, line, { buyerId: clear(line && line.buyerId) }); })
+        });
+      }),
+      guestTabs: listOf(source.guestTabs).map(function (tab) {
+        return Object.assign({}, tab, { collectorId: clear(tab && tab.collectorId), writtenOffBy: clear(tab && tab.writtenOffBy) });
+      }),
+      payments: listOf(source.payments).map(function (payment) {
+        return Object.assign({}, payment, { fromPersonId: clear(payment && payment.fromPersonId), toPersonId: clear(payment && payment.toPersonId) });
+      })
+    });
+  }
+
+  /**
+   * Everyone else on the roster whose balance would change if `personId` were removed
+   * (KTD9): [{ personId, name, beforeCents, afterCents }]. Removing someone deletes the
+   * pours they drank, so a person reading $0.00 can still take other people's credit
+   * with them; the app refuses the removal while this list is not empty.
+   */
+  function balanceChangesOnRemoval(state, personId) {
+    var after = new Map(crewBalances(withoutPerson(state, personId)).map(function (entry) { return [entry.personId, entry.cents]; }));
+    return crewBalances(state)
+      .filter(function (entry) { return entry.personId && entry.personId !== personId; })
+      .map(function (entry) {
+        return { personId: entry.personId, name: entry.name, beforeCents: entry.cents, afterCents: after.has(entry.personId) ? after.get(entry.personId) : 0 };
+      })
+      .filter(function (entry) { return entry.beforeCents !== entry.afterCents; });
+  }
+
+  // ---------- settle-up form and quick log (0.4.2, 0.5.4, KTD8) -----------------
+
+  var DOLLAR_AMOUNT = /^\$?(?:(\d+)(?:\.(\d{1,2}))?|\.(\d{1,2}))$/;
+
+  /**
+   * A typed dollar amount ("3.20", "$12", ".5") as whole cents, read digit by digit
+   * so no floating-point product can round it; null for anything else (a sign,
+   * more than two decimals, separators, an exponent, an empty field).
+   */
+  function dollarsToCents(value) {
+    if (typeof value === "number" && !Number.isFinite(value)) return null;
+    if (typeof value !== "number" && typeof value !== "string") return null;
+    var match = DOLLAR_AMOUNT.exec(String(value).trim());
+    if (!match) return null;
+    var whole = match[1] || "0";
+    var fraction = (match[2] || match[3] || "").padEnd(2, "0");
+    return Number(whole) * 100 + Number(fraction);
+  }
+
+  /** The amount one quick-log tap pours: a 1.5 oz measure of poured stock, one unit of counted stock. */
+  function quickLogAmount(type) {
+    return type && type.measure === MEASURE_UNIT ? 1 : 1.5;
+  }
+
+  function timeOf(value) {
+    var time = Date.parse(value);
+    return Number.isFinite(time) ? time : -Infinity;
+  }
+
+  /**
+   * The last `limit` (default 8) distinct things a person logged, newest first:
+   * { kind: "bottle", id } from their crew pours and { kind: "menu", id } from their
+   * unvoided crew ring-ups. Items no longer in state are skipped, and a repeat keeps
+   * only its newest place. Ties in time keep the later record first.
+   */
+  function recentLogItems(state, personId, limit) {
+    var source = state || {};
+    var max = limit === undefined ? 8 : limit;
+    if (!personId) return [];
+    var bottleIds = new Set(listOf(source.bottles).map(function (bottle) { return bottle && bottle.id; }));
+    var menuIds = new Set(listOf(source.menuItems).map(function (item) { return item && item.id; }));
+    var logged = [];
+    listOf(source.nights).forEach(function (night) {
+      listOf(night && night.pours).forEach(function (pour) {
+        if (!pour || pour.personId !== personId || !bottleIds.has(pour.bottleId)) return;
+        logged.push({ kind: "bottle", id: pour.bottleId, time: timeOf(pour.timestamp), order: logged.length });
+      });
+    });
+    listOf(source.ringUps).forEach(function (ringUp) {
+      if (!ringUp || ringUp.kind !== "crew" || ringUp.voidedAt || ringUp.personId !== personId) return;
+      if (!menuIds.has(ringUp.menuItemId)) return;
+      logged.push({ kind: "menu", id: ringUp.menuItemId, time: timeOf(ringUp.rungAt), order: logged.length });
+    });
+    logged.sort(function (a, b) {
+      if (a.time !== b.time) return b.time - a.time;
+      return b.order - a.order;
+    });
+    var seen = new Set();
+    var recent = [];
+    logged.forEach(function (entry) {
+      var key = entry.kind + ":" + entry.id;
+      if (recent.length >= max || seen.has(key)) return;
+      seen.add(key);
+      recent.push({ kind: entry.kind, id: entry.id });
+    });
+    return recent;
   }
 
   // ---------- whole-state normalizer (archives, localStorage, database loads) ---
@@ -1317,6 +1457,11 @@ var RNMBDomain = (function () {
     ringUpCostCents: ringUpCostCents,
     crewBalances: crewBalances,
     suggestPayments: suggestPayments,
+    crewDrinkCostCents: crewDrinkCostCents,
+    balanceChangesOnRemoval: balanceChangesOnRemoval,
+    dollarsToCents: dollarsToCents,
+    quickLogAmount: quickLogAmount,
+    recentLogItems: recentLogItems,
     normalizeNight: normalizeNight,
     normalizePour: normalizePour,
     normalizeMenuItem: normalizeMenuItem,
