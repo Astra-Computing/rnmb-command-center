@@ -394,6 +394,137 @@ async function exitRegisterTo(page, tab) {
   await page.click(`.tab-button[data-tab="${tab}"]`);
 }
 
+// ---------- review-fix helpers ------------------------------------------------------------
+
+/**
+ * A stub Supabase that HAS run supabase/host-mode.sql: every table answers 200,
+ * writes change `store` the way PostgREST would (eq / in / not.in / is filters,
+ * merge-duplicates upserts, return=representation), and every request is kept
+ * in `log` in order. Set `stub.fail = (entry) => status | null` to fail a request.
+ */
+function hostModeStub(seed = {}) {
+  const TABLES = [
+    "rnmb_people", "rnmb_beverage_types", "rnmb_bottles", "rnmb_nights", "rnmb_pours", "rnmb_settings",
+    "rnmb_menu_items", "rnmb_recipe_ingredients", "rnmb_guest_tabs", "rnmb_ring_ups", "rnmb_ring_up_lines", "rnmb_stock_adjustments"
+  ];
+  const store = Object.fromEntries(TABLES.map((table) => [table, JSON.parse(JSON.stringify(seed[table] || []))]));
+  const log = [];
+  const unexpected = [];
+  const stub = { store, log, unexpected, fail: null };
+
+  const matches = (row, params) => Array.from(params.entries()).every(([key, value]) => {
+    if (["select", "order", "on_conflict"].includes(key)) return true;
+    const cell = row[key] === undefined || row[key] === null ? null : String(row[key]);
+    const list = (text) => text.replace(/^\(|\)$/g, "").split(",");
+    if (value === "is.null") return cell === null;
+    if (value === "not.is.null") return cell !== null;
+    if (value.startsWith("eq.")) return cell === value.slice(3);
+    if (value.startsWith("in.")) return list(value.slice(3)).includes(cell);
+    if (value.startsWith("not.in.")) return !list(value.slice(7)).includes(cell);
+    unexpected.push(`filter ${key}=${value}`);
+    return false;
+  });
+
+  stub.routes = async (page) => {
+    await page.route("**/api/config", (route) => route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ enabled: true, supabaseUrl: `${baseUrl}/stub-supabase`, supabaseAnonKey: "stub-key" })
+    }));
+    await page.route("**/stub-supabase/rest/v1/**", (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      const path = url.pathname.replace(/^.*\/rest\/v1\//, "");
+      const method = request.method();
+      const prefer = request.headers().prefer || "";
+      const raw = request.postData() || "";
+      const entry = { method, path, query: url.search, prefer, body: raw ? JSON.parse(raw) : null };
+      const json = (status, body) => route.fulfill({ status, contentType: "application/json", body: body === undefined ? "" : JSON.stringify(body) });
+
+      if (path === "rpc/rnmb_authorized") return json(200, true);
+      if (method !== "GET") log.push(entry);
+      const failure = stub.fail && stub.fail(entry);
+      if (failure) return json(failure, { code: "XX000", message: "Simulated failure" });
+
+      if (path === "rpc/rnmb_start_host_night") {
+        const { id, name, date } = entry.body.payload;
+        store.rnmb_nights.push({ id, name, date, kind: "host", ended_at: null });
+        return json(200, id);
+      }
+      if (path.startsWith("rpc/") || !TABLES.includes(path)) {
+        unexpected.push(`${method} ${path}`);
+        return json(404, { code: "PGRST202", message: "not stubbed" });
+      }
+      const rows = store[path];
+      if (method === "GET") return json(200, rows.filter((row) => matches(row, url.searchParams)));
+      if (method === "POST") {
+        const incoming = Array.isArray(entry.body) ? entry.body : [entry.body];
+        const merge = prefer.includes("resolution=merge-duplicates");
+        for (const row of incoming) {
+          const existing = rows.find((candidate) => String(candidate.id) === String(row.id));
+          if (existing && !merge) return json(409, { code: "23505", message: "duplicate key" });
+        }
+        incoming.forEach((row) => {
+          const existing = rows.find((candidate) => String(candidate.id) === String(row.id));
+          if (existing) Object.assign(existing, row);
+          else rows.push({ ...row });
+        });
+        return route.fulfill({ status: 201, body: "" });
+      }
+      if (method === "PATCH") {
+        const hit = rows.filter((row) => matches(row, url.searchParams));
+        hit.forEach((row) => Object.assign(row, entry.body));
+        return prefer.includes("return=representation") ? json(200, hit) : route.fulfill({ status: 204, body: "" });
+      }
+      if (method === "DELETE") {
+        store[path] = rows.filter((row) => !matches(row, url.searchParams));
+        return route.fulfill({ status: 204, body: "" });
+      }
+      unexpected.push(`${method} ${path}`);
+      return route.fulfill({ status: 405, body: "" });
+    });
+  };
+  return stub;
+}
+
+/** Seed rows for hostModeStub: two crew nights, a rum and a lime, and a two-line Rum Punch. */
+function hostModeSeed() {
+  const ids = {
+    sam: "11111111-1111-4111-8111-111111111111",
+    rum: "22222222-2222-4222-8222-222222222222",
+    lime: "33333333-3333-4333-8333-333333333333",
+    nightOne: "44444444-4444-4444-8444-444444444444",
+    nightTwo: "55555555-5555-4555-8555-555555555555",
+    punch: "66666666-6666-4666-8666-666666666666",
+    rumLine: "77777777-7777-4777-8777-777777777777",
+    limeLine: "88888888-8888-4888-8888-888888888888"
+  };
+  return {
+    ids,
+    seed: {
+      rnmb_people: [{ id: ids.sam, name: "Sam", color: "#ef4444" }],
+      rnmb_beverage_types: [
+        { id: ids.rum, name: "Rum", category: "Rum", abv: 40, measure: "oz", unit_oz: null },
+        { id: ids.lime, name: "Lime juice", category: "Mixer", abv: 0, measure: "oz", unit_oz: null }
+      ],
+      rnmb_nights: [
+        { id: ids.nightOne, name: "Night One", date: "2026-09-15", kind: "crew", ended_at: null },
+        { id: ids.nightTwo, name: "Night Two", date: "2026-09-16", kind: "crew", ended_at: null }
+      ],
+      rnmb_settings: [{ id: true, active_night_id: ids.nightTwo, responsible_mode: true, markup_percent: 0, rounding_increment_cents: 25 }],
+      rnmb_menu_items: [{ id: ids.punch, name: "Rum Punch", kind: "cocktail" }],
+      rnmb_recipe_ingredients: [
+        { id: ids.rumLine, menu_item_id: ids.punch, type_id: ids.rum, amount: 2, line_no: 0 },
+        { id: ids.limeLine, menu_item_id: ids.punch, type_id: ids.lime, amount: 1, line_no: 1 }
+      ]
+    }
+  };
+}
+
+/** Chrome logs a failed fetch, and commitSave logs the non-refusal error; both are expected when a scenario fails a request on purpose. */
+const simulatedFailure = (message) => message.type() === "error" &&
+  (message.text().includes("status of 500") || message.text().includes("Simulated failure"));
+
 const scenarios = [
   {
     name: "U3 local boot with no /api/config, Reload demo, Export carries every host-mode collection",
@@ -2058,6 +2189,259 @@ const scenarios = [
         } finally {
           await session.close();
         }
+      }
+    }
+  },
+
+  {
+    name: "Review #1 shared database: a failed recipe write while editing a menu item leaves the old recipe whole; a good edit upserts, then prunes, then renames",
+    async run({ browser }) {
+      const { ids, seed } = hostModeSeed();
+      const stub = hostModeStub(seed);
+      const session = await openPage(browser, { routes: stub.routes, allowConsole: simulatedFailure });
+      const { page } = session;
+      const recipe = () => stub.store.rnmb_recipe_ingredients
+        .filter((row) => row.menu_item_id === ids.punch)
+        .map((row) => ({ id: row.id, type_id: row.type_id, amount: Number(row.amount) }));
+      const edit = (ingredients, name = "Rum Punch") => page.evaluate(({ ids, ingredients, name }) => window.__rnmb.hostAction(
+        "Menu item updated.",
+        (db) => db.saveMenuItem({ id: ids.punch, name, kind: "cocktail", ingredients })
+      ), { ids, ingredients, name });
+      try {
+        await session.waitForToast("Connected to Supabase.");
+        assert.equal(await page.evaluate(() => window.__rnmb.hostModeAvailable), true);
+        const original = recipe();
+        assert.equal(original.length, 2);
+
+        // The recipe write fails, whatever the order the repository sends things in.
+        stub.fail = (entry) => (entry.method === "POST" && entry.path === "rnmb_recipe_ingredients" ? 500 : null);
+        const failed = await edit([{ id: ids.rumLine, typeId: ids.rum, amount: 3 }, { typeId: ids.lime, amount: 1.5 }], "Rum Punch Deluxe");
+        assert.equal(failed, false, "the save reports failure");
+        assert.deepEqual(recipe(), original, "the shared recipe survives a failed ingredient write");
+        const reloaded = await page.evaluate((id) => window.__rnmb.state.menuItems.find((item) => item.id === id), ids.punch);
+        assert.equal(reloaded.ingredients.length, 2, "this browser reloads the intact recipe");
+        assert.equal(reloaded.name, "Rum Punch", "the rename did not land before the recipe did");
+
+        // A good edit: keep the rum line (new amount), replace the lime line.
+        stub.fail = null;
+        const logStart = stub.log.length;
+        const saved = await edit([{ id: ids.rumLine, typeId: ids.rum, amount: 3 }, { typeId: ids.lime, amount: 1.5 }], "Rum Punch Deluxe");
+        assert.equal(saved, true);
+        const writes = stub.log.slice(logStart);
+        const upsert = writes.findIndex((entry) => entry.method === "POST" && entry.path === "rnmb_recipe_ingredients");
+        const prune = writes.findIndex((entry) => entry.method === "DELETE" && entry.path === "rnmb_recipe_ingredients");
+        const rename = writes.findIndex((entry) => entry.method === "PATCH" && entry.path === "rnmb_menu_items");
+        assert.ok(upsert >= 0 && prune > upsert && rename > prune, `upsert, then prune, then rename (got ${writes.map((entry) => `${entry.method} ${entry.path}`).join(", ")})`);
+        assert.match(writes[upsert].prefer, /resolution=merge-duplicates/);
+        assert.match(decodeURIComponent(writes[prune].query), new RegExp(`id=not\\.in\\.\\(.*${ids.rumLine}`), "the prune keeps the lines still in the recipe");
+        const stored = recipe();
+        assert.equal(stored.length, 2);
+        assert.deepEqual(stored.find((row) => row.id === ids.rumLine), { id: ids.rumLine, type_id: ids.rum, amount: 3 }, "the kept line keeps its id");
+        assert.equal(stored.some((row) => row.id === ids.limeLine), false, "the replaced line is gone");
+        const state = await page.evaluate((id) => window.__rnmb.state.menuItems.find((item) => item.id === id), ids.punch);
+        assert.equal(state.name, "Rum Punch Deluxe");
+        assert.deepEqual(state.ingredients.map((ingredient) => ingredient.id).sort(), stored.map((row) => row.id).sort(), "this browser holds the ids the database holds");
+        assert.deepEqual(stub.unexpected, []);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Review #2 shared database: night, hydration and host-night saves never send pricing, and a pricing save sends only pricing",
+    async run({ browser }) {
+      const { ids, seed } = hostModeSeed();
+      const stub = hostModeStub(seed);
+      const session = await openPage(browser, { routes: stub.routes });
+      const { page } = session;
+      const PRICING = ["markup_percent", "rounding_increment_cents"];
+      const settingsWritesSince = (start) => stub.log.slice(start).filter((entry) => entry.path.startsWith("rnmb_settings"));
+      const settingsKeys = (entry) => Object.keys(Array.isArray(entry.body) ? entry.body[0] : entry.body).filter((key) => key !== "id").sort();
+      try {
+        await session.waitForToast("Connected to Supabase.");
+        assert.equal(await page.evaluate(() => window.__rnmb.hostModeAvailable), true);
+        // Another device raises the markup after this page loaded.
+        Object.assign(stub.store.rnmb_settings[0], { markup_percent: 50, rounding_increment_cents: 50 });
+
+        let start = stub.log.length;
+        await page.click('.tab-button[data-tab="tonight"]');
+        await page.selectOption("#nightSelect", ids.nightOne);
+        await session.waitForToast("Active night switched.");
+        let sent = settingsWritesSince(start);
+        assert.ok(sent.length >= 1, "the switch wrote settings");
+        sent.forEach((entry) => assert.deepEqual(settingsKeys(entry).filter((key) => PRICING.includes(key)), [], `the night switch sent no pricing: ${JSON.stringify(entry.body)}`));
+        assert.equal(stub.store.rnmb_settings[0].active_night_id, ids.nightOne);
+        assert.equal(Number(stub.store.rnmb_settings[0].markup_percent), 50, "the other device's markup survives a night switch");
+
+        start = stub.log.length;
+        await page.evaluate(() => {
+          const toggle = document.querySelector("#responsibleMode");
+          toggle.checked = false;
+          toggle.dispatchEvent(new Event("change", { bubbles: true }));
+        });
+        await session.waitForToast("Hydration reminders muted.");
+        settingsWritesSince(start).forEach((entry) => assert.deepEqual(settingsKeys(entry).filter((key) => PRICING.includes(key)), [], "the hydration toggle sent no pricing"));
+        assert.equal(stub.store.rnmb_settings[0].responsible_mode, false);
+
+        start = stub.log.length;
+        await page.fill("#nightForm [name='name']", "Night Three");
+        await clickForToast(session, "#nightForm button[type='submit']", "Night log started.");
+        sent = settingsWritesSince(start);
+        assert.ok(sent.length >= 1, "a new night becomes active");
+        sent.forEach((entry) => assert.deepEqual(settingsKeys(entry).filter((key) => PRICING.includes(key)), [], "a new crew night sent no pricing"));
+
+        start = stub.log.length;
+        await startHostNightViaForm(session, "Review host night");
+        sent = settingsWritesSince(start);
+        assert.ok(sent.length >= 1, "the host night becomes active");
+        sent.forEach((entry) => assert.deepEqual(settingsKeys(entry).filter((key) => PRICING.includes(key)), [], "starting a host night sent no pricing"));
+        assert.equal(Number(stub.store.rnmb_settings[0].markup_percent), 50, "the markup is still the other device's");
+        assert.equal(Number(stub.store.rnmb_settings[0].rounding_increment_cents), 50);
+
+        // The other way round: another device switches the night, then this one saves pricing.
+        stub.store.rnmb_settings[0].active_night_id = ids.nightTwo;
+        start = stub.log.length;
+        await setPricingViaForm(session, { markupPercent: 25, increment: "0.25" });
+        sent = settingsWritesSince(start);
+        assert.equal(sent.length, 1, "one pricing write");
+        assert.deepEqual(settingsKeys(sent[0]), PRICING, `pricing sends only pricing: ${JSON.stringify(sent[0].body)}`);
+        assert.equal(stub.store.rnmb_settings[0].active_night_id, ids.nightTwo, "the other device's active night survives a pricing save");
+        assert.equal(Number(stub.store.rnmb_settings[0].markup_percent), 25);
+
+        // A database with no settings row yet still gets one.
+        stub.store.rnmb_settings = [];
+        await page.click('.tab-button[data-tab="tonight"]');
+        await page.selectOption("#nightSelect", ids.nightOne);
+        await page.waitForFunction(() => window.__toasts.at(-1) === "Active night switched.");
+        assert.equal(stub.store.rnmb_settings.length, 1, "the settings row was created");
+        assert.equal(stub.store.rnmb_settings[0].active_night_id, ids.nightOne);
+        assert.deepEqual(stub.unexpected, []);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Review #4 a crew ring-up is voided from the register: it asks first, stock comes back and the crew figures drop",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await startHostNightViaForm(session, "Crew void night");
+        const bourbon = await page.evaluate(() => window.__rnmb.state.bottles.find((bottle) => bottle.nickname === "The Briefing Bottle").id);
+        const stockBefore = await stockOf(page, bourbon);
+        await page.click('.tab-button[data-tab="tonight"]');
+        const consumedBefore = (await page.textContent("#metricConsumed")).trim();
+
+        await openRegister(session);
+        await registerItem(page, "Bourbon Neat").click();
+        await registerCrew(page, "Casey").click();
+        await clickForToast(session, "#registerConfirm", "Bourbon Neat poured for Casey. No charge.");
+        const ringUpId = await page.evaluate(() => window.__rnmb.state.ringUps[0].id);
+        assert.equal(await stockOf(page, bourbon), Math.round((stockBefore - 2) * 100) / 100);
+
+        const voidButton = `#registerWork [data-void-ring-up="${ringUpId}"]`;
+        assert.equal(await page.locator(voidButton).count(), 1, "the crew drink has a Void control on the register");
+        let dialogMessage = "";
+        page.once("dialog", (dialog) => { dialogMessage = dialog.message(); });
+        await clickForToast(session, voidButton, "Item voided and its stock restored.");
+        assert.match(dialogMessage, /Void Bourbon Neat poured for Casey\?/);
+        assert.equal(await stockOf(page, bourbon), stockBefore, "the bourbon comes back");
+        const voided = await page.evaluate((id) => window.__rnmb.state.ringUps.find((ringUp) => ringUp.id === id), ringUpId);
+        assert.ok(voided.voidedAt, "voided, not deleted");
+        assert.equal(await page.locator(voidButton).count(), 0, "a voided crew drink leaves the list");
+
+        await exitRegisterTo(page, "tonight");
+        assert.equal((await page.textContent("#metricConsumed")).trim(), consumedBefore, "crew consumption is back where it was");
+        assert.match(await page.textContent("#personConsumption"), /No pours logged for the active night/);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Review #5 tapping Open tab again while the first call is pending opens exactly one tab",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await startHostNightViaForm(session);
+        await openRegister(session);
+        await page.evaluate(() => {
+          const repo = window.__rnmb.repository;
+          const original = repo.openTab;
+          window.__openTabCalls = 0;
+          repo.openTab = async (tab) => {
+            window.__openTabCalls += 1;
+            await new Promise((resolve) => { window.__releaseOpenTab = resolve; });
+            return original(tab);
+          };
+        });
+        await page.fill("#registerTabForm [name='guestName']", "Riley");
+        await page.click("#registerOpenTab");
+        await page.waitForFunction(() => typeof window.__releaseOpenTab === "function");
+        const pending = await page.evaluate(() => {
+          document.querySelector("#registerTabForm").requestSubmit();
+          document.querySelector("#registerOpenTab").click();
+          return {
+            calls: window.__openTabCalls,
+            buttonDisabled: document.querySelector("#registerOpenTab").disabled,
+            inputDisabled: document.querySelector("#registerTabForm [name='guestName']").disabled
+          };
+        });
+        assert.equal(pending.calls, 1, "a second submit while pending makes no second call");
+        assert.equal(pending.buttonDisabled, true, "Open tab is disabled while pending");
+        assert.equal(pending.inputDisabled, true, "the guest name is locked while pending");
+
+        const toastCount = (await session.toasts()).length;
+        await page.evaluate(() => window.__releaseOpenTab());
+        await page.waitForFunction((count) => window.__toasts.slice(count).includes("Tab opened for Riley."), toastCount);
+        const tabs = await page.evaluate(() => window.__rnmb.state.guestTabs.filter((tab) => tab.guestName === "Riley").length);
+        assert.equal(tabs, 1, "exactly one tab for Riley");
+        assert.equal(await page.evaluate(() => window.__openTabCalls), 1);
+        assert.equal(await page.isEnabled("#registerOpenTab"), true, "Open tab is usable again");
+        assert.equal(await page.isEnabled("#registerTabForm [name='guestName']"), true, "the guest name is usable again");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Review #6 a markup with more than two decimals, or of 10000% or more, is refused and nothing is saved",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      const pricing = () => page.evaluate(() => {
+        const stored = JSON.parse(localStorage.getItem("rnmb-command-center-v1"));
+        const live = window.__rnmb.state;
+        return { live: [live.markupPercent, live.roundingIncrementCents], stored: [stored.markupPercent, stored.roundingIncrementCents] };
+      });
+      try {
+        const before = await pricing();
+        await page.click('.tab-button[data-tab="menu"]');
+        for (const [markup, message] of [
+          ["12.345", "The markup is kept to two decimal places, and 12.345 has more."],
+          ["10000", "The markup must be below 10000%."]
+        ]) {
+          await page.fill("#pricingForm [name='markupPercent']", markup);
+          await page.fill("#pricingForm [name='roundingIncrement']", "0.50");
+          await clickForToast(session, "#pricingForm button[type='submit']", message);
+          assert.deepEqual(await pricing(), before, `markup ${markup} saved nothing`);
+        }
+        assert.ok(!(await session.toasts()).includes("Pricing saved."), "no pricing save was reported");
+        await setPricingViaForm(session, { markupPercent: "12.35", increment: "0.50" });
+        assert.equal(await page.evaluate(() => window.__rnmb.state.markupPercent), 12.35, "two decimals are still accepted");
+        session.assertClean();
+      } finally {
+        await session.close();
       }
     }
   }
