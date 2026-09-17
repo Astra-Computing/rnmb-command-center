@@ -1,5 +1,6 @@
 /*
- * domain.js — pure money and stock arithmetic for RNMB Command Center host mode.
+ * domain.js — pure money and stock arithmetic for RNMB Command Center host mode
+ * and the crew running balance.
  *
  * A classic browser script (no build step, no imports). It defines ONE global,
  * `RNMBDomain`, and when loaded by Node (`require("./domain.js")`) exports the
@@ -22,7 +23,21 @@
  *   ringUp  { id, nightId, kind: "guest"|"crew", tabId, personId, personName, menuItemName,
  *             priceCents|null, rungAt, voidedAt|null, lines: [line] }
  *   tab     { id, nightId, guestName, status: "open"|"paid"|"written_off",
- *             collectorId, collectorName, amountCents, closedAt }
+ *             collectorId, collectorName, amountCents, writtenOffBy|null, writtenOffByName|null,
+ *             openedAt, closedAt }
+ *             writtenOffBy/writtenOffByName: the crew member who wrote the tab off (null before
+ *             supabase/crew-balance.sql and on open or paid tabs)
+ *   pour    { id, personId, bottleId, ounces (amount in the type's measure), abv, timestamp,
+ *             costCents|null, buyerId|null, buyerName|null }   a crew pour, inside night.pours
+ *             costCents is WHOLE cents stamped at pour time (pourCostCents) with the bottle's buyer
+ *             snapshot; null on pours logged before cost stamping, which move no money
+ *   payment { id, fromPersonId, fromName, toPersonId, toName, amountCents (whole, > 0),
+ *             paidAt, voidedAt|null }                  crew member to crew member; soft-voided only
+ *   balance { personId|null, name, cents }             + = is owed, - = owes
+ *   suggestedPayment { fromPersonId|null, fromName, toPersonId|null, toName, amountCents }
+ *
+ * Crew balances (KTD1-KTD4) are derived on every read and never stored; every money
+ * movement is a pair of equal and opposite whole-cent amounts, so they sum to zero.
  *
  * Exported API:
  *   Constants: STANDARD_DRINK_OZ, MEASURE_OZ, MEASURE_UNIT, AMOUNT_EPSILON,
@@ -60,11 +75,27 @@
  *               byBuyer[{ buyerId, buyerName, cents }] }], writtenOff{ totalCents, byBuyer[] }, openTabCount }
  *   crewConsumption(ringUps, types, nightId?) -> { ounces, standardDrinks, count, byPerson[{ personId, personName,
  *               ounces, standardDrinks, count }] } over unvoided crew ring-ups (guest ring-ups never count)
- *   normalizeNight / normalizeMenuItem / normalizeTab / normalizeRingUp / normalizeAdjustment(record)
- *               -> the record with every field present in a fixed order (nulls, numbers, defaults)
- *   normalizeState(input) -> full browser state: people, types, bottles, nights (kind, endedAt, pours,
- *               startedLocally only when true), menuItems, guestTabs, ringUps, stockAdjustments,
- *               activeNightId, responsibleMode, markupPercent, roundingIncrementCents
+ *   pourCostCents(bottle, amount) -> whole cents: unitCostCents x amount rounded half-up once (throws on
+ *               a negative or non-numeric amount, or a bottle that cannot be costed)
+ *   ringUpCostCents(lines[{ costCents }]) -> { totalCents (unrounded total rounded half-up once),
+ *               lineCents[] (allocateShares of the total by line cost; sums to totalCents) }
+ *   crewBalances(state) -> [balance]: roster people in roster order (0 included), then anyone no longer
+ *               on the roster with a non-zero balance, by name then id, under their snapshot name.
+ *               crew pours: drinker -costCents, buyer +costCents; unvoided crew ring-ups: person -total,
+ *               line buyers +lineCents; paid tabs: line buyers +shareCents, collector - the same (=
+ *               amountCents); written-off tabs: writtenOffBy -each unvoided ring-up's total, buyers
+ *               +lineCents; unvoided payments: from +amountCents, to -amountCents. A movement where
+ *               either side names nobody (no id and no name) moves nothing; stock adjustments never do.
+ *   suggestPayments(balances) -> [suggestedPayment]: the fewest payments (exact, up to 10 non-zero
+ *               balances; largest debtor to largest creditor above that); order-independent, ties by
+ *               name then id
+ *   normalizeNight / normalizeMenuItem / normalizeTab / normalizeRingUp / normalizeAdjustment /
+ *   normalizePayment(record) -> the record with every field present in a fixed order (nulls, numbers, defaults)
+ *   normalizePour(pour) -> the pour with costCents (number|null), buyerId and buyerName (null when absent)
+ *   normalizeState(input) -> full browser state: people, types, bottles, nights (kind, endedAt, pours
+ *               normalized, startedLocally only when true), menuItems, guestTabs, ringUps,
+ *               stockAdjustments, payments, activeNightId, responsibleMode, markupPercent,
+ *               roundingIncrementCents
  *   typeRow(type, hostModeAvailable) -> rnmb_beverage_types row (snake_case)
  *   nightRow(night, hostModeAvailable) -> rnmb_nights row
  *   settingsRow(settings, hostModeAvailable) -> rnmb_settings row
@@ -673,6 +704,283 @@ var RNMBDomain = (function () {
     return result;
   }
 
+  // ---------- crew running balance (0.5.2-0.5.6, 0.8.7, 0.8.8, KTD1-KTD4) ------
+
+  /** Whole cents, half-up, after collapsing float noise (320.4999999999 is 320.5 and becomes 321). */
+  function roundHalfUpCents(cents) {
+    return Math.floor(round6(cents) + 0.5) + 0;
+  }
+
+  /** The integer cents a crew pour is stamped with when logged (KTD2): unit cost x amount, rounded half-up once. */
+  function pourCostCents(bottle, amount) {
+    var quantity = amount === null || amount === undefined || amount === "" ? NaN : Number(amount);
+    if (!Number.isFinite(quantity) || quantity < 0) throw new RangeError("A pour amount must be a finite amount of 0 or more.");
+    return roundHalfUpCents(lineCostCents(normalizeBottle(bottle), quantity));
+  }
+
+  /**
+   * A ring-up's cost in whole cents (KTD2): the unrounded line costs are totalled,
+   * rounded half-up ONCE, and the total is split back over the lines by largest
+   * remainder, so the lines always add up to exactly the total.
+   */
+  function ringUpCostCents(lines) {
+    var costs = (lines || []).map(function (line) {
+      var cost = Number((line && line.costCents) || 0);
+      if (!Number.isFinite(cost) || cost < 0) throw new RangeError("A line cost must be a finite amount of 0 or more.");
+      return cost;
+    });
+    var totalCents = roundHalfUpCents(costs.reduce(function (total, cost) { return total + cost; }, 0));
+    return { totalCents: totalCents, lineCents: allocateShares(totalCents, costs) };
+  }
+
+  /** "id:<id>" for a known id, "name:<name>" for a name snapshot only, null when a record names nobody. */
+  function partyKey(id, name) {
+    if (id !== undefined && id !== null && id !== "") return "id:" + id;
+    if (typeof name === "string" && name !== "") return "name:" + name;
+    return null;
+  }
+
+  function wholeCentsOrNull(value) {
+    if (value === undefined || value === null || value === "") return null;
+    var number = Number(value);
+    return Number.isFinite(number) ? Math.round(number) : null;
+  }
+
+  function isOwnedLine(line) {
+    return Boolean(line) && partyKey(line.buyerId, line.buyerName) !== null;
+  }
+
+  function compareParties(a, b) {
+    if (a.name !== b.name) return a.name < b.name ? -1 : 1;
+    var idA = a.personId === null || a.personId === undefined ? "" : String(a.personId);
+    var idB = b.personId === null || b.personId === undefined ? "" : String(b.personId);
+    if (idA !== idB) return idA < idB ? -1 : 1;
+    return 0;
+  }
+
+  /**
+   * Every person's running balance in integer cents, derived from the records on
+   * every read (KTD1). Positive = the crew owes them; negative = they owe.
+   *   crew pour (costCents stamped)    drinker -costCents, the bottle's buyer +costCents
+   *   unvoided crew ring-up            person -ringUpCostCents total, each line's buyer +its allocated cents
+   *   paid guest tab                   each unvoided line's buyer +shareCents, the collector - the same
+   *   written-off guest tab            writtenOffBy - each unvoided ring-up's total, buyers + allocated cents
+   *   unvoided payment                 from +amountCents (paying reduces what you owe), to -amountCents
+   * Every movement is a pair of equal and opposite amounts, so the balances always
+   * sum to zero (0.5.6). A movement where either side names nobody moves nothing:
+   * pours logged before cost stamping (costCents null), stock nobody bought (no
+   * buyer id or name, excluded from the ring-up total too) and write-offs recorded
+   * before their author was. A paid tab debits the collector the shares it credits,
+   * which equals amountCents whenever the tab's records are consistent (the database
+   * enforces amount_cents = the sum of unvoided prices). Stock adjustments never
+   * move money (0.5.5). Output: every roster person in roster order (0 included),
+   * then people no longer on the roster with a non-zero balance, by name then id,
+   * under their snapshot name.
+   */
+  function crewBalances(state) {
+    var source = state || {};
+    var entries = new Map();
+    var roster = [];
+
+    listOf(source.people).forEach(function (person) {
+      var key = person ? partyKey(person.id, person.name) : null;
+      if (key === null || entries.has(key)) return;
+      var entry = { personId: person.id === undefined || person.id === "" ? null : person.id, name: person.name || "", cents: 0 };
+      entries.set(key, entry);
+      roster.push(entry);
+    });
+
+    function entryFor(key, id, name) {
+      var entry = entries.get(key);
+      if (!entry) {
+        entry = { personId: id === undefined || id === "" ? null : id, name: "", cents: 0 };
+        entries.set(key, entry);
+      }
+      if (!entry.name && typeof name === "string") entry.name = name;
+      return entry;
+    }
+
+    /** `from` gives up `cents` to `to`: from -cents, to +cents. Nothing moves unless both sides are named. */
+    function move(fromId, fromName, toId, toName, cents) {
+      var fromKey = partyKey(fromId, fromName);
+      var toKey = partyKey(toId, toName);
+      if (fromKey === null || toKey === null || !cents) return;
+      entryFor(fromKey, fromId, fromName).cents -= cents;
+      entryFor(toKey, toId, toName).cents += cents;
+    }
+
+    function chargeCost(personId, personName, lines) {
+      if (partyKey(personId, personName) === null) return;
+      var owned = (lines || []).filter(isOwnedLine);
+      var cost = ringUpCostCents(
+        owned.map(function (line) {
+          var cents = Number(line.costCents);
+          return { costCents: Number.isFinite(cents) && cents > 0 ? cents : 0 };
+        })
+      );
+      owned.forEach(function (line, index) {
+        move(personId, personName, line.buyerId, line.buyerName, cost.lineCents[index]);
+      });
+    }
+
+    listOf(source.nights).forEach(function (night) {
+      listOf(night && night.pours).forEach(function (pour) {
+        if (!pour) return;
+        var cents = wholeCentsOrNull(pour.costCents);
+        if (cents === null || cents <= 0) return;
+        move(pour.personId, pour.personName, pour.buyerId, pour.buyerName, cents);
+      });
+    });
+
+    var tabMap = byId(source.guestTabs);
+    listOf(source.ringUps).forEach(function (ringUp) {
+      if (!ringUp || ringUp.voidedAt) return;
+      if (ringUp.kind === "crew") {
+        chargeCost(ringUp.personId, ringUp.personName, ringUp.lines);
+        return;
+      }
+      var tab = tabMap.get(ringUp.tabId);
+      if (!tab) return;
+      if (tab.status === "paid") {
+        listOf(ringUp.lines).forEach(function (line) {
+          if (!line) return;
+          var share = wholeCentsOrNull(line.shareCents);
+          if (share === null || share <= 0) return;
+          move(tab.collectorId, tab.collectorName, line.buyerId, line.buyerName, share);
+        });
+      } else if (tab.status === "written_off") {
+        chargeCost(tab.writtenOffBy, tab.writtenOffByName, ringUp.lines);
+      }
+    });
+
+    listOf(source.payments).forEach(function (payment) {
+      if (!payment || payment.voidedAt) return;
+      var cents = wholeCentsOrNull(payment.amountCents);
+      if (cents === null || cents <= 0) return;
+      // Paying moves the payer toward zero: the payee gives up the credit, the payer gains it.
+      move(payment.toPersonId, payment.toName, payment.fromPersonId, payment.fromName, cents);
+    });
+
+    var onRoster = new Set(roster);
+    var others = [];
+    entries.forEach(function (entry) {
+      if (!onRoster.has(entry) && entry.cents !== 0) others.push(entry);
+    });
+    others.sort(compareParties);
+    return roster.concat(others).map(function (entry) {
+      return { personId: entry.personId, name: entry.name, cents: entry.cents + 0 };
+    });
+  }
+
+  // Up to this many non-zero balances, suggestPayments searches for the true minimum (KTD3).
+  var EXACT_SETTLE_LIMIT = 10;
+
+  /** Largest debtor pays largest creditor until one side is settled. Ties go to the earlier party in the given order. */
+  function settleGreedy(parties) {
+    var working = parties.map(function (party) { return { party: party, cents: party.cents }; });
+    var payments = [];
+    for (;;) {
+      var debtor = null;
+      var creditor = null;
+      working.forEach(function (entry) {
+        if (entry.cents < 0 && (!debtor || entry.cents < debtor.cents)) debtor = entry;
+        if (entry.cents > 0 && (!creditor || entry.cents > creditor.cents)) creditor = entry;
+      });
+      if (!debtor || !creditor) return payments;
+      var amount = Math.min(-debtor.cents, creditor.cents);
+      payments.push({
+        fromPersonId: debtor.party.personId,
+        fromName: debtor.party.name,
+        toPersonId: creditor.party.personId,
+        toName: creditor.party.name,
+        amountCents: amount
+      });
+      debtor.cents += amount;
+      creditor.cents -= amount;
+    }
+  }
+
+  /**
+   * Splits the parties into the most zero-sum groups (a group of k settles in k-1
+   * payments, so the most groups means the fewest payments). Subset DP over at most
+   * 2^10 masks: best[mask] = the most zero-sum prefixes of any ordering of mask.
+   * Walking back down from the full set, always removing the lowest index that keeps
+   * the optimum, makes the result depend only on the (sorted) order of parties.
+   */
+  function zeroSumGroups(parties) {
+    var n = parties.length;
+    var full = (1 << n) - 1;
+    var sums = new Array(full + 1);
+    var best = new Array(full + 1);
+    sums[0] = 0;
+    best[0] = 0;
+    for (var mask = 1; mask <= full; mask += 1) {
+      var low = mask & -mask;
+      sums[mask] = sums[mask ^ low] + parties[31 - Math.clz32(low)].cents;
+      var top = 0;
+      for (var i = 0; i < n; i += 1) {
+        if (mask & (1 << i)) top = Math.max(top, best[mask ^ (1 << i)]);
+      }
+      best[mask] = top + (sums[mask] === 0 ? 1 : 0);
+    }
+
+    var groups = [];
+    var current = [];
+    var remaining = full;
+    while (remaining) {
+      var closes = sums[remaining] === 0 ? 1 : 0;
+      for (var j = 0; j < n; j += 1) {
+        var bit = 1 << j;
+        if ((remaining & bit) && best[remaining ^ bit] + closes === best[remaining]) {
+          current.push(j);
+          remaining ^= bit;
+          break;
+        }
+      }
+      if (sums[remaining] === 0) {
+        groups.push(current);
+        current = [];
+      }
+    }
+    return groups
+      .map(function (group) {
+        return group.sort(function (a, b) { return a - b; });
+      })
+      .sort(function (a, b) { return a[0] - b[0]; })
+      .map(function (group) {
+        return group.map(function (index) { return parties[index]; });
+      });
+  }
+
+  /**
+   * The payments that settle everyone (KTD3). Zero balances are ignored and parties
+   * are sorted by name then id first, so any order of the same balances gives the
+   * identical list on every device. Up to 10 non-zero balances: the true minimum
+   * number of payments. Above 10: largest debtor to largest creditor. Balances are
+   * expected to sum to zero (crewBalances always does); if not, what cannot be
+   * matched is left unsettled.
+   */
+  function suggestPayments(balances) {
+    var parties = listOf(balances)
+      .map(function (entry) {
+        var cents = Math.round(Number(entry && entry.cents));
+        return {
+          personId: entry && entry.personId !== undefined ? entry.personId : null,
+          name: entry && entry.name ? String(entry.name) : "",
+          cents: Number.isFinite(cents) ? cents : 0
+        };
+      })
+      .filter(function (party) { return party.cents !== 0; })
+      .sort(compareParties);
+    if (parties.length === 0) return [];
+    if (parties.length > EXACT_SETTLE_LIMIT) return settleGreedy(parties);
+    var payments = [];
+    zeroSumGroups(parties).forEach(function (group) {
+      settleGreedy(group).forEach(function (payment) { payments.push(payment); });
+    });
+    return payments;
+  }
+
   // ---------- whole-state normalizer (archives, localStorage, database loads) ---
 
   var MENU_KINDS = ["cocktail", "straight", "counted"];
@@ -697,6 +1005,15 @@ var RNMBDomain = (function () {
     return Number.isFinite(number) ? number : 0;
   }
 
+  /** A crew pour keeps its fields and gains costCents (whole cents or null), buyerId and buyerName (null when absent). */
+  function normalizePour(pour) {
+    var copy = Object.assign({}, pour);
+    copy.costCents = numberOrNull(copy.costCents);
+    copy.buyerId = orNull(copy.buyerId);
+    copy.buyerName = orNull(copy.buyerName);
+    return copy;
+  }
+
   /** startedLocally is a browser-only mark (KTD9): kept only when literally true, never sent to the database. */
   function normalizeNight(night) {
     var source = night || {};
@@ -707,7 +1024,7 @@ var RNMBDomain = (function () {
       date: source.date,
       kind: kind,
       endedAt: kind === "host" ? orNull(source.endedAt) : null,
-      pours: listOf(source.pours)
+      pours: listOf(source.pours).map(normalizePour)
     };
     if (source.startedLocally === true) result.startedLocally = true;
     return result;
@@ -735,6 +1052,8 @@ var RNMBDomain = (function () {
       collectorId: orNull(source.collectorId),
       collectorName: orNull(source.collectorName),
       amountCents: numberOrNull(source.amountCents),
+      writtenOffBy: orNull(source.writtenOffBy),
+      writtenOffByName: orNull(source.writtenOffByName),
       openedAt: orNull(source.openedAt),
       closedAt: orNull(source.closedAt)
     };
@@ -784,6 +1103,20 @@ var RNMBDomain = (function () {
     };
   }
 
+  function normalizePayment(payment) {
+    var source = payment || {};
+    return {
+      id: source.id,
+      fromPersonId: orNull(source.fromPersonId),
+      fromName: source.fromName || "",
+      toPersonId: orNull(source.toPersonId),
+      toName: source.toName || "",
+      amountCents: numberOrZero(source.amountCents),
+      paidAt: orNull(source.paidAt),
+      voidedAt: orNull(source.voidedAt)
+    };
+  }
+
   /** Any archive, localStorage copy or database load -> the full browser state, host-mode collections included. */
   function normalizeState(input) {
     var source = input || {};
@@ -799,6 +1132,7 @@ var RNMBDomain = (function () {
       guestTabs: listOf(source.guestTabs).map(normalizeTab),
       ringUps: listOf(source.ringUps).map(normalizeRingUp),
       stockAdjustments: listOf(source.stockAdjustments).map(normalizeAdjustment),
+      payments: listOf(source.payments).map(normalizePayment),
       activeNightId: source.activeNightId || (nights[0] && nights[0].id) || "",
       responsibleMode: source.responsibleMode !== false,
       markupPercent:
@@ -898,11 +1232,17 @@ var RNMBDomain = (function () {
     tabTotalCents: tabTotalCents,
     summarizeHostNight: summarizeHostNight,
     crewConsumption: crewConsumption,
+    pourCostCents: pourCostCents,
+    ringUpCostCents: ringUpCostCents,
+    crewBalances: crewBalances,
+    suggestPayments: suggestPayments,
     normalizeNight: normalizeNight,
+    normalizePour: normalizePour,
     normalizeMenuItem: normalizeMenuItem,
     normalizeTab: normalizeTab,
     normalizeRingUp: normalizeRingUp,
     normalizeAdjustment: normalizeAdjustment,
+    normalizePayment: normalizePayment,
     normalizeState: normalizeState,
     typeRow: typeRow,
     nightRow: nightRow,
