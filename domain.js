@@ -95,6 +95,9 @@
  *               whose balance would move if that person were deleted (their pours cascade, other references
  *               are set null and keep their name snapshots); includes parties already off the roster,
  *               matched by name snapshot with personId null
+ *   parseVolumeOunces(value) -> fluid ounces for a typed volume, to 2dp: a bare number is already
+ *               ounces ("1.5"), or name the unit and it converts ("750 ml", "1.5 fl oz", "3cl", "1 L").
+ *               null for anything else, including a negative, so a caller can tell empty from wrong
  *   dollarsToCents(value) -> whole cents for a typed dollar amount ("3.20", "$12", ".5"), else null
  *   quickLogAmount(type) -> 1.5 (oz) for poured stock, 1 (unit) for counted stock
  *   nightRecap(state, nightId) -> [{ personId, name, drinks, ounces, standardDrinks, costCents }]: one night's
@@ -1205,6 +1208,49 @@ var RNMBDomain = (function () {
    * so no floating-point product can round it; null for anything else (a sign,
    * more than two decimals, separators, an exponent, an empty field).
    */
+  // 1 US fluid ounce, the unit every volume is stored in. A 750 ml bottle is
+  // 25.36 oz by this, which is where the stock form's default came from.
+  var ML_PER_OUNCE = 29.5735295625;
+  var VOLUME_UNITS = {
+    oz: 1, ozs: 1, floz: 1, flozs: 1, ounce: 1, ounces: 1, flounce: 1, flounces: 1, fluidounce: 1, fluidounces: 1,
+    ml: 1 / ML_PER_OUNCE, mls: 1 / ML_PER_OUNCE, milliliter: 1 / ML_PER_OUNCE, milliliters: 1 / ML_PER_OUNCE,
+    millilitre: 1 / ML_PER_OUNCE, millilitres: 1 / ML_PER_OUNCE,
+    cl: 10 / ML_PER_OUNCE, cls: 10 / ML_PER_OUNCE, centiliter: 10 / ML_PER_OUNCE, centiliters: 10 / ML_PER_OUNCE,
+    centilitre: 10 / ML_PER_OUNCE, centilitres: 10 / ML_PER_OUNCE,
+    l: 1000 / ML_PER_OUNCE, liter: 1000 / ML_PER_OUNCE, liters: 1000 / ML_PER_OUNCE,
+    litre: 1000 / ML_PER_OUNCE, litres: 1000 / ML_PER_OUNCE
+  };
+
+  /**
+   * Fluid ounces for a volume somebody typed, rounded to 2dp (the precision every
+   * volume input already steps in). A bare number is ounces, so nothing that
+   * worked before changes meaning; naming a unit converts it.
+   *
+   * Bottles are labelled in millilitres and recipes in ounces, so both are
+   * accepted rather than making anyone do the arithmetic. Returns null for
+   * anything that is not a volume -- empty, a stray word, a negative -- so a
+   * caller can tell "typed nothing" from "typed something wrong".
+   */
+  function parseVolumeOunces(value) {
+    if (typeof value === "number") return isFinite(value) && value >= 0 ? round2(value) : null;
+    if (typeof value !== "string") return null;
+    var text = value.trim().toLowerCase();
+    if (!text) return null;
+    // "750 ml", "750ml", "1.5 fl oz", "1.5fl.oz." -- the number, then the unit.
+    var match = /^([0-9]*\.?[0-9]+)\s*([a-z. ]*)$/.exec(text);
+    if (!match) return null;
+    var amount = Number(match[1]);
+    if (!isFinite(amount) || amount < 0) return null;
+    var unit = match[2].replace(/[. ]/g, "");
+    if (!unit) return round2(amount);
+    if (!Object.prototype.hasOwnProperty.call(VOLUME_UNITS, unit)) return null;
+    return round2(amount * VOLUME_UNITS[unit]);
+  }
+
+  function round2(value) {
+    return Math.round(value * 100) / 100;
+  }
+
   function dollarsToCents(value) {
     if (typeof value === "number" && !Number.isFinite(value)) return null;
     if (typeof value !== "number" && typeof value !== "string") return null;
@@ -1624,6 +1670,7 @@ var RNMBDomain = (function () {
     crewDrinkCostCents: crewDrinkCostCents,
     balanceChangesOnRemoval: balanceChangesOnRemoval,
     dollarsToCents: dollarsToCents,
+    parseVolumeOunces: parseVolumeOunces,
     quickLogAmount: quickLogAmount,
     recentLogItems: recentLogItems,
     nightRecap: nightRecap,

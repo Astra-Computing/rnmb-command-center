@@ -14,6 +14,21 @@
   --shadow: 0 20px 60px rgba(0, 0, 0, 0.28);
 }
 
+/*
+ * Button colour carries meaning, so read this before adding one.
+ *
+ *   --accent (orange, #111 text)  the action that moves things on: the next step
+ *                                 in a flow, and opening or closing a night.
+ *                                 Start night, Open register, Ring up, Paid,
+ *                                 End night.
+ *   --surface-2 (grey)            everything you might pick instead: options,
+ *                                 selections, navigation, undo. Start over,
+ *                                 Open tab, Exit register, Void, Remove, Set level.
+ *
+ * A grey control may turn orange on hover; an orange one stays orange, so the
+ * colour never reads as a state change.
+ */
+
 * {
   box-sizing: border-box;
 }
@@ -625,6 +640,14 @@ body.is-register .app-shell {
   color: #111;
 }
 
+/* Open register is the next step out of Tonight; #exitRegister and #registerBack
+   are navigation back, so they keep the grey. */
+#openRegisterLink {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #111;
+}
+
 .register-banner {
   padding: 12px 16px;
   border: 2px solid var(--red);
@@ -741,6 +764,14 @@ body.is-register .app-shell {
 .register-secondary {
   background: var(--surface-2);
   color: var(--text);
+}
+
+/* Ending a night is the one action on either screen that closes the night, so
+   both End night buttons carry the accent, like .register-primary. The id beats
+   .register-secondary and #nightRecapPanel .secondary-button on specificity. */
+#registerEndNight {
+  background: var(--accent);
+  color: #111;
 }
 
 .register button:disabled {
@@ -1355,6 +1386,17 @@ body.is-register .app-shell {
 #nightRecapPanel .secondary-button:disabled {
   cursor: not-allowed;
   opacity: 0.45;
+}
+
+#nightRecapPanel #endCrewNight {
+  background: var(--accent);
+  color: #111;
+}
+
+/* The panel's generic hover turns a button accent; this one already is, so it
+   stays put rather than flashing to the same colour it started at. */
+#nightRecapPanel #endCrewNight:hover:not(:disabled) {
+  background: var(--accent);
 }
 
 .recap-add {

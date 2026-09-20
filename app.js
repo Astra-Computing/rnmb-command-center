@@ -1713,6 +1713,25 @@ function renderForms() {
   syncPourAmountField();
 }
 
+/**
+ * Point one amount field at a volume or at a count. A volume is a text field, so
+ * a typed unit reaches us -- `type="number"` reports an empty value for "750 ml"
+ * and the unit would be silently lost. A count keeps the number spinner.
+ */
+function setVolumeField(input, { volume, min, step, placeholder }) {
+  input.type = volume ? "text" : "number";
+  input.placeholder = volume ? placeholder : "";
+  if (volume) {
+    input.inputMode = "decimal";
+    input.autocomplete = "off";
+    input.removeAttribute("min");
+    input.removeAttribute("step");
+    return;
+  }
+  input.min = min;
+  input.step = step;
+}
+
 const POURED_SIZE_DEFAULT = 25.36;
 const COUNTED_SIZE_DEFAULT = 12;
 
@@ -1725,8 +1744,9 @@ function syncBottleSizeField() {
   // Swap the default only when the measure changes, so a typed size survives a re-render.
   if (input.dataset.measure !== measure) input.value = counted ? COUNTED_SIZE_DEFAULT : POURED_SIZE_DEFAULT;
   input.dataset.measure = measure;
-  input.min = "1";
-  input.step = counted ? "1" : "0.01";
+  // Counted stock is a whole number of units, so it keeps the number spinner. A
+  // volume is typed, because a number input throws away "750 ml" before we see it.
+  setVolumeField(input, { volume: !counted, min: "1", step: "1", placeholder: "25.36 or 750 ml" });
   document.querySelector("#bottleSizeLabel").textContent = counted ? "Size units" : "Size oz";
 }
 
@@ -1738,8 +1758,7 @@ function syncPourAmountField() {
   const measure = counted ? RNMBDomain.MEASURE_UNIT : RNMBDomain.MEASURE_OZ;
   if (input.dataset.measure !== measure) input.value = counted ? 1 : 1.5;
   input.dataset.measure = measure;
-  input.min = counted ? "1" : "0.1";
-  input.step = counted ? "1" : "0.1";
+  setVolumeField(input, { volume: !counted, min: "1", step: "1", placeholder: "1.5 or 44 ml" });
   document.querySelector("#pourAmountLabel").textContent = counted ? "Units consumed" : "Ounces consumed";
 }
 
@@ -2388,7 +2407,9 @@ function renderInventory() {
         <form class="level-form" data-level-form="${escapeHtml(bottle.id)}">
           <label>
             <span>Set level (${counted ? "units" : "oz"})</span>
-            <input name="level" type="number" min="0" max="${Number(bottle.size) || 0}" step="${counted ? "1" : "0.01"}" value="${level}" required>
+            ${counted
+              ? `<input name="level" type="number" min="0" max="${Number(bottle.size) || 0}" step="1" value="${level}" required>`
+              : `<input name="level" type="text" inputmode="decimal" autocomplete="off" value="${level}" placeholder="${level} or 500 ml" required>`}
           </label>
           <button type="submit">Set</button>
         </form>
@@ -2466,15 +2487,14 @@ function syncIngredientRow(row) {
   if (kind === "counted") {
     input.value = "1";
     input.readOnly = true;
-    input.min = "1";
-    input.step = "1";
+    setVolumeField(input, { volume: false, min: "1", step: "1" });
     label.textContent = "Units";
     return;
   }
   input.readOnly = false;
-  input.min = isCounted(type) ? "1" : "0.01";
-  input.step = isCounted(type) ? "1" : "0.01";
-  label.textContent = isCounted(type) ? "Amount units" : "Amount oz";
+  const counted = isCounted(type);
+  setVolumeField(input, { volume: !counted, min: "1", step: "1", placeholder: "1.5 or 44 ml" });
+  label.textContent = counted ? "Amount units" : "Amount oz";
 }
 
 function addIngredientRow({ id = "", typeId = "", amount = 1 } = {}) {
@@ -2489,7 +2509,7 @@ function addIngredientRow({ id = "", typeId = "", amount = 1 } = {}) {
     </label>
     <label>
       <span data-amount-label>Amount oz</span>
-      <input name="ingredientAmount" type="number" min="0.01" step="0.01" value="${escapeHtml(String(amount))}">
+      <input name="ingredientAmount" type="text" inputmode="decimal" autocomplete="off" value="${escapeHtml(String(amount))}" placeholder="1.5 or 44 ml">
     </label>
     <button class="remove-button" type="button" data-remove-ingredient aria-label="Remove ingredient">×</button>
   `;
@@ -2544,9 +2564,11 @@ function menuItemDraftFromForm() {
     if (kind === "counted" && !isCounted(type)) return { error: `A counted item needs a counted stock type, and ${type.name} is poured.` };
     if (kind === "straight" && isCounted(type)) return { error: `A straight pour needs a poured stock type, and ${type.name} is counted.` };
     const raw = row.querySelector("input[name='ingredientAmount']").value.trim();
-    const amount = kind === "counted" ? 1 : Number(raw);
-    if (!Number.isFinite(amount) || amount <= 0 || (kind !== "counted" && raw === "")) {
-      return { error: "Every ingredient needs an amount above zero." };
+    // Counted ingredients are always one unit; a poured one is a volume, so a
+    // recipe can be written in millilitres as readily as in ounces.
+    const amount = kind === "counted" ? 1 : (isCounted(type) ? Number(raw) : RNMBDomain.parseVolumeOunces(raw));
+    if (amount === null || !Number.isFinite(amount) || amount <= 0 || (kind !== "counted" && raw === "")) {
+      return { error: "Every ingredient needs an amount above zero, in ounces or millilitres." };
     }
     if (isCounted(type) && !Number.isInteger(amount)) return { error: `${type.name} is counted stock, so use a whole number of units.` };
     ingredients.push({ id: row.dataset.ingredientId || undefined, typeId: type.id, amount });
@@ -3573,7 +3595,8 @@ document.querySelector("#typeForm").addEventListener("submit", async (event) => 
   const data = new FormData(form);
   const measure = data.get("measure") === RNMBDomain.MEASURE_UNIT ? RNMBDomain.MEASURE_UNIT : RNMBDomain.MEASURE_OZ;
   const abv = Number(data.get("abv"));
-  const unitOz = measure === RNMBDomain.MEASURE_UNIT ? Number(data.get("unitOz")) : null;
+  // The volume of one unit, so a can labelled 355 ml can be typed that way.
+  const unitOz = measure === RNMBDomain.MEASURE_UNIT ? RNMBDomain.parseVolumeOunces(data.get("unitOz")) : null;
   if (!Number.isFinite(abv) || abv < 0 || abv > 95) {
     showToast("ABV must be between 0 and 95 percent.");
     return;
@@ -3621,10 +3644,13 @@ document.querySelector("#bottleForm").addEventListener("submit", async (event) =
   }
   const data = new FormData(event.currentTarget);
   // The form field keeps its old name; the amount is in the type's measure (KTD5).
-  const size = Number(data.get("sizeOz"));
   const stockType = typeById(data.get("typeId"));
-  if (!stockType || !Number.isFinite(size) || size <= 0) {
-    showToast("Pick a type and a size above zero.");
+  // Counted stock is a count; a poured size is a volume, so "750 ml" is accepted.
+  const size = stockType && isCounted(stockType)
+    ? Number(data.get("sizeOz"))
+    : RNMBDomain.parseVolumeOunces(data.get("sizeOz"));
+  if (!stockType || size === null || !Number.isFinite(size) || size <= 0) {
+    showToast("Pick a type and a size above zero. A size can be ounces or millilitres, like 750 ml.");
     return;
   }
   if (isCounted(stockType) && !Number.isInteger(size)) {
@@ -3683,7 +3709,16 @@ document.querySelector("#pourForm").addEventListener("submit", async (event) => 
   try {
     // In the type's measure: ounces, or a count for counted stock (KTD5). The
     // field keeps its old name, and so does the pour's `ounces` property.
-    pour = preparePour(night, { personId: data.get("personId"), bottleId: data.get("bottleId"), ounces: Number(data.get("ounces")) });
+    const bottleForPour = bottleById(data.get("bottleId"));
+    const rawAmount = data.get("ounces");
+    const amount = isCounted(typeById(bottleForPour?.typeId))
+      ? Number(rawAmount)
+      : RNMBDomain.parseVolumeOunces(rawAmount);
+    if (amount === null) {
+      showToast("Enter how much was drunk, in ounces or millilitres, like 1.5 or 44 ml.");
+      return;
+    }
+    pour = preparePour(night, { personId: data.get("personId"), bottleId: data.get("bottleId"), ounces: amount });
   } catch (error) {
     showToast(error.userMessage || "Pick a stocked bottle and a valid pour.");
     return;
@@ -3784,8 +3819,10 @@ document.body.addEventListener("submit", async (event) => {
   if (!bottle) return;
   const type = typeById(bottle.typeId);
   const raw = form.querySelector("[name='level']").value.trim();
-  const newRemaining = Number(raw);
-  if (raw === "" || !Number.isFinite(newRemaining) || newRemaining < 0 || newRemaining > Number(bottle.size)) {
+  // A level in the bottle is a volume unless the stock is counted, so it reads
+  // millilitres too -- handy when what is left is judged against the label.
+  const newRemaining = isCounted(type) ? Number(raw) : RNMBDomain.parseVolumeOunces(raw);
+  if (raw === "" || newRemaining === null || !Number.isFinite(newRemaining) || newRemaining < 0 || newRemaining > Number(bottle.size)) {
     showToast(`Set a level from 0 to ${amountText(type, bottle.size)}.`);
     return;
   }

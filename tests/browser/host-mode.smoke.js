@@ -3822,6 +3822,106 @@ const scenarios = [
         await session.close();
       }
     }
+  },
+  {
+    name: "Both End night buttons carry the accent, the same orange as the register's primary action",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const bg = (selector) => page.evaluate(
+          (sel) => getComputedStyle(document.querySelector(sel)).backgroundColor,
+          selector
+        );
+
+        // The crew recap's End night, while a crew night is the active one.
+        await page.click('.tab-button[data-tab="tonight"]');
+        await page.waitForSelector("#endCrewNight:not([hidden])");
+        const crewEnd = await bg("#endCrewNight");
+
+        // Starting a host night makes it active, which hides the crew recap.
+        await startHostNightViaForm(session, "Accent night");
+        await openRegister(session);
+        await openTabViaRegister(session, "Riley");
+        const registerEnd = await bg("#registerEndNight");
+        const registerPay = await bg(".register-pay");
+        const registerOther = await bg("#registerClear");
+
+        assert.equal(registerEnd, registerPay, "the register's End night matches its primary action");
+        assert.equal(crewEnd, registerPay, "and so does the crew recap's End night");
+        assert.notEqual(registerEnd, registerOther, "and neither reads as a plain secondary button");
+
+        // Pin the token itself, so a theme change has to be deliberate.
+        assert.equal(registerPay, "rgb(249, 115, 22)", "--accent is #f97316");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+  {
+    name: "Every volume field takes millilitres as well as ounces, and counted stock still takes only whole units",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const tequila = await page.evaluate(() => window.__rnmb.state.types.find((type) => type.name === "Emergency Tequila").id);
+
+        // 1. Stock size: the bottle is labelled 750 ml, so that is what gets typed.
+        const metric = await addStockViaForm(session, { typeId: tequila, nickname: "Metric bottle", size: "750 ml" });
+        assert.equal(metric.size, 25.36, "750 ml is stored as 25.36 oz");
+        assert.equal(metric.remaining, 25.36);
+
+        // 2. A pour in millilitres comes off the same bottle in ounces.
+        await page.click('.tab-button[data-tab="tonight"]');
+        await page.selectOption("#pourForm [name='personId']", await personIdOf(page, "Sam"));
+        await page.selectOption("#pourForm [name='bottleId']", metric.id);
+        await page.fill("#pourForm [name='ounces']", "44 ml");
+        await clickForToast(session, "#pourForm button[type='submit']", "Pour logged.");
+        assert.equal(await stockOf(page, metric.id), 23.87, "44 ml is 1.49 oz off a 25.36 oz bottle");
+
+        // 3. Set level, judged against the label rather than converted by hand.
+        await page.click('.tab-button[data-tab="inventory"]');
+        await page.fill(`#inventoryList [data-level-form="${metric.id}"] [name='level']`, "500 ml");
+        await clickForToast(session, `#inventoryList [data-level-form="${metric.id}"] button[type='submit']`, "Stock level set.");
+        assert.equal(await stockOf(page, metric.id), 16.91, "500 ml is 16.91 oz");
+
+        // 4. A counted type's unit volume is a volume: a can is labelled 355 ml.
+        const can = await addTypeViaForm(session, { name: "Metric can", category: "Beer", measure: "unit", unitOz: "355 ml", abv: 5 });
+        assert.equal(can.unitOz, 12, "355 ml is 12 oz per unit");
+
+        // 5. But the COUNT of those cans is a count, not a volume: the field stays
+        //    a number input, so "12 ml" cannot even be typed into it.
+        await page.click('.tab-button[data-tab="inventory"]');
+        await page.selectOption("#bottleForm [name='typeId']", can.id);
+        assert.equal(await page.locator("#bottleForm [name='sizeOz']").getAttribute("type"), "number", "a counted size keeps the number spinner");
+        await page.selectOption("#bottleForm [name='typeId']", tequila);
+        assert.equal(await page.locator("#bottleForm [name='sizeOz']").getAttribute("type"), "text", "a poured size takes typed units");
+
+        // 6. A recipe ingredient in millilitres.
+        await page.click('.tab-button[data-tab="menu"]');
+        await page.fill("#menuItemForm [name='name']", "Metric shot");
+        await page.selectOption("#menuItemForm [name='kind']", "straight");
+        const row = page.locator("#ingredientRows [data-ingredient-row]").first();
+        await row.locator("select[name='ingredientType']").selectOption(tequila);
+        await row.locator("input[name='ingredientAmount']").fill("44 ml");
+        await clickForToast(session, "#menuItemSubmit", "Menu item added.");
+        const saved = await page.evaluate(() => window.__rnmb.state.menuItems.find((item) => item.name === "Metric shot"));
+        assert.equal(saved.ingredients[0].amount, 1.49, "the recipe stores 1.49 oz");
+
+        // 7. Nonsense is refused rather than guessed at, and nothing is saved.
+        await page.click('.tab-button[data-tab="inventory"]');
+        await page.selectOption("#bottleForm [name='typeId']", tequila);
+        await page.fill("#bottleForm [name='nickname']", "Bad units");
+        await page.fill("#bottleForm [name='sizeOz']", "5 gallons");
+        await clickForToast(session, "#bottleForm button[type='submit']", "Pick a type and a size above zero. A size can be ounces or millilitres, like 750 ml.");
+        assert.equal(await page.evaluate(() => window.__rnmb.state.bottles.some((entry) => entry.nickname === "Bad units")), false, "nothing was saved");
+
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
   }
 ];
 

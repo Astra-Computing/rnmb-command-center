@@ -1719,3 +1719,39 @@ test("crewDrinksOnNight keeps a drink whose drinker has left the roster (0.4.3, 
   const drinks = D.crewDrinksOnNight(state, "h1");
   assert.deepEqual(drinks.map((drink) => [drink.personName, drink.personId, drink.costCents]), [["Zoe", null, 100]], "the name snapshot still names who owes it");
 });
+
+test("parseVolumeOunces takes ounces or millilitres, and refuses anything that is not a volume", () => {
+  // A bare number is already ounces, so nothing typed before this existed changes meaning.
+  assert.equal(D.parseVolumeOunces("1.5"), 1.5);
+  assert.equal(D.parseVolumeOunces("25.36"), 25.36);
+  assert.equal(D.parseVolumeOunces(12), 12);
+  assert.equal(D.parseVolumeOunces("0"), 0);
+
+  // The two the bar actually has to read: a bottle labelled in ml, a recipe in oz.
+  assert.equal(D.parseVolumeOunces("750 ml"), 25.36, "a 750 ml bottle is the stock form's default");
+  assert.equal(D.parseVolumeOunces("355ml"), 12, "a 355 ml can is 12 oz");
+  assert.equal(D.parseVolumeOunces("1.5 fl oz"), 1.5);
+  assert.equal(D.parseVolumeOunces("1.5fl.oz."), 1.5, "punctuation and spacing in the unit are ignored");
+  assert.equal(D.parseVolumeOunces(" 44 ml "), 1.49);
+
+  // Spelled out, and the other metric sizes a bottle is sold in.
+  assert.equal(D.parseVolumeOunces("750 millilitres"), 25.36);
+  assert.equal(D.parseVolumeOunces("3cl"), 1.01);
+  assert.equal(D.parseVolumeOunces("1 L"), 33.81);
+  assert.equal(D.parseVolumeOunces("1 litre"), 33.81);
+  assert.equal(D.parseVolumeOunces("12 ounces"), 12);
+
+  // Null, never 0, so a caller can tell "typed nothing" from "typed something wrong".
+  assert.equal(D.parseVolumeOunces(""), null);
+  assert.equal(D.parseVolumeOunces("   "), null);
+  assert.equal(D.parseVolumeOunces("abc"), null);
+  assert.equal(D.parseVolumeOunces("-2"), null, "a negative volume is not a volume");
+  assert.equal(D.parseVolumeOunces("-2 ml"), null);
+  assert.equal(D.parseVolumeOunces("5 gallons"), null, "an unknown unit is refused rather than guessed at");
+  assert.equal(D.parseVolumeOunces("750 ml of gin"), null);
+  assert.equal(D.parseVolumeOunces(null), null);
+  assert.equal(D.parseVolumeOunces(undefined), null);
+  assert.equal(D.parseVolumeOunces({}), null);
+  assert.equal(D.parseVolumeOunces(NaN), null);
+  assert.equal(D.parseVolumeOunces(Infinity), null);
+});

@@ -6,6 +6,7 @@ A dependency-free dashboard for tracking group beverage inventory, spending, nig
 
 - Shared Supabase persistence for people, beverage types, bottle purchases, and night logs
 - U.S. standard drink calculations using fluid ounces and ABV
+- Every volume can be typed in millilitres instead — `750 ml`, `44ml`, `3cl`, `1 L` — and is stored in ounces
 - One running balance per person: every drink costs the drinker what it drew, and credits whoever bought it
 - Quick log: two taps on a phone to record a drink, and an end-of-night recap to fix what was missed
 - Inventory depletion tracking when pours are logged
@@ -93,6 +94,8 @@ Host mode replaces a flat cover charge with a tab per guest.
 **Set up (in the dashboard):**
 
 1. **Inventory**: add stock types. Choose *Poured, ounces* for spirits, liqueurs and fluid mixers (mixers use ABV 0) or *Counted, units* for cans and bottled drinks (give the volume of one unit). Then add the stock you bought, with its price and who paid.
+
+   Anywhere a **volume** is asked for — a bottle's size, a pour, a recipe ingredient, a unit's volume, or setting a level by hand — you can type the unit and it converts: `750 ml` for a bottle, `44 ml` for a shot, `3cl`, `1 L`. A bare number still means ounces, so nothing you already know how to type has changed. The one exception is the **count** of counted stock (how many cans you bought), which is a number of units and not a volume.
 2. **Menu**: build cocktails, straight pours and counted items from those types, and set the markup percentage and the rounding step. Each item shows the price it would ring up at right now, or *Unavailable* when stock can't cover it.
 3. **Tonight**: start a night and choose *Host night*, then follow *Open register*.
 
