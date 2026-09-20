@@ -403,6 +403,533 @@ small,
   justify-content: space-between;
 }
 
+/* .form-grid label is display:grid, which would override the hidden attribute. */
+.form-grid [hidden] {
+  display: none;
+}
+
+/* Set level on an inventory card: one compact row, input then button. */
+.level-form {
+  display: flex;
+  gap: 8px;
+  align-items: end;
+}
+
+.level-form label {
+  display: grid;
+  flex: 1 1 auto;
+  gap: 4px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+
+.level-form input {
+  width: 100%;
+  min-width: 0;
+  min-height: 36px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.level-form button {
+  flex: 0 0 auto;
+  min-height: 36px;
+  padding: 6px 14px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: 800;
+}
+
+.level-form button:hover {
+  background: var(--accent);
+  color: #111;
+}
+
+.level-form button:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+
+/* Menu tab */
+.notice {
+  padding: 12px 14px;
+  border: 1px solid rgba(250, 204, 21, 0.6);
+  border-radius: 8px;
+  background: rgba(250, 204, 21, 0.1);
+  color: var(--yellow);
+  font-weight: 700;
+}
+
+.form-grid .span-2 {
+  grid-column: 1 / -1;
+}
+
+.form-note {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.ingredient-block {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.field-label {
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.ingredient-rows {
+  display: grid;
+  gap: 8px;
+}
+
+.ingredient-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 7.5rem) auto;
+  gap: 8px;
+  align-items: end;
+}
+
+.ingredient-row input[readonly] {
+  color: var(--muted);
+}
+
+.form-grid .secondary-button,
+.card-actions .secondary-button {
+  min-height: 36px;
+  padding: 6px 14px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: 800;
+}
+
+.ingredient-block .secondary-button {
+  justify-self: start;
+}
+
+/* Sits beside the submit button, so match its height. */
+.form-grid #menuItemCancel {
+  min-height: 42px;
+}
+
+.form-grid .remove-button {
+  min-height: 42px;
+  padding: 0 12px;
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+.form-grid .secondary-button:hover:not(:disabled),
+.card-actions .secondary-button:hover:not(:disabled) {
+  background: var(--accent);
+  color: #111;
+}
+
+.form-grid button:disabled,
+.card-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.price-pill {
+  background: rgba(34, 197, 94, 0.14);
+  color: var(--accent-2);
+  font-size: 1rem;
+}
+
+.recipe-lines {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding-left: 18px;
+  font-size: 0.88rem;
+}
+
+.card-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+/* Tonight: the way into the register while a host night runs. */
+.host-night-notice {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid rgba(249, 115, 22, 0.6);
+  border-radius: 8px;
+  background: rgba(249, 115, 22, 0.1);
+}
+
+.host-night-notice[hidden] {
+  display: none;
+}
+
+/* Bar register (#register): full screen, touch-first, for one bartender. */
+body.is-register .app-shell {
+  display: none;
+}
+
+.register {
+  display: grid;
+  gap: 16px;
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+/* Two selectors' worth of specificity, so hidden beats every display rule below. */
+.register[hidden],
+.register [hidden] {
+  display: none;
+}
+
+.register-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.register-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 48px;
+  padding: 10px 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.register-link:hover {
+  background: var(--accent);
+  color: #111;
+}
+
+.register-banner {
+  padding: 12px 16px;
+  border: 2px solid var(--red);
+  border-radius: 8px;
+  background: rgba(239, 68, 68, 0.2);
+  color: #fecaca;
+  font-weight: 900;
+}
+
+.register-message {
+  display: grid;
+  gap: 12px;
+  justify-items: start;
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.register-message.is-danger {
+  border-color: var(--red);
+}
+
+.register-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+.register-panel {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.register-menu-grid,
+.register-choice-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 10px;
+}
+
+.register-choice {
+  display: grid;
+  gap: 4px;
+  align-content: center;
+  min-height: 64px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #11161b;
+  color: var(--text);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.register-choice span {
+  color: var(--muted);
+  font-size: 0.88rem;
+  font-weight: 700;
+}
+
+.register-crew {
+  border-left: 6px solid var(--person-color, var(--accent));
+}
+
+.register-choice[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: rgba(249, 115, 22, 0.18);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.register-tab-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: end;
+}
+
+.register-tab-form label,
+.register-source label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.register input,
+.register select {
+  width: 100%;
+  min-width: 0;
+  min-height: 48px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #11161b;
+  color: var(--text);
+  font-size: 1rem;
+}
+
+.register-primary,
+.register-secondary {
+  min-height: 48px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  font-weight: 900;
+}
+
+.register-primary {
+  background: var(--accent);
+  color: #111;
+}
+
+.register-secondary {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.register button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.register-ingredients {
+  display: grid;
+  gap: 12px;
+}
+
+.register-ingredient {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #11161b;
+}
+
+.register-ingredient.is-short {
+  border-color: rgba(239, 68, 68, 0.8);
+}
+
+.register-ingredient-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.register-source {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 6.5rem) auto;
+  gap: 8px;
+  align-items: end;
+}
+
+.register-source-detail {
+  grid-column: 1 / -1;
+}
+
+.register-add-source {
+  justify-self: start;
+}
+
+.register-error {
+  color: #fca5a5;
+}
+
+.register-actions {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+}
+
+#registerConfirm {
+  min-height: 60px;
+  font-size: 1.05rem;
+}
+
+.register-tab-list {
+  display: grid;
+  gap: 10px;
+}
+
+.register-tab-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #11161b;
+}
+
+.register-tab-card header {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.register-tab-items {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.register-tab-items li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.register-tabs-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+/* Close-out on an open tab: who collected, then Paid or Write off. */
+.register-close {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: end;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.register-close label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+/* Ledger: host nights, kept visibly apart from Settle Up. */
+.host-nights-note {
+  margin: -6px 0 14px;
+}
+
+.host-night-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr));
+  gap: 12px;
+}
+
+.host-night-card {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--blue);
+  border-radius: 8px;
+  background: #11161b;
+  overflow-wrap: anywhere;
+}
+
+.host-night-card header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.host-night-card header small {
+  display: block;
+  color: var(--muted);
+}
+
+.host-night-section,
+.host-night-group {
+  display: grid;
+  gap: 6px;
+}
+
+.host-night-section small {
+  color: var(--muted);
+}
+
+.host-night-row,
+.host-night-buyers li {
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.host-night-buyers {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0 0 0 12px;
+  border-left: 2px solid var(--line);
+  color: var(--muted);
+  list-style: none;
+}
+
+.host-night-buyers strong {
+  color: var(--text);
+}
+
 .progress {
   overflow: hidden;
   height: 12px;
@@ -550,7 +1077,7 @@ small,
   }
 
   .nav-tabs {
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(6, minmax(0, 1fr));
   }
 
   .tab-button {
@@ -565,6 +1092,10 @@ small,
 
   .wide {
     grid-row: auto;
+  }
+
+  .register-grid {
+    grid-template-columns: 1fr;
   }
 }
 
@@ -588,5 +1119,30 @@ small,
 
   .metric-card {
     min-height: 112px;
+  }
+
+  .register {
+    padding: 14px;
+  }
+
+  .register-menu-grid,
+  .register-choice-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .register-source {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 5.5rem);
+  }
+
+  .register-source .register-remove {
+    grid-column: 1 / -1;
+  }
+
+  .register-close {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .register-close label {
+    grid-column: 1 / -1;
   }
 }

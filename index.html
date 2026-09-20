@@ -22,6 +22,7 @@
           <button class="tab-button is-active" type="button" data-tab="overview">Overview</button>
           <button class="tab-button" type="button" data-tab="tonight">Tonight</button>
           <button class="tab-button" type="button" data-tab="inventory">Inventory</button>
+          <button class="tab-button" type="button" data-tab="menu">Menu</button>
           <button class="tab-button" type="button" data-tab="ledger">Ledger</button>
           <button class="tab-button" type="button" data-tab="crew">Crew</button>
         </nav>
@@ -137,8 +138,19 @@
                   Date
                   <input name="date" type="date" required>
                 </label>
+                <label>
+                  Kind
+                  <select name="kind">
+                    <option value="crew">Crew night</option>
+                    <option value="host">Host night (guests and bar register)</option>
+                  </select>
+                </label>
                 <button type="submit">Start Night</button>
               </form>
+              <div id="hostNightNotice" class="host-night-notice" hidden>
+                <span id="hostNightNoticeText">A host night is running.</span>
+                <a id="openRegisterLink" class="register-link" href="#register">Open register</a>
+              </div>
               <div class="field-block">
                 <label for="nightSelect">Active night</label>
                 <select id="nightSelect"></select>
@@ -162,8 +174,8 @@
                   <select name="bottleId" required></select>
                 </label>
                 <label>
-                  Ounces consumed
-                  <input name="ounces" type="number" min="0.1" step="0.1" value="1.5" required>
+                  <span id="pourAmountLabel">Ounces consumed</span>
+                  <input name="ounces" type="number" min="0.1" step="0.1" value="1.5" data-measure="oz" required>
                 </label>
                 <button type="submit">Log Pour</button>
               </form>
@@ -216,12 +228,24 @@
                     <option>Gin</option>
                     <option>Tequila</option>
                     <option>Liqueur</option>
+                    <option>Mixer</option>
                     <option>Other</option>
                   </select>
                 </label>
                 <label>
+                  Measure
+                  <select name="measure" required>
+                    <option value="oz">Poured, ounces</option>
+                    <option value="unit">Counted, units</option>
+                  </select>
+                </label>
+                <label>
                   ABV %
-                  <input name="abv" type="number" min="0.1" max="95" step="0.1" value="40" required>
+                  <input name="abv" type="number" min="0" max="95" step="0.1" value="40" required>
+                </label>
+                <label id="typeUnitOzField" hidden>
+                  Unit volume oz
+                  <input name="unitOz" type="number" min="0.1" step="0.1" value="12" disabled>
                 </label>
                 <button type="submit">Add Type</button>
               </form>
@@ -244,8 +268,8 @@
                   <input name="nickname" placeholder="The Council Bottle">
                 </label>
                 <label>
-                  Size oz
-                  <input name="sizeOz" type="number" min="1" step="0.1" value="25.36" required>
+                  <span id="bottleSizeLabel">Size oz</span>
+                  <input name="sizeOz" type="number" min="1" step="0.01" value="25.36" data-measure="oz" required>
                 </label>
                 <label>
                   Price
@@ -285,6 +309,73 @@
           </section>
         </section>
 
+        <section class="tab-panel" id="menu" aria-labelledby="menu-title">
+          <p id="menuHostModeNotice" class="notice" role="status" hidden></p>
+          <div class="split-layout inventory-layout">
+            <section class="panel">
+              <div class="panel-heading">
+                <div>
+                  <span class="eyebrow">Menu Item</span>
+                  <h3 id="menu-title">Add Menu Item</h3>
+                </div>
+              </div>
+              <form id="menuItemForm" class="form-grid" novalidate>
+                <input name="menuItemId" type="hidden" value="">
+                <label>
+                  Name
+                  <input name="name" placeholder="Margarita">
+                </label>
+                <label>
+                  Kind
+                  <select name="kind">
+                    <option value="cocktail">Cocktail</option>
+                    <option value="straight">Straight pour</option>
+                    <option value="counted">Counted item</option>
+                  </select>
+                </label>
+                <div class="ingredient-block span-2">
+                  <span class="field-label">Ingredients</span>
+                  <div id="ingredientRows" class="ingredient-rows"></div>
+                  <button id="addIngredientRow" class="secondary-button" type="button">Add ingredient</button>
+                </div>
+                <button id="menuItemSubmit" type="submit">Add Menu Item</button>
+                <button id="menuItemCancel" class="secondary-button" type="button" hidden>Cancel edit</button>
+              </form>
+            </section>
+
+            <section class="panel">
+              <div class="panel-heading">
+                <div>
+                  <span class="eyebrow">Pricing</span>
+                  <h3>Markup and Rounding</h3>
+                </div>
+              </div>
+              <form id="pricingForm" class="form-grid" novalidate>
+                <label>
+                  Markup %
+                  <input name="markupPercent" type="number" min="0" step="0.1" value="0">
+                </label>
+                <label>
+                  Round up to ($)
+                  <input name="roundingIncrement" type="number" min="0.01" step="0.01" value="0.25">
+                </label>
+                <p class="form-note span-2">A drink's price is the cost of what it pours, plus the markup, rounded up to this amount. Drinks already rung up keep their price.</p>
+                <button type="submit">Save Pricing</button>
+              </form>
+            </section>
+          </div>
+
+          <section class="panel">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">Current Prices</span>
+                <h3>Menu</h3>
+              </div>
+            </div>
+            <div id="menuList" class="inventory-grid empty-state">No menu items yet.</div>
+          </section>
+        </section>
+
         <section class="tab-panel" id="ledger" aria-labelledby="ledger-title">
           <div class="dashboard-grid">
             <section class="panel wide">
@@ -306,6 +397,18 @@
               <div id="settleList" class="stack-list empty-state">Need people and receipts first.</div>
             </section>
           </div>
+
+          <!-- Host nights (2.8.6, 0.5.1): guest money, kept apart from Settle Up, which it never changes. -->
+          <section class="panel host-nights-panel" aria-labelledby="hostNightsTitle">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">Host Nights</span>
+                <h3 id="hostNightsTitle">Guest Money</h3>
+              </div>
+            </div>
+            <p class="form-note host-nights-note">Who holds the money guests paid, and which crew member's stock each part paid for, margin included. For reference only: Equal Share above does not change.</p>
+            <div id="hostNightList" class="host-night-list empty-state">No host nights yet.</div>
+          </section>
         </section>
 
         <section class="tab-panel" id="crew" aria-labelledby="crew-title">
@@ -357,7 +460,76 @@
       </main>
     </div>
 
+    <!-- The bar register (KTD7): a full-screen view on #register, for one bartender. -->
+    <section id="register" class="register" aria-labelledby="registerTitle" hidden>
+      <header class="register-bar">
+        <div>
+          <p class="eyebrow">Bar Register</p>
+          <h2 id="registerTitle">Register</h2>
+          <small id="registerNightMeta"></small>
+        </div>
+        <a id="exitRegister" class="register-link" href="#">Exit register</a>
+      </header>
+
+      <p id="registerLocalBanner" class="register-banner" role="alert" hidden>This browser only: nothing rung up here is saved to the shared database, and no one else will see it.</p>
+
+      <div id="registerClosed" class="register-message" hidden>
+        <h3>The register is closed</h3>
+        <p id="registerClosedMessage">No host night is running. Start one from Tonight on the dashboard, then open the register.</p>
+        <a id="registerBack" class="register-link" href="#">Back to the dashboard</a>
+      </div>
+
+      <div id="registerNotSaving" class="register-message is-danger" hidden>
+        <h3>Not saving</h3>
+        <p id="registerNotSavingMessage"></p>
+        <button id="registerRetry" class="register-primary" type="button">Retry</button>
+      </div>
+
+      <div id="registerWork" class="register-grid" hidden>
+        <section class="panel register-panel register-menu-panel" aria-labelledby="registerMenuTitle">
+          <h3 id="registerMenuTitle">1. Drink</h3>
+          <div id="registerMenu" class="register-menu-grid"></div>
+        </section>
+
+        <section class="panel register-panel register-target-panel" aria-labelledby="registerTargetTitle">
+          <h3 id="registerTargetTitle">2. For</h3>
+          <span class="field-label">Guest tabs</span>
+          <div id="registerTabs" class="register-choice-grid"></div>
+          <form id="registerTabForm" class="register-tab-form" novalidate>
+            <label>
+              <span class="field-label">New tab</span>
+              <input name="guestName" autocomplete="off" placeholder="Guest name">
+            </label>
+            <button id="registerOpenTab" class="register-secondary" type="submit">Open tab</button>
+          </form>
+          <span class="field-label">Crew (no charge)</span>
+          <div id="registerCrew" class="register-choice-grid"></div>
+        </section>
+
+        <section class="panel register-panel register-pour-panel" aria-labelledby="registerPourTitle">
+          <h3 id="registerPourTitle">3. Pour from</h3>
+          <div id="registerIngredients" class="register-ingredients"></div>
+          <p id="registerHint" class="form-note" role="status"></p>
+          <div class="register-actions">
+            <button id="registerClear" class="register-secondary" type="button">Start over</button>
+            <button id="registerConfirm" class="register-primary" type="button" disabled>Ring up</button>
+          </div>
+        </section>
+
+        <section class="panel register-panel register-tabs-panel" aria-labelledby="registerOpenTabsTitle">
+          <div class="register-tabs-head">
+            <h3 id="registerOpenTabsTitle">Open tabs</h3>
+            <button id="registerEndNight" class="register-secondary" type="button">End night</button>
+          </div>
+          <div id="registerTabList" class="register-tab-list"></div>
+          <h3 id="registerCrewDrinksTitle">Crew drinks</h3>
+          <div id="registerCrewDrinkList" class="register-tab-list"></div>
+        </section>
+      </div>
+    </section>
+
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="domain.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

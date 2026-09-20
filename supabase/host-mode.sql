@@ -1,81 +1,55 @@
-create extension if not exists pgcrypto;
+-- RNMB Command Center — host mode: stock catalog, menu, guest tabs and the bar
+-- register.
+--
+-- Run this once in the Supabase SQL editor (Dashboard → SQL Editor → New query),
+-- BEFORE deploying the version of the dashboard that has the register. It is
+-- safe to re-run: every statement either checks whether its object already
+-- exists or replaces it, and no existing row is deleted or changed.
+--
+-- It needs NO edits. Unlike rls-passphrase.sql there is no passphrase in this
+-- file; every new table and function reuses the passphrase you already set,
+-- through rnmb_authorized(). Run rls-passphrase.sql first if you never have.
+--
+-- Afterwards, run supabase/checks/host-mode-checks.sql to prove it works. That
+-- script changes nothing: it rolls everything back at the end.
+--
+-- What it adds:
+--   * Beverage types learn whether they are poured (ounces) or counted (units),
+--     and may have 0% ABV, so mixers like lime juice can be tracked stock.
+--   * Nights learn whether they are a crew night or a host night, and when a
+--     host night ended. At most one host night can be open at a time.
+--   * Settings learn the markup percentage and the price rounding increment.
+--   * New tables for menu items, their recipes, guest tabs, ring-ups (every
+--     drink the register records), the stock each ring-up drew from, and hand
+--     corrections of stock levels.
+--   * Functions that save each register action in ONE call. A function runs
+--     inside a single transaction, so if any check fails nothing is written:
+--     stock can never be deducted without the sale being recorded.
 
--- Fresh projects only: this file creates every table at its current shape. A
--- database created from an older copy of this file is brought up to date by
--- supabase/rls-passphrase.sql and supabase/host-mode.sql instead, and those
--- two files must end at the same result as this one.
+-- 0. Refuse to run before the passphrase gate exists, with a readable reason.
+do $$
+begin
+  if to_regprocedure('public.rnmb_authorized()') is null then
+    raise exception 'Run supabase/rls-passphrase.sql before supabase/host-mode.sql: rnmb_authorized() does not exist yet.';
+  end if;
+end;
+$$;
 
-create table if not exists public.rnmb_people (
-  id uuid primary key default gen_random_uuid(),
-  name text not null check (char_length(trim(name)) > 0),
-  color text not null default '#ef4444',
-  created_at timestamptz not null default now()
-);
+-- 1. Beverage types: poured or counted, and mixers with no alcohol.
+--    Columns are added without inline checks, and each check is dropped and
+--    re-added by name, so a second run never stacks duplicate constraints.
+alter table public.rnmb_beverage_types add column if not exists measure text not null default 'oz';
+alter table public.rnmb_beverage_types add column if not exists unit_oz numeric(8, 2);
 
-create table if not exists public.rnmb_beverage_types (
-  id uuid primary key default gen_random_uuid(),
-  name text not null check (char_length(trim(name)) > 0),
-  category text not null,
-  abv numeric(5, 2) not null check (abv >= 0 and abv <= 95),
-  created_at timestamptz not null default now(),
-  measure text not null default 'oz',
-  unit_oz numeric(8, 2),
-  constraint rnmb_beverage_types_measure check (measure in ('oz', 'unit')),
-  constraint rnmb_beverage_types_unit_volume
-    check ((unit_oz is null or unit_oz > 0) and (measure = 'oz' or unit_oz is not null))
-);
-
-create table if not exists public.rnmb_nights (
-  id uuid primary key default gen_random_uuid(),
-  name text not null check (char_length(trim(name)) > 0),
-  date date not null,
-  created_at timestamptz not null default now(),
-  kind text not null default 'crew',
-  ended_at timestamptz,
-  constraint rnmb_nights_kind check (kind in ('crew', 'host')),
-  constraint rnmb_nights_ended_host_only check (ended_at is null or kind = 'host')
-);
-
--- A partial unique index: every open host night has the same value in the
--- indexed column, so a second open host night would be a duplicate.
-create unique index if not exists rnmb_nights_one_open_host
-  on public.rnmb_nights (kind)
-  where kind = 'host' and ended_at is null;
-
-create table if not exists public.rnmb_bottles (
-  id uuid primary key default gen_random_uuid(),
-  type_id uuid not null references public.rnmb_beverage_types(id) on delete cascade,
-  nickname text,
-  size_oz numeric(8, 2) not null check (size_oz > 0),
-  remaining_oz numeric(8, 2) not null check (remaining_oz >= 0),
-  price numeric(10, 2) not null default 0 check (price >= 0),
-  buyer_id uuid references public.rnmb_people(id) on delete set null,
-  purchase_date date not null,
-  created_at timestamptz not null default now(),
-  check (remaining_oz <= size_oz)
-);
-
-create table if not exists public.rnmb_pours (
-  id uuid primary key default gen_random_uuid(),
-  night_id uuid not null references public.rnmb_nights(id) on delete cascade,
-  person_id uuid not null references public.rnmb_people(id) on delete cascade,
-  bottle_id uuid not null references public.rnmb_bottles(id) on delete cascade,
-  ounces numeric(8, 2) not null check (ounces > 0),
-  abv_snapshot numeric(5, 2) not null check (abv_snapshot > 0 and abv_snapshot <= 95),
-  poured_at timestamptz not null default now()
-);
-
-create table if not exists public.rnmb_settings (
-  id boolean primary key default true,
-  active_night_id uuid references public.rnmb_nights(id) on delete set null,
-  responsible_mode boolean not null default true,
-  updated_at timestamptz not null default now(),
-  markup_percent numeric(6, 2) not null default 0,
-  rounding_increment_cents integer not null default 25,
-  constraint rnmb_settings_singleton check (id),
-  constraint rnmb_settings_markup_percent check (markup_percent >= 0),
-  constraint rnmb_settings_rounding_increment_cents check (rounding_increment_cents > 0)
-);
+alter table public.rnmb_beverage_types drop constraint if exists rnmb_beverage_types_abv_check;
+alter table public.rnmb_beverage_types add constraint rnmb_beverage_types_abv_check
+  check (abv >= 0 and abv <= 95);
+alter table public.rnmb_beverage_types drop constraint if exists rnmb_beverage_types_measure;
+alter table public.rnmb_beverage_types add constraint rnmb_beverage_types_measure
+  check (measure in ('oz', 'unit'));
+alter table public.rnmb_beverage_types drop constraint if exists rnmb_beverage_types_unit_volume;
+alter table public.rnmb_beverage_types add constraint rnmb_beverage_types_unit_volume
+  check ((unit_oz is null or unit_oz > 0) and (measure = 'oz' or unit_oz is not null));
 
 comment on column public.rnmb_beverage_types.measure is
   'oz = poured stock tracked in ounces; unit = counted stock tracked in whole units (cans, bottled drinks).';
@@ -91,10 +65,40 @@ comment on column public.rnmb_bottles.remaining_oz is
   'Amount left in the stock item, in its type''s measure: ounces for poured types, whole units for counted types.';
 comment on column public.rnmb_pours.ounces is
   'Amount of the crew pour in its type''s measure: ounces for poured types, whole units for counted types.';
+
+-- 2. Nights: crew or host, and when a host night ended.
+alter table public.rnmb_nights add column if not exists kind text not null default 'crew';
+alter table public.rnmb_nights add column if not exists ended_at timestamptz;
+
+alter table public.rnmb_nights drop constraint if exists rnmb_nights_kind;
+alter table public.rnmb_nights add constraint rnmb_nights_kind
+  check (kind in ('crew', 'host'));
+alter table public.rnmb_nights drop constraint if exists rnmb_nights_ended_host_only;
+alter table public.rnmb_nights add constraint rnmb_nights_ended_host_only
+  check (ended_at is null or kind = 'host');
+
+-- A partial unique index: every open host night has the same value in the
+-- indexed column, so a second open host night would be a duplicate.
+create unique index if not exists rnmb_nights_one_open_host
+  on public.rnmb_nights (kind)
+  where kind = 'host' and ended_at is null;
+
+-- 3. Settings: markup and rounding. Defaults invent no profit: 0% markup, and
+--    prices rounded up to the next 25 cents.
+alter table public.rnmb_settings add column if not exists markup_percent numeric(6, 2) not null default 0;
+alter table public.rnmb_settings add column if not exists rounding_increment_cents integer not null default 25;
+
+alter table public.rnmb_settings drop constraint if exists rnmb_settings_markup_percent;
+alter table public.rnmb_settings add constraint rnmb_settings_markup_percent
+  check (markup_percent >= 0);
+alter table public.rnmb_settings drop constraint if exists rnmb_settings_rounding_increment_cents;
+alter table public.rnmb_settings add constraint rnmb_settings_rounding_increment_cents
+  check (rounding_increment_cents > 0);
+
 comment on column public.rnmb_settings.rounding_increment_cents is
   'Drink prices are rounded UP to a multiple of this many cents (25 = $0.25).';
 
--- Host mode tables (identical to supabase/host-mode.sql).
+-- 4. New tables.
 --    Money is whole cents. Money history is never deleted: a stock item that a
 --    ring-up drew from cannot be deleted (on delete restrict), and removing a
 --    person keeps their name on past records through a name snapshot column
@@ -205,27 +209,8 @@ create index if not exists rnmb_ring_up_lines_ring_up_idx on public.rnmb_ring_up
 create index if not exists rnmb_ring_up_lines_bottle_idx on public.rnmb_ring_up_lines (bottle_id);
 create index if not exists rnmb_stock_adjustments_bottle_idx on public.rnmb_stock_adjustments (bottle_id);
 
-create or replace function public.rnmb_touch_settings_updated_at()
-returns trigger
-language plpgsql
-as $$
-begin
-  new.updated_at = now();
-  return new;
-end;
-$$;
-
-drop trigger if exists rnmb_settings_updated_at on public.rnmb_settings;
-create trigger rnmb_settings_updated_at
-before update on public.rnmb_settings
-for each row execute function public.rnmb_touch_settings_updated_at();
-
-alter table public.rnmb_people enable row level security;
-alter table public.rnmb_beverage_types enable row level security;
-alter table public.rnmb_nights enable row level security;
-alter table public.rnmb_bottles enable row level security;
-alter table public.rnmb_pours enable row level security;
-alter table public.rnmb_settings enable row level security;
+-- 5. Row-level security: the same passphrase gate as every other table.
+--    One `for all` policy per table covers select, insert, update and delete.
 alter table public.rnmb_menu_items enable row level security;
 alter table public.rnmb_recipe_ingredients enable row level security;
 alter table public.rnmb_guest_tabs enable row level security;
@@ -233,62 +218,6 @@ alter table public.rnmb_ring_ups enable row level security;
 alter table public.rnmb_ring_up_lines enable row level security;
 alter table public.rnmb_stock_adjustments enable row level security;
 
--- Access control: every table is gated behind a shared passphrase, which the
--- browser sends on the x-rnmb-key header. See supabase/rls-passphrase.sql for
--- the full explanation and for how to set or rotate the passphrase; that file
--- is also what you run against a database that already has the old open
--- policies. This block keeps a freshly created project from starting wide open.
-
-create table if not exists public.rnmb_access (
-  id boolean primary key default true check (id),
-  passphrase text not null,
-  updated_at timestamptz not null default now()
-);
-
--- No policies on purpose: RLS denies by default, so the publishable key can
--- never read this table. Only rnmb_authorized() sees it, via SECURITY DEFINER.
-alter table public.rnmb_access enable row level security;
-
-create or replace function public.rnmb_authorized()
-returns boolean
-language sql
-stable
-security definer
-set search_path = public
-as $$
-  select exists (
-    select 1
-    from public.rnmb_access
-    where passphrase <> ''
-      and passphrase = coalesce(
-        nullif(current_setting('request.headers', true), '')::json ->> 'x-rnmb-key',
-        ''
-      )
-  );
-$$;
-
-revoke all on function public.rnmb_authorized() from public;
-grant execute on function public.rnmb_authorized() to anon, authenticated;
-
-drop policy if exists "RNMB public read people" on public.rnmb_people;
-drop policy if exists "RNMB public write people" on public.rnmb_people;
-drop policy if exists "RNMB public read beverage types" on public.rnmb_beverage_types;
-drop policy if exists "RNMB public write beverage types" on public.rnmb_beverage_types;
-drop policy if exists "RNMB public read nights" on public.rnmb_nights;
-drop policy if exists "RNMB public write nights" on public.rnmb_nights;
-drop policy if exists "RNMB public read bottles" on public.rnmb_bottles;
-drop policy if exists "RNMB public write bottles" on public.rnmb_bottles;
-drop policy if exists "RNMB public read pours" on public.rnmb_pours;
-drop policy if exists "RNMB public write pours" on public.rnmb_pours;
-drop policy if exists "RNMB public read settings" on public.rnmb_settings;
-drop policy if exists "RNMB public write settings" on public.rnmb_settings;
-
-drop policy if exists "RNMB gated people" on public.rnmb_people;
-drop policy if exists "RNMB gated beverage types" on public.rnmb_beverage_types;
-drop policy if exists "RNMB gated nights" on public.rnmb_nights;
-drop policy if exists "RNMB gated bottles" on public.rnmb_bottles;
-drop policy if exists "RNMB gated pours" on public.rnmb_pours;
-drop policy if exists "RNMB gated settings" on public.rnmb_settings;
 drop policy if exists "RNMB gated menu items" on public.rnmb_menu_items;
 drop policy if exists "RNMB gated recipe ingredients" on public.rnmb_recipe_ingredients;
 drop policy if exists "RNMB gated guest tabs" on public.rnmb_guest_tabs;
@@ -296,18 +225,6 @@ drop policy if exists "RNMB gated ring-ups" on public.rnmb_ring_ups;
 drop policy if exists "RNMB gated ring-up lines" on public.rnmb_ring_up_lines;
 drop policy if exists "RNMB gated stock adjustments" on public.rnmb_stock_adjustments;
 
-create policy "RNMB gated people" on public.rnmb_people
-  for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
-create policy "RNMB gated beverage types" on public.rnmb_beverage_types
-  for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
-create policy "RNMB gated nights" on public.rnmb_nights
-  for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
-create policy "RNMB gated bottles" on public.rnmb_bottles
-  for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
-create policy "RNMB gated pours" on public.rnmb_pours
-  for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
-create policy "RNMB gated settings" on public.rnmb_settings
-  for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
 create policy "RNMB gated menu items" on public.rnmb_menu_items
   for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
 create policy "RNMB gated recipe ingredients" on public.rnmb_recipe_ingredients
@@ -321,7 +238,7 @@ create policy "RNMB gated ring-up lines" on public.rnmb_ring_up_lines
 create policy "RNMB gated stock adjustments" on public.rnmb_stock_adjustments
   for all using (public.rnmb_authorized()) with check (public.rnmb_authorized());
 
--- Host mode: one-call functions (identical to supabase/host-mode.sql).
+-- 6. One-call functions.
 --    The browser calls each one as POST /rest/v1/rpc/<name> with the body
 --    {"payload": {...}}. They run as the CALLER (not SECURITY DEFINER), so the
 --    gated policies above still apply, and each one checks the passphrase
@@ -1005,11 +922,6 @@ grant execute on function public.rnmb_correct_stock(jsonb) to anon, authenticate
 grant execute on function public.rnmb_add_crew_pour(jsonb) to anon, authenticated;
 grant execute on function public.rnmb_remove_crew_pour(jsonb) to anon, authenticated;
 
--- Set a real passphrase before anyone uses the dashboard.
-insert into public.rnmb_access (id, passphrase)
-values (true, 'CHANGE-ME')
-on conflict (id) do nothing;
-
-insert into public.rnmb_settings (id, responsible_mode)
-values (true, true)
-on conflict (id) do nothing;
+-- 7. Tell the API to pick up the new tables and functions straight away,
+--    instead of answering 404 until its schema cache refreshes.
+notify pgrst, 'reload schema';
