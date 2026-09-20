@@ -58,6 +58,8 @@ Nobody splits the bill evenly. Each crew member carries one running balance in w
 
 **Ledger → Crew Balances** shows who is owed and who owes, and under it *Fewest payments to square up*: the shortest list of transfers that settles everyone, each with a *Paid* button to record it once the money has actually moved. Every balance together always adds up to zero, and a crew member whose balance is not zero cannot be removed from the roster until they are settled.
 
+That rule is enforced twice against the shared database, because two phones can be working from copies of the balances minutes apart. The dashboard checks what it knows and gives the friendly message; the database then re-checks the records themselves, and refuses only what the delete would actually destroy. Removing somebody deletes the drinks they drank, so a drink of theirs that cost money keeps them on the roster until it is voided — otherwise whoever bought that bottle would silently lose the credit. Every other record that names them — a payment, a crew drink, stock they bought that was poured from, a guest tab they collected or wrote off — keeps their name beside the emptied link, so the money on it survives them and they can leave once they are square.
+
 ### Logging a drink
 
 **Tonight → Quick Log** is built for a phone: tap who is drinking, then tap what they are having. The second row offers that person's usual — the last eight things they logged — or the whole shelf the first time. Tapping a bottle logs one measure of it (1.5 oz, or one unit of counted stock like a can). Tapping a menu item rings the whole recipe up at once, drawing every ingredient from stock. Either way the drinker is charged at cost and the buyers are credited straight away.
@@ -75,14 +77,14 @@ An ended *host* night behaves differently: it only ends once every guest tab is 
 
 ### Rolling crew balances out
 
-1. Run [supabase/crew-balance.sql](supabase/crew-balance.sql) in the Supabase SQL editor. It needs [supabase/host-mode.sql](supabase/host-mode.sql) to have been run first, and it is safe to run more than once.
-2. Run [supabase/checks/crew-balance-checks.sql](supabase/checks/crew-balance-checks.sql). It tests every rule inside a transaction it rolls back, and returns one row with the number of checks passed.
-3. Deploy the client straight away.
-4. Reload every crew device, including the register, before the next night.
+1. Deploy the client first.
+2. Run [supabase/crew-balance.sql](supabase/crew-balance.sql) in the Supabase SQL editor. It needs [supabase/host-mode.sql](supabase/host-mode.sql) to have been run first, and it is safe to run more than once.
+3. Run [supabase/checks/crew-balance-checks.sql](supabase/checks/crew-balance-checks.sql). It tests every rule inside a transaction it rolls back, and returns one row with the number of checks passed (11).
+4. Reload every crew device, including the register.
 
-**Run the SQL before deploying the new client and the live register will refuse write-offs.** The migration makes a tab write-off name the crew member writing it off, and the deployed client does not send one yet. Keep the gap between step 1 and step 3 as short as you can.
+**The client goes first on purpose.** The new client sends no crew-balance column and no write-off author until it sees that the migration has run, so it behaves exactly like the old one against a database that has not had it yet. The other order is the one that breaks: the migrated `rnmb_close_tab` refuses a write-off that names nobody, an un-upgraded phone never sends an author, and a host night cannot end while a tab is still open — so one stale device could be stuck mid-service. Running the client first means that pairing never happens.
 
-Until the SQL has been run the app still works: the Ledger names the file to run and shows no balances rather than wrong ones, payments and ending a crew night are refused, and pours save without their cost stamp. Pours logged before the migration carry no cost, so they charge nobody.
+Until the SQL has been run the app still works: the Ledger names the file to run and shows no balances rather than wrong ones, payments and ending a crew night are refused, pours save without their cost stamp, and a guest tab is written off plainly — no author is asked for and nothing claims a charge, because there is nowhere to record one. Pours logged before the migration carry no cost, so they charge nobody.
 
 ## Host Mode
 

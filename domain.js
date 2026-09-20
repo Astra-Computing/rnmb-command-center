@@ -91,9 +91,10 @@
  *               name then id
  *   crewDrinkCostCents(lines) -> whole cents a crew drink (or a written-off guest drink) charges: the owned
  *               lines' cost rounded half-up once, exactly what crewBalances debits
- *   balanceChangesOnRemoval(state, personId) -> [{ personId, name, beforeCents, afterCents }]: other roster people
+ *   balanceChangesOnRemoval(state, personId) -> [{ personId, name, beforeCents, afterCents }]: everyone else
  *               whose balance would move if that person were deleted (their pours cascade, other references
- *               are set null and keep their name snapshots)
+ *               are set null and keep their name snapshots); includes parties already off the roster,
+ *               matched by name snapshot with personId null
  *   dollarsToCents(value) -> whole cents for a typed dollar amount ("3.20", "$12", ".5"), else null
  *   quickLogAmount(type) -> 1.5 (oz) for poured stock, 1 (unit) for counted stock
  *   nightRecap(state, nightId) -> [{ personId, name, drinks, ounces, standardDrinks, costCents }]: one night's
@@ -1048,17 +1049,25 @@ var RNMBDomain = (function () {
   }
 
   /**
-   * Everyone else on the roster whose balance would change if `personId` were removed
-   * (KTD9): [{ personId, name, beforeCents, afterCents }]. Removing someone deletes the
-   * pours they drank, so a person reading $0.00 can still take other people's credit
-   * with them; the app refuses the removal while this list is not empty.
+   * Everyone else whose balance would change if `personId` were removed (KTD9):
+   * [{ personId, name, beforeCents, afterCents }], the roster and anyone who has
+   * already left it under their name snapshot (personId null). Removing someone
+   * deletes the pours they drank, so a person reading $0.00 can still take other
+   * people's credit with them; the app refuses the removal while this list is not
+   * empty.
    */
   function balanceChangesOnRemoval(state, personId) {
-    var after = new Map(crewBalances(withoutPerson(state, personId)).map(function (entry) { return [entry.personId, entry.cents]; }));
+    // Keyed the way crewBalances groups parties — id when known, name otherwise —
+    // so a shift that lands on somebody who already left the roster (a name
+    // snapshot with no id) is seen too, instead of every such party collapsing
+    // onto one null key and being filtered away.
+    var keyOf = function (entry) { return partyKey(entry.personId, entry.name); };
+    var after = new Map(crewBalances(withoutPerson(state, personId)).map(function (entry) { return [keyOf(entry), entry.cents]; }));
     return crewBalances(state)
-      .filter(function (entry) { return entry.personId && entry.personId !== personId; })
+      .filter(function (entry) { return entry.personId !== personId; })
       .map(function (entry) {
-        return { personId: entry.personId, name: entry.name, beforeCents: entry.cents, afterCents: after.has(entry.personId) ? after.get(entry.personId) : 0 };
+        var key = keyOf(entry);
+        return { personId: entry.personId, name: entry.name, beforeCents: entry.cents, afterCents: after.has(key) ? after.get(key) : 0 };
       })
       .filter(function (entry) { return entry.beforeCents !== entry.afterCents; });
   }

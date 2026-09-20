@@ -2,9 +2,14 @@
 -- crew members, who wrote a tab off, and crew nights that can end.
 --
 -- Run this once in the Supabase SQL editor (Dashboard → SQL Editor → New query),
--- BEFORE deploying the version of the dashboard that shows crew balances. It is
--- safe to re-run: every statement either checks whether its object already
--- exists or replaces it, and no existing row is deleted or changed.
+-- AFTER deploying the version of the dashboard that shows crew balances. That
+-- order is deliberate: the new dashboard sends no crew-balance column and no
+-- write-off author until it has seen this file run, so it works unchanged
+-- against a database that has not had it yet — while an OLD dashboard against a
+-- migrated database cannot write off a guest tab at all, because the new
+-- rnmb_close_tab refuses a write-off with no author and the old one never sends
+-- one. It is safe to re-run: every statement either checks whether its object
+-- already exists or replaces it, and no existing row is deleted or changed.
 --
 -- It needs NO edits. There is no passphrase in this file; every new table and
 -- function reuses the passphrase you already set, through rnmb_authorized().
@@ -13,9 +18,14 @@
 -- Afterwards, run supabase/checks/crew-balance-checks.sql to prove it works.
 -- That script changes nothing: it rolls everything back at the end.
 --
--- If you ever re-run host-mode.sql after this file, run this file again right
--- after it: host-mode.sql puts back the older night rules and functions that
--- this file replaces.
+-- If you ever re-run host-mode.sql after this file, what happens depends on
+-- whether a crew night has ended yet. Once one has, host-mode.sql re-adds its
+-- own rnmb_nights_ended_host_only constraint (ended_at is null or kind =
+-- 'host'), Postgres checks it against every existing row, the ended crew night
+-- fails it, and the whole script aborts and changes nothing — nothing here needs
+-- redoing. Before any crew night has ended, host-mode.sql succeeds and does put
+-- back the older night rules and functions this file replaces; run this file
+-- again right after it in that case.
 --
 -- What it adds:
 --   * Crew pours learn what they cost, in whole cents, and whose bottle they
@@ -31,6 +41,14 @@
 --     ended host night stays locked.
 --   * Crew drinks can be rung up from a menu item on a crew night (open or
 --     ended) as well as on a running host night. Guest drinks stay host-only.
+--     An ended host night locks its guest items, but a crew drink rung up on it
+--     can still be voided: it is charged at cost and sits on no tab.
+--   * Removing a crew member is a function now, not a plain delete: it refuses
+--     while a drink that cost money still names them as the drinker, because
+--     that drink is deleted with them and its credit would go too. Everything
+--     else that names them keeps the name and loses only the link, so two
+--     devices working minutes apart can neither orphan a balance nor strand
+--     somebody who has squared up on the roster.
 
 -- 0. Refuse to run before the passphrase gate and host mode exist, with a
 --    readable reason.
@@ -403,8 +421,12 @@ begin
     raise exception 'RNMB: that item was already voided.';
   end if;
 
+  -- An ended host night freezes the guest tabs that were counted against the
+  -- cash. A crew drink is on no tab and is charged at cost, so it stays
+  -- correctable like a crew night's, or a drink rung up to the wrong person
+  -- would be a permanent debit with nowhere to undo it.
   select * into v_night from public.rnmb_nights where id = v_ring_up.night_id for share;
-  if v_night.kind = 'host' and v_night.ended_at is not null then
+  if v_night.kind = 'host' and v_night.ended_at is not null and v_ring_up.kind = 'guest' then
     raise exception 'RNMB: this host night has ended, so its items can no longer be voided.';
   end if;
 
@@ -800,6 +822,51 @@ begin
 end;
 $$;
 
+-- Remove a crew member from the roster, but only while nothing the delete
+-- destroys was carrying money. Of the nine columns that name a person, exactly
+-- one cascades: rnmb_pours.person_id, the drinker. Deleting the person deletes
+-- those pours, and a cost-stamped pour is a debit against the drinker and a
+-- credit to whoever bought the bottle, so that credit would vanish with it.
+-- Every other reference is `on delete set null` beside a name snapshot, so the
+-- payment, tab, ring-up, line or bottle survives and its money stays under the
+-- name. Requirement 0.5.7 is enforced here, where the rows are, with the person
+-- locked first, because a browser can be working from a copy of the balances
+-- that is minutes old; the dashboard keeps its own finer check ("their own
+-- balance is not $0.00 yet") as the friendly first message.
+-- payload: id
+create or replace function public.rnmb_remove_person(payload jsonb)
+returns uuid
+language plpgsql
+set search_path = public
+as $$
+declare
+  v_id uuid;
+  v_name text;
+begin
+  if not public.rnmb_authorized() then
+    raise exception 'RNMB: the passphrase is missing or wrong, so nothing was saved.'
+      using errcode = '42501';
+  end if;
+
+  v_id := nullif(payload ->> 'id', '')::uuid;
+  select name into v_name from public.rnmb_people where id = v_id for update;
+  if not found then
+    raise exception 'RNMB: that crew member does not exist.';
+  end if;
+
+  if exists (
+    select 1 from public.rnmb_pours
+     where person_id = v_id and cost_cents is not null
+  ) then
+    raise exception 'RNMB: % drank drinks that cost money, and removing them would erase those drinks and change somebody else''s balance, so they stay on the roster.', v_name;
+  end if;
+
+  delete from public.rnmb_people where id = v_id;
+
+  return v_id;
+end;
+$$;
+
 -- Same grants as rnmb_authorized(): nobody by default, then the two roles the
 -- publishable key can act as. (Replacing a function keeps its grants; they are
 -- repeated here so this file reads complete.)
@@ -811,6 +878,7 @@ revoke all on function public.rnmb_end_host_night(jsonb) from public;
 revoke all on function public.rnmb_add_crew_pour(jsonb) from public;
 revoke all on function public.rnmb_record_payment(jsonb) from public;
 revoke all on function public.rnmb_void_payment(jsonb) from public;
+revoke all on function public.rnmb_remove_person(jsonb) from public;
 
 grant execute on function public.rnmb_ring_up(jsonb) to anon, authenticated;
 grant execute on function public.rnmb_void_ring_up(jsonb) to anon, authenticated;
@@ -820,6 +888,7 @@ grant execute on function public.rnmb_end_host_night(jsonb) to anon, authenticat
 grant execute on function public.rnmb_add_crew_pour(jsonb) to anon, authenticated;
 grant execute on function public.rnmb_record_payment(jsonb) to anon, authenticated;
 grant execute on function public.rnmb_void_payment(jsonb) to anon, authenticated;
+grant execute on function public.rnmb_remove_person(jsonb) to anon, authenticated;
 
 -- 7. Tell the API to pick up the new table, columns and functions straight
 --    away, instead of answering 404 until its schema cache refreshes.

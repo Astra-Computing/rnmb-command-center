@@ -1552,6 +1552,31 @@ test("balanceChangesOnRemoval names everyone whose balance would move if a perso
   assert.equal(drankAndPaid.nights[0].pours.length, 1, "the input state is not changed");
 });
 
+test("balanceChangesOnRemoval sees a shift that lands on somebody already off the roster (0.5.7, KTD9)", () => {
+  const roster = [...people, { id: "p-casey", name: "Casey" }];
+  // Erin left at $0.00; her name stays on the stock she bought. Casey drinks 1840c of it,
+  // so Casey reads -1840 and Erin +1840 under her snapshot alone.
+  const pours = [{ id: "x1", personId: "p-casey", personName: "Casey", bottleId: "b", ounces: 1, abv: 40, timestamp: "t", costCents: 1840, buyerId: null, buyerName: "Erin" }];
+  const state = { people: roster, nights: [{ id: "n1", pours }] };
+  assert.deepEqual(
+    D.crewBalances(state).filter((entry) => entry.cents !== 0),
+    [{ personId: "p-casey", name: "Casey", cents: -1840 }, { personId: null, name: "Erin", cents: 1840 }]
+  );
+  // Removing Casey deletes the pour, which takes Erin's 1840c credit with it — a shift
+  // nobody authorised, on a party with no id at all.
+  assert.deepEqual(
+    D.balanceChangesOnRemoval(state, "p-casey"),
+    [{ personId: null, name: "Erin", beforeCents: 1840, afterCents: 0 }]
+  );
+  // A crew ring-up is not deleted with its drinker, only unlinked, and it keeps the
+  // name it was rung up under — so the same drink as a ring-up moves nobody.
+  const rung = {
+    people: roster,
+    ringUps: [{ id: "r1", kind: "crew", personId: "p-casey", personName: "Casey", voidedAt: null, lines: [{ costCents: 500, buyerId: null, buyerName: "Erin" }] }]
+  };
+  assert.deepEqual(D.balanceChangesOnRemoval(rung, "p-casey"), []);
+});
+
 test("nightRecap groups one night's drinks by who drank them, with the cents each one charges (0.4.3)", () => {
   const roster = [...people, { id: "p-casey", name: "Casey" }];
   const bottles = [
