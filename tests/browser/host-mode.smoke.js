@@ -3723,6 +3723,105 @@ const scenarios = [
         await session.close();
       }
     }
+  },
+  {
+    name: "Crew review #5 follow-up: an ended host night's crew drinks can be voided from Ledger, its guest items cannot",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const { night } = await startHostNightViaForm(session, "Ledger fix night");
+        await openRegister(session);
+        await openTabViaRegister(session, "Riley");
+        await ringUpToTab(session, "Bourbon Neat", "Riley");
+        const bourbon = await bottleIdOf(page, "The Briefing Bottle");
+
+        // A crew drink rung up to the wrong person while the bar was open.
+        await registerItem(page, "Bourbon Neat").click();
+        await registerCrew(page, "Casey").click();
+        await clickForToast(session, "#registerConfirm", "Bourbon Neat poured for Casey · $2.76 at cost.");
+        assert.equal((await balanceCents(page)).Casey, -276, "the crew drink debits Casey at cost");
+
+        await payTabViaRegister(session, "Riley", "Jordan");
+        await clickForToast(session, "#registerEndNight", "Ledger fix night ended. Its summary is under Host nights in Ledger.");
+
+        // The register goes with the night, which is why this fix had to live elsewhere.
+        await page.evaluate(() => { location.hash = "#register"; });
+        await page.waitForSelector("#registerClosed:not([hidden])");
+        assert.equal(await page.locator("#registerWork").isHidden(), true, "no register once the night has ended");
+        await page.evaluate(() => { location.hash = ""; });
+
+        // The Ledger's host-night card lists the crew drink, and only the crew drink.
+        await page.click('.tab-button[data-tab="ledger"]');
+        const card = page.locator(`.host-night-card[data-host-night-id="${night.id}"]`);
+        await card.waitFor();
+        const listed = await card.locator("[data-crew-drinks] li").allTextContents();
+        assert.equal(listed.length, 1, `one crew drink listed, and the guest item is not among them; got ${JSON.stringify(listed)}`);
+        assert.ok(listed[0].includes("Casey"), `expected the drinker named, got: ${listed[0]}`);
+        assert.ok(listed[0].includes("$2.76"), `expected the cost shown, got: ${listed[0]}`);
+        const note = await card.locator("[data-crew-drinks] .form-note").textContent();
+        assert.ok(note.includes("charged at cost and can still be put right"), `expected the ended-night note, got: ${note}`);
+
+        const stockBefore = await stockOf(page, bourbon);
+        await clickForToast(session, `.host-night-card[data-host-night-id="${night.id}"] [data-void-crew-drink]`, "Drink voided. Stock and balances are back to where they were.");
+
+        assert.equal((await balanceCents(page)).Casey, 0, "Casey's balance goes back");
+        assert.equal(await stockOf(page, bourbon), Math.round((stockBefore + 2) * 100) / 100, "and the stock comes back");
+        assert.equal(await card.locator("[data-crew-drinks] li").count(), 0, "the voided drink leaves the list");
+        assert.equal(await card.locator("[data-crew-drinks] small").textContent(), "No crew drinks charged.");
+
+        // The guest item on the same ended night is still frozen, and its money still counted.
+        const guestVoid = await page.evaluate(async () => {
+          const r = window.__rnmb;
+          const guest = r.state.ringUps.find((entry) => entry.kind === "guest");
+          const ok = await r.hostAction("Guest item voided.", (db) => db.voidRingUp(guest.id));
+          return { ok, voided: Boolean(r.state.ringUps.find((entry) => entry.id === guest.id).voidedAt) };
+        });
+        assert.equal(guestVoid.ok, false, "a guest item on an ended host night stays frozen");
+        assert.equal(guestVoid.voided, false);
+
+        const toasts = await session.toasts();
+        assert.ok(toasts.includes("This host night has ended, so its items can no longer be voided."), "the guest refusal is still shown");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+  {
+    name: "Crew review #5 follow-up: a running host night lists its crew pours in Ledger, and voiding one there puts the stock and balance back",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const { night } = await startHostNightViaForm(session, "Running night");
+        const bourbon = await bottleIdOf(page, "The Briefing Bottle");
+
+        // Starting a host night makes it the active night, so quick log lands a
+        // crew POUR on it — the other kind of crew drink a host night can hold.
+        await quickLog(session, "Casey", "The Briefing Bottle", "Logged 1.5 oz of The Briefing Bottle for Casey · $2.07 at cost.");
+
+        await page.click('.tab-button[data-tab="ledger"]');
+        const card = page.locator(`.host-night-card[data-host-night-id="${night.id}"]`);
+        await card.waitFor();
+        assert.equal(await card.locator("[data-host-night-status]").textContent(), "Running · 0 open tabs");
+        const listed = await card.locator("[data-crew-drinks] li").allTextContents();
+        assert.equal(listed.length, 1, `the pour is listed while the night runs; got ${JSON.stringify(listed)}`);
+        assert.ok(listed[0].includes("Casey"), `expected the drinker named, got: ${listed[0]}`);
+        assert.ok(listed[0].includes("The Briefing Bottle"), `expected the stock named, got: ${listed[0]}`);
+        assert.equal(await card.locator("[data-crew-drinks] .form-note").count(), 0, "no ended-night note while it runs");
+
+        const stockBefore = await stockOf(page, bourbon);
+        assert.equal((await balanceCents(page)).Casey, -207, "the pour charges Casey at cost");
+
+        await clickForToast(session, `.host-night-card[data-host-night-id="${night.id}"] [data-void-crew-drink]`, "Drink voided. Stock and balances are back to where they were.");
+        assert.equal(await stockOf(page, bourbon), Math.round((stockBefore + 1.5) * 100) / 100, "the poured stock comes back");
+        assert.equal((await balanceCents(page)).Casey, 0, "and Casey's balance with it");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
   }
 ];
 

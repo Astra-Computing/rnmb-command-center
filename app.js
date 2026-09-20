@@ -3427,9 +3427,71 @@ function renderHostNights() {
         <span class="field-label">Written off</span>
         ${writtenOff}
       </div>
+      <div class="host-night-section" data-crew-drinks>
+        <span class="field-label">Crew drinks</span>
+        ${hostNightCrewDrinks(night)}
+      </div>
     `;
     target.append(card);
   });
+}
+
+/*
+ * Crew drinks charged on a host night (0.4.3, KTD7). The bar register only exists
+ * while the night runs, so once it ends this is the only way to undo a drink rung
+ * up to the wrong crew member. That is allowed where a guest item is not: a guest
+ * item sits on a tab whose total was counted against the cash when the night
+ * closed, while a crew drink is charged at cost straight to a person's balance and
+ * touches no tab. Before crew-balance.sql the database still locks the whole
+ * ended night, so there the drinks are listed and the button says why it cannot.
+ */
+function hostNightCrewDrinks(night) {
+  const drinks = RNMBDomain.crewDrinksOnNight(state, night.id);
+  if (!drinks.length) return "<small>No crew drinks charged.</small>";
+  const locked = Boolean(night.endedAt) && !crewBalanceAvailable;
+  const rows = drinks.map((drink) => {
+    const who = drink.personName || personById(drink.personId)?.name || "Crew";
+    const what = drink.kind === "pour"
+      ? (bottleById(drink.bottleId) ? stockLabel(bottleById(drink.bottleId)) : "Stock since removed")
+      : (drink.name || "Drink");
+    const cost = drink.costCents === null ? "no charge" : `${centsText(drink.costCents)} at cost`;
+    return `
+      <li data-crew-drink="${escapeHtml(drink.id)}" data-crew-drink-kind="${drink.kind}">
+        <span>${escapeHtml(what)} · ${escapeHtml(who)}</span>
+        <span>${escapeHtml(cost)}</span>
+        <button type="button" class="secondary-button" data-void-crew-drink="${escapeHtml(drink.id)}" data-void-crew-kind="${drink.kind}" data-void-crew-night="${escapeHtml(night.id)}"${locked ? " disabled" : ""} aria-label="Void ${escapeHtml(what)} for ${escapeHtml(who)}">Void</button>
+      </li>`;
+  }).join("");
+  const note = locked
+    ? `<small class="form-note">${escapeHtml(CREW_BALANCE_SQL_MESSAGE)}</small>`
+    : (night.endedAt ? "<small class=\"form-note\">This night has ended, so its guest tabs are settled — but a crew drink is charged at cost and can still be put right.</small>" : "");
+  return `<ul class="host-night-crew-drinks">${rows}</ul>${note}`;
+}
+
+/** Void one crew drink charged on a host night: stock and the drinker's balance both go back. */
+async function voidHostNightCrewDrink(id, kind, nightId) {
+  const night = state.nights.find((entry) => entry.id === nightId);
+  if (!night) return;
+
+  if (kind === "ringUp") {
+    const ringUp = state.ringUps.find((entry) => entry.id === id && entry.kind === "crew");
+    if (!ringUp) return;
+    const who = ringUp.personName || personById(ringUp.personId)?.name || "crew";
+    if (!confirm(`Void ${ringUp.menuItemName || "this drink"} for ${who}? What it poured goes back into stock, and ${who}'s balance goes back to where it was.`)) return;
+    await hostAction("Drink voided. Stock and balances are back to where they were.", (db) => db.voidRingUp(ringUp.id));
+    return;
+  }
+
+  const pour = (night.pours || []).find((entry) => entry.id === id);
+  const bottle = bottleById(pour?.bottleId);
+  if (!pour || !bottle) return;
+  const who = pour.personName || personById(pour.personId)?.name || "crew";
+  const measure = amountText(typeById(bottle.typeId), pour.ounces);
+  if (!confirm(`Void ${measure} of ${stockLabel(bottle)} for ${who}? It goes back into stock, and ${who}'s balance goes back to where it was.`)) return;
+  // saveState's pattern: change state first, then persist. A failure reloads it.
+  bottle.remaining = round6(Math.min(Number(bottle.size), Number(bottle.remaining) + Number(pour.ounces)));
+  night.pours = night.pours.filter((entry) => entry.id !== id);
+  await saveState("Drink voided. Stock and balances are back to where they were.", (db) => db.removePour(pour, bottle.remaining));
 }
 
 function renderCrew() {
@@ -3875,6 +3937,11 @@ document.querySelector("#ledger").addEventListener("click", async (event) => {
   if (!control || control.disabled) return;
   if (control.hasAttribute("data-pay-suggestion")) {
     await recordSuggestedPayment(control);
+    return;
+  }
+  if (control.dataset.voidCrewDrink) {
+    // The Host nights panel is inside #ledger, so it is handled here too.
+    await voidHostNightCrewDrink(control.dataset.voidCrewDrink, control.dataset.voidCrewKind, control.dataset.voidCrewNight);
     return;
   }
   if (control.dataset.voidPayment) await voidPayment(control.dataset.voidPayment);

@@ -1671,3 +1671,51 @@ test("nightRecap keeps a drinker who has left the roster, after everyone still o
   };
   assert.deepEqual(D.nightRecap(state, "n1").map((entry) => [entry.name, entry.personId]), [["Sam", "p-sam"], ["Ada", null], ["Zoe", null]], "the roster first, then anyone removed since, by name");
 });
+
+test("crewDrinksOnNight flattens a host night's crew drinks, newest first, each with its drinker (0.4.3)", () => {
+  const state = {
+    people: [{ id: "p-sam", name: "Sam" }, { id: "p-alex", name: "Alex" }],
+    types,
+    bottles: [{ id: "b-tequila", typeId: "t-tequila", size: 25.36, remaining: 20, price: 60, buyerId: "p-sam" }],
+    nights: [{
+      id: "h1",
+      kind: "host",
+      endedAt: "2026-09-20T04:00:00Z",
+      pours: [
+        { id: "po1", personId: "p-alex", bottleId: "b-tequila", ounces: 1.5, abv: 40, timestamp: "2026-09-20T01:00:00Z", costCents: 355, buyerId: "p-sam", buyerName: "Sam" }
+      ]
+    }],
+    ringUps: [
+      // A guest drink on the same night: it belongs to a tab, never to a crew member.
+      { id: "rg", nightId: "h1", kind: "guest", tabId: "tab1", personId: null, personName: null, menuItemName: "Margarita", priceCents: 900, rungAt: "2026-09-20T02:00:00Z", voidedAt: null, lines: [{ typeId: "t-tequila", amount: 1.5, abv: 40, costCents: 355, shareCents: 900, buyerId: "p-sam", buyerName: "Sam" }] },
+      { id: "rc", nightId: "h1", kind: "crew", personId: "p-alex", personName: "Alex", menuItemName: "Paloma", rungAt: "2026-09-20T03:00:00Z", voidedAt: null, lines: [{ typeId: "t-tequila", amount: 1.5, abv: 40, costCents: 355, buyerId: "p-sam", buyerName: "Sam" }] },
+      { id: "rv", nightId: "h1", kind: "crew", personId: "p-alex", personName: "Alex", menuItemName: "Voided one", rungAt: "2026-09-20T03:30:00Z", voidedAt: "2026-09-20T03:31:00Z", lines: [{ typeId: "t-tequila", amount: 1.5, abv: 40, costCents: 355, buyerId: "p-sam", buyerName: "Sam" }] }
+    ]
+  };
+
+  const drinks = D.crewDrinksOnNight(state, "h1");
+  assert.deepEqual(drinks.map((drink) => [drink.kind, drink.id]), [["ringUp", "rc"], ["pour", "po1"]], "newest first; the guest drink and the voided one are not crew drinks");
+  assert.equal(drinks[0].personName, "Alex");
+  assert.equal(drinks[0].personId, "p-alex");
+  assert.equal(drinks[0].costCents, 355, "charged at cost to the drinker, credited to Sam");
+  assert.equal(drinks[1].kind, "pour");
+  assert.equal(drinks[1].bottleId, "b-tequila");
+
+  assert.deepEqual(D.crewDrinksOnNight(state, "missing"), []);
+  assert.deepEqual(D.crewDrinksOnNight({}, "h1"), []);
+  assert.deepEqual(D.crewDrinksOnNight(), []);
+});
+
+test("crewDrinksOnNight keeps a drink whose drinker has left the roster (0.4.3, 0.5.7)", () => {
+  const state = {
+    people: [{ id: "p-sam", name: "Sam" }],
+    types,
+    bottles: [],
+    nights: [{ id: "h1", kind: "host", endedAt: "2026-09-20T04:00:00Z", pours: [] }],
+    ringUps: [
+      { id: "r1", nightId: "h1", kind: "crew", personId: null, personName: "Zoe", menuItemName: "Shot", rungAt: "2026-09-20T02:00:00Z", voidedAt: null, lines: [{ typeId: "t-tequila", amount: 1.5, abv: 40, costCents: 100, buyerId: "p-sam", buyerName: "Sam" }] }
+    ]
+  };
+  const drinks = D.crewDrinksOnNight(state, "h1");
+  assert.deepEqual(drinks.map((drink) => [drink.personName, drink.personId, drink.costCents]), [["Zoe", null, 100]], "the name snapshot still names who owes it");
+});
