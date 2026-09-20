@@ -121,6 +121,21 @@
         </section>
 
         <section class="tab-panel" id="tonight" aria-labelledby="tonight-title">
+          <!-- Quick log (0.4.2, KTD8): who is drinking, then one tap on a bottle or menu item. -->
+          <section class="panel quick-log-panel" aria-labelledby="quickLogTitle">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">Two Taps</span>
+                <h3 id="quickLogTitle">Quick Log</h3>
+              </div>
+            </div>
+            <p id="quickLogNight" class="form-note"></p>
+            <span class="field-label">1. Who's drinking?</span>
+            <div id="quickLogPeople" class="quick-log-grid quick-log-people"></div>
+            <span id="quickLogItemsLabel" class="field-label">2. What are they having?</span>
+            <div id="quickLogItems" class="quick-log-grid"></div>
+          </section>
+
           <div class="split-layout">
             <section class="panel">
               <div class="panel-heading">
@@ -181,6 +196,20 @@
               </form>
             </section>
           </div>
+
+          <!-- End of night and recap (0.4.3, KTD7). A review, never a gate: balances
+               are already live, and an ended crew night stays editable. -->
+          <section class="panel" id="nightRecapPanel" aria-labelledby="nightRecapTitle" hidden>
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">Wrap Up</span>
+                <h3 id="nightRecapTitle">End of Night</h3>
+              </div>
+              <button type="button" id="endCrewNight" class="secondary-button">End night</button>
+            </div>
+            <p id="nightRecapNote" class="form-note"></p>
+            <div id="nightRecapList" class="recap-grid"></div>
+          </section>
 
           <section class="panel">
             <div class="panel-heading">
@@ -387,18 +416,49 @@
               </div>
               <div id="ledgerList" class="ledger-list empty-state">No purchases logged yet.</div>
             </section>
-            <section class="panel">
+            <!-- Crew running balances (0.5.2, 0.9.2): derived from drinks, tabs and payments on every render. -->
+            <section class="panel balances-panel" aria-labelledby="balancesTitle">
               <div class="panel-heading">
                 <div>
                   <span class="eyebrow">Settle Up</span>
-                  <h3>Equal Share</h3>
+                  <h3 id="balancesTitle">Crew Balances</h3>
                 </div>
               </div>
-              <div id="settleList" class="stack-list empty-state">Need people and receipts first.</div>
+              <p id="balanceNotice" class="notice" role="status" hidden></p>
+              <p id="balanceSummary" class="form-note balance-summary"></p>
+              <div id="balanceList" class="balance-list"></div>
+              <h4 class="subheading">Fewest payments to square up</h4>
+              <div id="paymentSuggestions" class="payment-list"></div>
+            </section>
+
+            <section class="panel payments-panel" aria-labelledby="paymentsTitle">
+              <div class="panel-heading">
+                <div>
+                  <span class="eyebrow">Venmo Log</span>
+                  <h3 id="paymentsTitle">Record a Payment</h3>
+                </div>
+              </div>
+              <form id="paymentForm" class="form-grid" novalidate>
+                <label>
+                  From
+                  <select name="fromPersonId"></select>
+                </label>
+                <label>
+                  To
+                  <select name="toPersonId"></select>
+                </label>
+                <label>
+                  Amount ($)
+                  <input name="amount" inputmode="decimal" autocomplete="off" placeholder="3.20">
+                </label>
+                <button id="paymentSubmit" type="submit">Record Payment</button>
+              </form>
+              <h4 class="subheading">Recent payments</h4>
+              <div id="paymentList" class="payment-list"></div>
             </section>
           </div>
 
-          <!-- Host nights (2.8.6, 0.5.1): guest money, kept apart from Settle Up, which it never changes. -->
+          <!-- Host nights (2.8.6, 0.8.7, 0.8.8): guest money by collector and buyer. Paid and written-off tabs feed Crew Balances. -->
           <section class="panel host-nights-panel" aria-labelledby="hostNightsTitle">
             <div class="panel-heading">
               <div>
@@ -406,7 +466,7 @@
                 <h3 id="hostNightsTitle">Guest Money</h3>
               </div>
             </div>
-            <p class="form-note host-nights-note">Who holds the money guests paid, and which crew member's stock each part paid for, margin included. For reference only: Equal Share above does not change.</p>
+            <p class="form-note host-nights-note">Who holds the money guests paid, and which crew member's stock each part paid for, margin included. These tabs already count in Crew Balances above: the collector carries what they collected, and whoever wrote a tab off covers what its drinks cost.</p>
             <div id="hostNightList" class="host-night-list empty-state">No host nights yet.</div>
           </section>
         </section>
@@ -502,7 +562,7 @@
             </label>
             <button id="registerOpenTab" class="register-secondary" type="submit">Open tab</button>
           </form>
-          <span class="field-label">Crew (no charge)</span>
+          <span class="field-label">Crew (at cost)</span>
           <div id="registerCrew" class="register-choice-grid"></div>
         </section>
 
