@@ -76,6 +76,14 @@ let hostModeAvailable = true;
 const HOST_MODE_SQL_MESSAGE = "Host mode is not set up on the shared database yet. Run supabase/host-mode.sql in Supabase, then reload.";
 const NOT_SAVING_MESSAGE = "This host night belongs to the shared database, and this browser is not connected to it, so nothing was saved. Reload the page to reconnect, then try again.";
 const SOLD_BOTTLE_MESSAGE = "Drinks have been sold from this stock item, so it cannot be deleted. Set its remaining level to empty instead.";
+const POURED_BOTTLE_MESSAGE = "Crew drinks have been poured from this stock item and charged against it, so it cannot be deleted. Set its remaining level to empty instead.";
+// Crew balances (crew-balance KTD6): false when the shared database has not run
+// supabase/crew-balance.sql -- rnmb_payments answers 404, or rnmb_pours has no
+// cost columns (and always when host mode itself is missing). Local mode always
+// has them, so this starts true and is reset on every load, like hostModeAvailable.
+// While false, no payment, pour-cost or write-off-author column is ever sent.
+let crewBalanceAvailable = true;
+const CREW_BALANCE_SQL_MESSAGE = "Crew balances are not set up on the shared database yet. Run supabase/crew-balance.sql in Supabase, then reload.";
 
 // The bar register (KTD7): the order being built is this one object, never the
 // DOM, so every render rebuilds the register from it. See renderRegister().
@@ -92,6 +100,30 @@ let registerPending = false;
 let openTabPending = false;
 // Close-out: the collector picked on each open tab card (tab id -> person id), kept across re-renders.
 const registerCollectors = new Map();
+// Close-out: the crew member picked to write each open tab off (tab id -> person id); they are charged its cost (0.8.8).
+const registerWriters = new Map();
+
+// Quick log on Tonight (0.4.2, KTD8): the person whose drinks are being logged, and
+// true while one tap's save is out, so a double tap logs one drink.
+let quickLogPersonId = null;
+let quickLogPending = false;
+// The night quick log writes to. Normally the active night; the recap's "Add a
+// missed drink" pins the night it is showing, so a drink added while fixing up
+// one night can never land on another (0.4.3).
+let quickLogNightId = null;
+// Settle-up (0.5.4): true while a payment or a void is being saved.
+let paymentPending = false;
+// End of night (0.4.3): true while ending a night or voiding from the recap.
+let recapPending = false;
+// One id per draft (KTD14): a tap or payment that fails keeps its id, so retrying
+// the same drink or payment can never save it twice. Forgotten once saved.
+const quickLogDraftIds = new Map();
+const paymentDraftIds = new Map();
+
+function draftId(drafts, key) {
+  if (!drafts.has(key)) drafts.set(key, uid());
+  return drafts.get(key);
+}
 
 function normalizeState(input) {
   return RNMBDomain.normalizeState(input);
@@ -148,10 +180,28 @@ function openHostNightFor(nightId, local) {
   return night;
 }
 
+/**
+ * The night a ring-up goes on (crew-balance KTD6/KTD7, as rnmb_ring_up): guest
+ * drinks need an open host night; crew drinks may also go on a crew night,
+ * whether or not it has ended. The KTD9 local check applies to host nights only.
+ */
+function ringUpNightFor(record, local) {
+  const night = state.nights.find((entry) => entry.id === record.nightId);
+  if (record.kind === "crew" && night && night.kind !== "host") return night;
+  return openHostNightFor(record.nightId, local);
+}
+
+/** A crew member on the roster, or a refusal with the given message. */
+function crewMember(personId, message) {
+  const person = personId ? personById(personId) : null;
+  if (!person) throw refusal(message);
+  return person;
+}
+
 const hostRules = {
   ringUp(record, { local }) {
     if (state.ringUps.some((entry) => entry.id === record.id)) throw refusal("That ring-up was already saved.");
-    const night = openHostNightFor(record.nightId, local);
+    const night = ringUpNightFor(record, local);
     let person = null;
     if (record.kind === "guest") {
       if (!record.tabId) throw refusal("A guest ring-up needs a tab.");
@@ -243,8 +293,15 @@ const hostRules = {
     if (!ringUp) throw refusal("That ring-up does not exist.");
     if (ringUp.voidedAt) throw refusal("That item was already voided.");
     const night = state.nights.find((entry) => entry.id === ringUp.nightId);
-    if (night?.endedAt) throw refusal("This host night has ended, so its items can no longer be voided.");
-    if (local && night?.startedLocally !== true) throw refusal(NOT_SAVING_MESSAGE);
+    // A crew night's items stay voidable after it ends (KTD7); host nights keep
+    // their locks, but only over guest items. An ended host night freezes the
+    // tab totals that were counted against the cash; a crew drink touches no tab
+    // and is charged at cost, so leaving it locked would make a wrong person's
+    // debit permanent with nowhere to correct it.
+    if (night?.kind !== "crew") {
+      if (night?.endedAt && ringUp.kind === "guest") throw refusal("This host night has ended, so its items can no longer be voided.");
+      if (local && night?.startedLocally !== true) throw refusal(NOT_SAVING_MESSAGE);
+    }
     if (ringUp.kind === "guest") {
       const tab = state.guestTabs.find((entry) => entry.id === ringUp.tabId);
       if (tab?.status !== "open") throw refusal("That tab is already closed, so its items can no longer be voided.");
@@ -271,7 +328,7 @@ const hostRules = {
     return saved;
   },
 
-  closeTab({ id, status, collectorId, amountCents }, { local }) {
+  closeTab({ id, status, collectorId, amountCents, writtenOffBy }, { local }) {
     const tab = state.guestTabs.find((entry) => entry.id === id);
     if (!tab) throw refusal("That tab does not exist.");
     if (tab.status !== "open") throw refusal("That tab is already closed.");
@@ -285,12 +342,28 @@ const hostRules = {
       if (!Number.isInteger(amountCents) || amountCents !== total) {
         throw refusal(`The amount collected (${amountCents ?? "no"} cents) must equal the tab total (${total} cents).`);
       }
-      closed = { ...tab, status, collectorId: collector.id, collectorName: collector.name, amountCents, closedAt: nowIso() };
+      closed = {
+        ...tab, status, collectorId: collector.id, collectorName: collector.name, amountCents,
+        writtenOffBy: null, writtenOffByName: null, closedAt: nowIso()
+      };
     } else if (status === "written_off") {
       if ((collectorId ?? null) !== null || (amountCents ?? null) !== null) {
         throw refusal("A written-off tab has no collector and no amount.");
       }
-      closed = { ...tab, status, collectorId: null, collectorName: null, amountCents: null, closedAt: nowIso() };
+      let author = null;
+      if (writtenOffBy) {
+        author = crewMember(writtenOffBy, "The crew member writing off the tab does not exist.");
+      // crew-balance.sql requires the crew member who writes a tab off (0.7.8), and the
+      // register asks for one on every open tab card, so the local rules require one too
+      // whenever crew balances are on. Before crew-balance.sql the database has nowhere
+      // to keep an author, so none is required (or sent).
+      } else if (crewBalanceAvailable) {
+        throw refusal("A written-off tab needs the crew member who wrote it off.");
+      }
+      closed = {
+        ...tab, status, collectorId: null, collectorName: null, amountCents: null,
+        writtenOffBy: author ? author.id : null, writtenOffByName: author ? author.name : null, closedAt: nowIso()
+      };
     } else {
       throw refusal("A tab closes as paid or written off.");
     }
@@ -332,6 +405,50 @@ const hostRules = {
     const ended = { ...night, endedAt: nowIso() };
     state.nights = state.nights.map((entry) => (entry.id === nightId ? ended : entry));
     return ended;
+  },
+
+  /** rnmb_end_night: a crew night ends straight away; a host night keeps endHostNight's rules. */
+  endNight(nightId, { local }) {
+    const night = state.nights.find((entry) => entry.id === nightId);
+    if (!night) throw refusal("That night does not exist.");
+    if (night.kind === "host") return hostRules.endHostNight(nightId, { local });
+    if (night.endedAt) throw refusal("This crew night has already ended.");
+    const ended = { ...night, endedAt: nowIso() };
+    state.nights = state.nights.map((entry) => (entry.id === nightId ? ended : entry));
+    return ended;
+  },
+
+  /** rnmb_record_payment (0.5.4, KTD5): whole cents above zero between two different crew members, names snapshotted. */
+  recordPayment({ id, fromPersonId, toPersonId, amountCents, paidAt }) {
+    if (!id) throw refusal("A payment needs an id.");
+    if (state.payments.some((entry) => entry.id === id)) throw refusal("That payment was already recorded.");
+    if (!Number.isInteger(amountCents) || amountCents <= 0) throw refusal("A payment needs an amount above zero, in whole cents.");
+    if (!fromPersonId || !toPersonId) throw refusal("A payment needs the crew member who paid and the one who was paid.");
+    if (fromPersonId === toPersonId) throw refusal("A payment must be between two different crew members.");
+    const from = crewMember(fromPersonId, "The crew member who paid does not exist.");
+    const to = crewMember(toPersonId, "The crew member who was paid does not exist.");
+    const saved = RNMBDomain.normalizePayment({
+      id,
+      fromPersonId: from.id,
+      fromName: from.name,
+      toPersonId: to.id,
+      toName: to.name,
+      amountCents,
+      paidAt: paidAt || nowIso(),
+      voidedAt: null
+    });
+    state.payments.push(saved);
+    return saved;
+  },
+
+  /** rnmb_void_payment: a soft void; the payment stays in the history. */
+  voidPayment(paymentId) {
+    const payment = state.payments.find((entry) => entry.id === paymentId);
+    if (!payment) throw refusal("That payment does not exist.");
+    if (payment.voidedAt) throw refusal("That payment was already voided.");
+    const voided = { ...payment, voidedAt: nowIso() };
+    state.payments = state.payments.map((entry) => (entry.id === paymentId ? voided : entry));
+    return voided;
   },
 
   correctStock({ id, bottleId, newRemaining }) {
@@ -423,6 +540,34 @@ function preparePricing({ markupPercent, roundingIncrementCents }) {
   return { markupPercent: markup, roundingIncrementCents: increment };
 }
 
+/**
+ * Check a crew pour and build it, without touching state (the caller applies it
+ * and saves with saveState + db.addPour). Mirrors rnmb_add_crew_pour: an ended
+ * host night takes no pours, but an ended crew night does (KTD7). When crew
+ * balances are available the pour is stamped with its whole-cent cost and the
+ * bottle buyer (KTD2), as the database function stamps it; otherwise it carries
+ * no stamp, because the shared database has nowhere to keep one.
+ */
+function preparePour(night, { id, personId, bottleId, ounces, timestamp }) {
+  if (night?.kind === "host" && night.endedAt) throw refusal("This host night has ended, so no more pours can be logged.");
+  const bottle = bottleById(bottleId);
+  const type = typeById(bottle?.typeId);
+  const amount = Number(ounces);
+  if (!bottle || !type || !(amount > 0)) throw refusal("Pick a stocked bottle and a valid pour.");
+  if (!(Number(type.abv) > 0)) throw refusal(`${type.name} has no alcohol, so it is not logged as a pour.`);
+  if (isCounted(type) && !Number.isInteger(amount)) throw refusal(`${type.name} is counted stock, so log a whole number of units.`);
+  if (amount > Number(bottle.remaining)) throw refusal("That pour exceeds the bottle inventory.");
+  const pour = {
+    id: id || uid(),
+    personId,
+    bottleId: bottle.id,
+    ounces: amount,
+    abv: type.abv,
+    timestamp: timestamp || new Date().toISOString()
+  };
+  return RNMBDomain.normalizePour(crewBalanceAvailable ? RNMBDomain.stampPour(pour, bottle, state.people) : pour);
+}
+
 /** Price a draft with the current settings. sources: [{ bottleId, amount }] across every ingredient. */
 function buildRingUp({ id, nightId, kind, tabId, personId, menuItemId, sources }) {
   const priced = RNMBDomain.priceRingUp(sources, {
@@ -473,6 +618,9 @@ function createLocalRepository() {
     closeTab: apply("closeTab"),
     startHostNight: apply("startHostNight"),
     endHostNight: apply("endHostNight"),
+    endNight: apply("endNight"),
+    recordPayment: apply("recordPayment"),
+    voidPayment: apply("voidPayment"),
     correctStock: apply("correctStock"),
     saveMenuItem: apply("saveMenuItem"),
     removeMenuItem: apply("removeMenuItem"),
@@ -558,6 +706,25 @@ function createSupabaseRepository(config) {
       if (error.status === 404 || ["PGRST205", "42P01"].includes(error.code)) return null;
       throw error;
     }
+  }
+
+  /*
+   * Whether rnmb_pours has the crew-balance cost columns. Selecting a column that
+   * does not exist is refused (400, 42703) even when no row matches, and no row
+   * ever has a null id, so this reads nothing either way.
+   */
+  async function pourCostColumnsExist() {
+    try {
+      await request("rnmb_pours?select=cost_cents,buyer_id,buyer_name&id=is.null");
+      return true;
+    } catch (error) {
+      if ([400, 404].includes(error.status) || ["42703", "PGRST204", "PGRST205", "42P01"].includes(error.code)) return false;
+      throw error;
+    }
+  }
+
+  function requireCrewBalance() {
+    if (!crewBalanceAvailable) throw refusal(CREW_BALANCE_SQL_MESSAGE);
   }
 
   async function rpc(name, payload) {
@@ -691,7 +858,7 @@ function createSupabaseRepository(config) {
     async load() {
       const [
         peopleRows, typeRows, bottleRows, nightRows, pourRows, settingsRows,
-        menuItemRows, ingredientRowsRead, tabRows, ringUpRows, lineRows, adjustmentRows
+        menuItemRows, ingredientRowsRead, tabRows, ringUpRows, lineRows, adjustmentRows, paymentRows
       ] = await Promise.all([
         readTable("rnmb_people", "order=created_at.asc"),
         readTable("rnmb_beverage_types", "order=created_at.asc"),
@@ -704,10 +871,17 @@ function createSupabaseRepository(config) {
         readHostModeTable("rnmb_guest_tabs", "order=opened_at.asc"),
         readHostModeTable("rnmb_ring_ups", "order=rung_at.asc"),
         readHostModeTable("rnmb_ring_up_lines", "order=line_no.asc"),
-        readHostModeTable("rnmb_stock_adjustments", "order=adjusted_at.asc")
+        readHostModeTable("rnmb_stock_adjustments", "order=adjusted_at.asc"),
+        readHostModeTable("rnmb_payments", "order=paid_at.asc")
       ]);
       const hostTables = [menuItemRows, ingredientRowsRead, tabRows, ringUpRows, lineRows, adjustmentRows];
       hostModeAvailable = hostTables.every((rows) => rows !== null);
+      // KTD6: balances need the payments table AND the pour cost columns (crew-balance.sql adds both).
+      // Deliberately sequential: this probe names columns a pre-crew-balance database
+      // does not have, so it must run only after the reads above prove host mode and
+      // the payments table exist. Racing it alongside them costs a pre-migration
+      // database a 400 on every load (KTD6).
+      crewBalanceAvailable = hostModeAvailable && paymentRows !== null && await pourCostColumnsExist();
 
       const groupBy = (rows, key) => {
         const groups = new Map();
@@ -734,7 +908,10 @@ function createSupabaseRepository(config) {
             bottleId: pour.bottle_id,
             ounces: Number(pour.ounces),
             abv: Number(pour.abv_snapshot),
-            timestamp: pour.poured_at
+            timestamp: pour.poured_at,
+            costCents: pour.cost_cents,
+            buyerId: pour.buyer_id,
+            buyerName: pour.buyer_name
           }))
       }));
 
@@ -782,6 +959,8 @@ function createSupabaseRepository(config) {
           collectorId: tab.collector_id,
           collectorName: tab.collector_name,
           amountCents: tab.amount_cents,
+          writtenOffBy: tab.written_off_by,
+          writtenOffByName: tab.written_off_by_name,
           openedAt: tab.opened_at,
           closedAt: tab.closed_at
         })),
@@ -816,6 +995,16 @@ function createSupabaseRepository(config) {
           newRemaining: adjustment.new_remaining,
           adjustedAt: adjustment.adjusted_at
         })),
+        payments: (paymentRows || []).map((payment) => ({
+          id: payment.id,
+          fromPersonId: payment.from_person_id,
+          fromName: payment.from_name,
+          toPersonId: payment.to_person_id,
+          toName: payment.to_name,
+          amountCents: payment.amount_cents,
+          paidAt: payment.paid_at,
+          voidedAt: payment.voided_at
+        })),
         activeNightId: settings.active_night_id || nights[0]?.id || "",
         responsibleMode: settings.responsible_mode !== false,
         markupPercent: settings.markup_percent,
@@ -828,6 +1017,13 @@ function createSupabaseRepository(config) {
       const hasHostHistory = nextState.guestTabs.length || nextState.ringUps.length ||
         nextState.stockAdjustments.length || nextState.nights.some((night) => night.kind === "host");
       if (!hostModeAvailable && hasHostHistory) throw refusal(`This data includes host-night records. ${HOST_MODE_SQL_MESSAGE}`);
+      if (!crewBalanceAvailable && RNMBDomain.hasCrewBalanceRecords(nextState)) {
+        throw refusal(`This data includes crew balance records (payments, drink costs, write-off authors or an ended crew night). ${CREW_BALANCE_SQL_MESSAGE}`);
+      }
+      // crew-balance.sql requires a written-off tab's author; one without cannot be re-inserted.
+      if (crewBalanceAvailable && nextState.guestTabs.some((tab) => tab.status === "written_off" && !tab.writtenOffByName)) {
+        throw refusal("This data has a written-off tab with no record of who wrote it off, and the shared database needs one, so nothing was replaced.");
+      }
 
       await request("rnmb_settings?id=eq.true", {
         method: "PATCH",
@@ -837,6 +1033,7 @@ function createSupabaseRepository(config) {
 
       // Children before parents: the host-mode tables reference nights, people,
       // bottles and types, and bottles and tabs refuse deletes while referenced.
+      if (crewBalanceAvailable) await deleteAll("rnmb_payments");
       if (hostModeAvailable) {
         await deleteAll("rnmb_ring_up_lines");
         await deleteAll("rnmb_ring_ups");
@@ -860,15 +1057,11 @@ function createSupabaseRepository(config) {
       await insertRows("rnmb_nights", nextState.nights.map((night) => RNMBDomain.nightRow(night, hostModeAvailable)));
       await insertRows("rnmb_bottles", nextState.bottles.map((bottle) => RNMBDomain.bottleRow(bottle)));
       await insertRows("rnmb_pours", nextState.nights.flatMap((night) => (
-        (night.pours || []).map((pour) => ({
-          id: pour.id,
-          night_id: night.id,
-          person_id: pour.personId,
-          bottle_id: pour.bottleId,
-          ounces: pour.ounces,
-          abv_snapshot: pour.abv,
-          poured_at: pour.timestamp
-        }))
+        (night.pours || []).map((pour) => RNMBDomain.pourRow(
+          { ...pour, buyerId: knownId(nextState.people, pour.buyerId) },
+          night.id,
+          crewBalanceAvailable
+        ))
       )));
 
       if (hostModeAvailable) {
@@ -885,6 +1078,9 @@ function createSupabaseRepository(config) {
           collector_id: knownId(people, tab.collectorId),
           collector_name: tab.collectorName,
           amount_cents: tab.amountCents,
+          ...(crewBalanceAvailable
+            ? { written_off_by: knownId(people, tab.writtenOffBy), written_off_by_name: tab.writtenOffByName || null }
+            : {}),
           opened_at: tab.openedAt || nowIso(),
           closed_at: tab.closedAt
         })));
@@ -920,6 +1116,13 @@ function createSupabaseRepository(config) {
           previous_remaining: adjustment.previousRemaining,
           new_remaining: adjustment.newRemaining,
           adjusted_at: adjustment.adjustedAt || nowIso()
+        })));
+      }
+      if (crewBalanceAvailable) {
+        await insertRows("rnmb_payments", nextState.payments.map((payment) => RNMBDomain.paymentRow({
+          ...payment,
+          fromPersonId: knownId(nextState.people, payment.fromPersonId),
+          toPersonId: knownId(nextState.people, payment.toPersonId)
         })));
       }
       await saveSettings(nextState);
@@ -959,15 +1162,7 @@ function createSupabaseRepository(config) {
         return;
       }
       await patchWhere("rnmb_bottles", `id=eq.${pour.bottleId}`, { remaining_oz: remaining });
-      await insertRow("rnmb_pours", {
-        id: pour.id,
-        night_id: night.id,
-        person_id: pour.personId,
-        bottle_id: pour.bottleId,
-        ounces: pour.ounces,
-        abv_snapshot: pour.abv,
-        poured_at: pour.timestamp
-      });
+      await insertRow("rnmb_pours", RNMBDomain.pourRow(pour, night.id, crewBalanceAvailable));
     },
     async removePour(pour, restoredRemaining) {
       if (hostModeAvailable) {
@@ -978,7 +1173,10 @@ function createSupabaseRepository(config) {
       await patchWhere("rnmb_bottles", `id=eq.${pour.bottleId}`, { remaining_oz: restoredRemaining });
     },
     async removeBottle(bottleId) {
-      if (bottleHasSales(bottleId)) throw refusal(SOLD_BOTTLE_MESSAGE);
+      // rnmb_ring_up_lines.bottle_id restricts, but rnmb_pours.bottle_id
+      // cascades, so a charged crew pour has to be refused before the request.
+      const refused = bottleDeleteRefusal(bottleId);
+      if (refused) throw refusal(refused);
       try {
         await deleteWhere("rnmb_bottles", `id=eq.${bottleId}`);
       } catch (error) {
@@ -988,6 +1186,16 @@ function createSupabaseRepository(config) {
       }
     },
     async removePerson(personId) {
+      // KTD9 (0.5.7): the browser's copy of the balances can be minutes old, so
+      // the rule that keeps money from being orphaned runs where the rows are.
+      // rnmb_remove_person locks the person and refuses while a cost-stamped
+      // pour still names them as the drinker, because that is the one reference
+      // the delete destroys rather than setting null. Before crew-balance.sql
+      // there is no such function, and no pour cost to protect.
+      if (crewBalanceAvailable) {
+        await rpc("rnmb_remove_person", { id: personId });
+        return;
+      }
       await deleteWhere("rnmb_people", `id=eq.${personId}`);
     },
 
@@ -1004,7 +1212,8 @@ function createSupabaseRepository(config) {
           id: line.id,
           bottle_id: line.bottleId,
           amount: line.amount,
-          cost_cents: line.costCents,
+          // Always sent, crew lines too: a crew drink's cost is what balances debit (KTD2).
+          cost_cents: Number(line.costCents ?? 0),
           ...(record.kind === "guest" ? { share_cents: line.shareCents } : {})
         }))
       });
@@ -1019,12 +1228,15 @@ function createSupabaseRepository(config) {
       return mirror("openTab", tab);
     },
     async closeTab(closing) {
+      // A database without crew-balance.sql has nowhere to keep the author, so it is neither sent nor mirrored.
+      const kept = crewBalanceAvailable ? closing : { ...closing, writtenOffBy: undefined };
       await rpc("rnmb_close_tab", {
-        id: closing.id,
-        status: closing.status,
-        ...(closing.status === "paid" ? { collector_id: closing.collectorId, amount_cents: closing.amountCents } : {})
+        id: kept.id,
+        status: kept.status,
+        ...(kept.status === "paid" ? { collector_id: kept.collectorId, amount_cents: kept.amountCents } : {}),
+        ...(kept.status === "written_off" && kept.writtenOffBy ? { written_off_by: kept.writtenOffBy } : {})
       });
-      return mirror("closeTab", closing);
+      return mirror("closeTab", kept);
     },
     async startHostNight(night) {
       await rpc("rnmb_start_host_night", { id: night.id, name: night.name, date: night.date || today() });
@@ -1037,6 +1249,33 @@ function createSupabaseRepository(config) {
     async endHostNight(nightId) {
       await rpc("rnmb_end_host_night", { id: nightId });
       return mirror("endHostNight", nightId);
+    },
+    async endNight(nightId) {
+      if (!crewBalanceAvailable) {
+        // Before crew-balance.sql only a host night can end, through the older function.
+        const night = state.nights.find((entry) => entry.id === nightId);
+        if (night?.kind !== "host") throw refusal(hostModeAvailable ? CREW_BALANCE_SQL_MESSAGE : HOST_MODE_SQL_MESSAGE);
+        return repositoryApi.endHostNight(nightId);
+      }
+      await rpc("rnmb_end_night", { id: nightId });
+      return mirror("endNight", nightId);
+    },
+    async recordPayment(payment) {
+      requireCrewBalance();
+      const withId = { ...payment, id: payment.id || uid() };
+      await rpc("rnmb_record_payment", {
+        id: withId.id,
+        from_person_id: withId.fromPersonId,
+        to_person_id: withId.toPersonId,
+        amount_cents: withId.amountCents,
+        ...(withId.paidAt ? { paid_at: withId.paidAt } : {})
+      });
+      return mirror("recordPayment", withId);
+    },
+    async voidPayment(paymentId) {
+      requireCrewBalance();
+      await rpc("rnmb_void_payment", { id: paymentId });
+      return mirror("voidPayment", paymentId);
     },
     async correctStock(correction) {
       const withId = { ...correction, id: correction.id || uid() };
@@ -1121,6 +1360,7 @@ async function init() {
       repository = createLocalRepository();
       syncMode = "local";
       hostModeAvailable = true;
+      crewBalanceAvailable = true;
       showToast("No passphrase. Using local browser storage.");
     }
     state = await repository.load();
@@ -1134,6 +1374,7 @@ async function init() {
     repository = createLocalRepository();
     syncMode = "local";
     hostModeAvailable = true;
+    crewBalanceAvailable = true;
     state = await repository.load();
     render();
     showToast("Supabase load failed. Using local browser storage.");
@@ -1410,7 +1651,9 @@ function render() {
   renderTopline();
   renderForms();
   renderOverview();
+  renderQuickLog();
   renderTonight();
+  renderNightRecap();
   renderInventory();
   renderMenu();
   renderLedger();
@@ -1612,6 +1855,263 @@ function renderRecentNights() {
   });
 }
 
+/*
+ * Quick log (0.4.2, KTD8): pick a person, tap what they are drinking, done. A
+ * bottle logs a crew pour of one sensible measure through the same preparePour +
+ * addPour path as the pour form; a menu item logs a crew ring-up on the active
+ * night, preselected from stock like the register. Everything is charged at cost
+ * to the drinker and credited to whoever bought the stock.
+ */
+function quickLogChoices(personId) {
+  const recent = RNMBDomain.recentLogItems(state, personId);
+  if (recent.length) return { recent: true, items: recent };
+  const bottles = state.bottles
+    .filter((bottle) => Number(typeById(bottle.typeId)?.abv) > 0 && Number(bottle.remaining) > RNMBDomain.AMOUNT_EPSILON)
+    .map((bottle) => ({ kind: "bottle", id: bottle.id }));
+  const menuItems = state.menuItems
+    .filter((item) => RNMBDomain.menuItemAvailability(item, state.bottles).available)
+    .map((item) => ({ kind: "menu", id: item.id }));
+  return { recent: false, items: [...bottles, ...menuItems] };
+}
+
+/** What one tap on a bottle pours, and what it costs the drinker; null cost when it cannot be priced. */
+function quickLogBottleOffer(bottle) {
+  const type = typeById(bottle.typeId);
+  const amount = RNMBDomain.quickLogAmount(type);
+  const enough = Number(bottle.remaining) + RNMBDomain.AMOUNT_EPSILON >= amount;
+  let costCents = null;
+  try {
+    costCents = RNMBDomain.pourCostCents(bottle, amount);
+  } catch (error) {
+    costCents = null;
+  }
+  return { amount, type, enough, costCents };
+}
+
+/** What one tap on a menu item rings up: the preselected sources, its cost, and why it cannot be logged. */
+function quickLogMenuOffer(menuItem) {
+  const ingredients = RNMBDomain.menuItemIngredients(menuItem);
+  const picks = RNMBDomain.preselectSources(menuItem, state.bottles);
+  const missing = picks.findIndex((pick) => !pick.available);
+  if (missing >= 0) {
+    const type = typeById(ingredients[missing].typeId);
+    return { ok: false, label: "Out of stock", reason: `There is not enough ${type?.name || "stock"} left for ${menuItem.name}, so nothing was logged.` };
+  }
+  const short = picks.findIndex((pick) => pick.short);
+  if (short >= 0) {
+    const type = typeById(ingredients[short].typeId);
+    const shortfall = RNMBDomain.sourcesShortfall(ingredients[short], picks[short].sources);
+    return {
+      ok: false,
+      label: "Needs two bottles",
+      reason: `${type?.name || "An ingredient"} is short ${exactAmountText(type, shortfall)} in every single bottle, so ${menuItem.name} was not logged. Ring it up on the register to split it, or top that bottle's level up.`
+    };
+  }
+  const sources = RNMBDomain.flattenSources(picks.map((pick) => pick.sources));
+  try {
+    const priced = RNMBDomain.priceRingUp(sources, {
+      bottles: state.bottles,
+      types: state.types,
+      people: state.people,
+      markupPercent: state.markupPercent,
+      roundingIncrementCents: state.roundingIncrementCents,
+      kind: "crew"
+    });
+    return { ok: true, sources, costCents: RNMBDomain.crewDrinkCostCents(priced.lines) };
+  } catch (error) {
+    return { ok: false, label: "Unavailable", reason: error.userMessage || error.message };
+  }
+}
+
+/** The night quick log writes to: the recap's pinned night while it still exists, else the active one. */
+function quickLogNight() {
+  const pinned = quickLogNightId ? state.nights.find((night) => night.id === quickLogNightId) : null;
+  if (!pinned) quickLogNightId = null;
+  return pinned || activeNight();
+}
+
+function renderQuickLog() {
+  const night = quickLogNight();
+  const peopleTarget = document.querySelector("#quickLogPeople");
+  const itemsTarget = document.querySelector("#quickLogItems");
+  const label = document.querySelector("#quickLogItemsLabel");
+  if (quickLogPersonId && !personById(quickLogPersonId)) quickLogPersonId = null;
+  const person = personById(quickLogPersonId);
+
+  document.querySelector("#quickLogNight").textContent = night
+    ? `Logging to ${night.name}${night.endedAt ? " (ended)" : ""}. Every drink is charged at cost to whoever drinks it, and credited to whoever bought the bottle.`
+    : "Start a night log below, then every drink is two taps away.";
+
+  peopleTarget.innerHTML = "";
+  if (!state.people.length) {
+    peopleTarget.innerHTML = `<p class="empty-state">Add the crew first, over in the Crew tab.</p>`;
+  }
+  state.people.forEach((entry) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "quick-log-choice quick-log-person";
+    button.dataset.quickPerson = entry.id;
+    button.disabled = quickLogPending;
+    button.setAttribute("aria-pressed", String(entry.id === quickLogPersonId));
+    button.style.setProperty("--person-color", safeColor(entry.color));
+    button.innerHTML = `<span class="avatar" style="--person-color: ${safeColor(entry.color)}">${initials(entry.name)}</span><strong>${escapeHtml(entry.name)}</strong>`;
+    peopleTarget.append(button);
+  });
+
+  itemsTarget.innerHTML = "";
+  if (!person) {
+    label.textContent = "2. What are they having?";
+    itemsTarget.innerHTML = `<p class="empty-state">Tap a name to see their usual.</p>`;
+    return;
+  }
+  const choices = quickLogChoices(person.id);
+  label.textContent = choices.recent
+    ? `2. ${person.name}'s usual`
+    : `2. Nothing logged for ${person.name} yet, so here is the shelf`;
+  if (!choices.items.length) {
+    itemsTarget.innerHTML = `<p class="empty-state">Nothing is in stock to log. Add stock in Inventory.</p>`;
+    return;
+  }
+  choices.items.forEach((choice) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "quick-log-choice";
+    let title = "";
+    let detail = "";
+    if (choice.kind === "bottle") {
+      const bottle = bottleById(choice.id);
+      if (!bottle) return;
+      const offer = quickLogBottleOffer(bottle);
+      button.dataset.quickBottle = bottle.id;
+      button.disabled = quickLogPending || !offer.enough || !night;
+      title = stockLabel(bottle);
+      detail = offer.enough
+        ? `${amountText(offer.type, offer.amount)}${offer.costCents === null ? "" : ` · ${centsText(offer.costCents)}`}`
+        : `Only ${amountText(offer.type, bottle.remaining)} left`;
+    } else {
+      const item = state.menuItems.find((entry) => entry.id === choice.id);
+      if (!item) return;
+      const offer = quickLogMenuOffer(item);
+      button.dataset.quickMenu = item.id;
+      button.disabled = quickLogPending || !night;
+      title = item.name;
+      detail = offer.ok ? `${centsText(offer.costCents)} at cost` : offer.label;
+      if (!offer.ok) button.classList.add("is-short");
+    }
+    button.innerHTML = `<strong>${escapeHtml(title)}</strong><span>${escapeHtml(detail)}</span>`;
+    itemsTarget.append(button);
+  });
+}
+
+/**
+ * The night a quick-logged drink goes on, or a refusal toast explaining why there
+ * is none. `night` names one explicitly: the recap passes the night it is showing
+ * so a missed drink lands there, whatever the active night is by the time of the tap.
+ */
+function quickLogTarget(night = quickLogNight()) {
+  if (!night) {
+    showToast("Start a night log first, then tap away.");
+    return null;
+  }
+  if (!personById(quickLogPersonId)) {
+    showToast("Tap who is drinking first.");
+    return null;
+  }
+  return { night, person: personById(quickLogPersonId) };
+}
+
+/** One tap on a bottle: a crew pour of one measure, through the same path as the pour form. */
+async function quickLogBottle(bottleId, onNight) {
+  const target = quickLogTarget(onNight);
+  const bottle = bottleById(bottleId);
+  if (!target || !bottle) return;
+  const { night, person } = target;
+  const offer = quickLogBottleOffer(bottle);
+  const key = `pour|${night.id}|${person.id}|${bottle.id}`;
+  let pour;
+  try {
+    pour = preparePour(night, { id: draftId(quickLogDraftIds, key), personId: person.id, bottleId: bottle.id, ounces: offer.amount });
+  } catch (error) {
+    showToast(error.userMessage || "That pour could not be logged.");
+    return;
+  }
+  bottle.remaining = round6(Math.max(0, Number(bottle.remaining) - pour.ounces));
+  night.pours.push(pour);
+  const cost = pour.costCents !== null && pour.buyerName ? `${centsText(pour.costCents)} at cost` : "no charge (nobody on the roster bought it)";
+  let message = `Logged ${amountText(offer.type, pour.ounces)} of ${stockLabel(bottle)} for ${person.name} · ${cost}.`;
+  const status = statusForDrinks(activeNightTotals().byPerson.get(person.id)?.drinks || 0);
+  if (state.responsibleMode && status.className) message += ` ${status.label}: ${status.meta}`;
+  quickLogPending = true;
+  renderQuickLog();
+  let saved = false;
+  try {
+    saved = await saveState(message, (db) => db.addPour(night, pour, bottle.remaining));
+  } finally {
+    quickLogPending = false;
+  }
+  if (saved) quickLogDraftIds.delete(key);
+  renderQuickLog();
+}
+
+/** One tap on a menu item: a crew ring-up on the active night, drawing every ingredient at once (0.7.9). */
+async function quickLogMenuItem(menuItemId, onNight) {
+  const target = quickLogTarget(onNight);
+  const menuItem = state.menuItems.find((entry) => entry.id === menuItemId);
+  if (!target || !menuItem) return;
+  const { night, person } = target;
+  if (!hostModeAvailable) {
+    showToast(HOST_MODE_SQL_MESSAGE);
+    return;
+  }
+  if (night.kind !== "host" && !crewBalanceAvailable) {
+    showToast(CREW_BALANCE_SQL_MESSAGE);
+    return;
+  }
+  const offer = quickLogMenuOffer(menuItem);
+  if (!offer.ok) {
+    showToast(offer.reason);
+    return;
+  }
+  const key = `menu|${night.id}|${person.id}|${menuItem.id}`;
+  const record = buildRingUp({
+    id: draftId(quickLogDraftIds, key),
+    nightId: night.id,
+    kind: "crew",
+    personId: person.id,
+    menuItemId: menuItem.id,
+    sources: offer.sources
+  });
+  quickLogPending = true;
+  renderQuickLog();
+  let saved = false;
+  try {
+    saved = await hostAction(
+      `Logged ${menuItem.name} for ${person.name} · ${centsText(RNMBDomain.crewDrinkCostCents(record.lines))} at cost.`,
+      (db) => db.ringUp(record)
+    );
+  } finally {
+    quickLogPending = false;
+  }
+  if (saved) quickLogDraftIds.delete(key);
+  renderQuickLog();
+}
+
+/**
+ * Where a crew drink's liquor came from, for the Tonight timeline. Nothing records
+ * whether a drink was rung up at the register or tapped into quick log, so the
+ * timeline used to call every one of them "Bar register", which was often untrue.
+ * It names the stock it drew instead — which is both known and more useful.
+ */
+function crewDrinkSource(ringUp) {
+  const names = [];
+  (ringUp.lines || []).forEach((line) => {
+    const bottle = bottleById(line.bottleId);
+    const name = bottle ? stockLabel(bottle) : typeById(line.typeId)?.name;
+    if (name && !names.includes(name)) names.push(name);
+  });
+  return names.length ? names.join(", ") : "Crew drink";
+}
+
 function renderTonight() {
   const target = document.querySelector("#personConsumption");
   const timeline = document.querySelector("#pourTimeline");
@@ -1643,7 +2143,8 @@ function renderTonight() {
 
   timeline.innerHTML = "";
   const pours = [...(night?.pours || [])].reverse().slice(0, 12);
-  // Crew drinks rung up on the register, newest first. They are voided on the register (Crew drinks), not removed here.
+  // Crew drinks rung up on the register or tapped into quick log, newest first. They are
+  // voided on the register (Crew drinks) or in the night's recap, not removed here.
   const registerDrinks = night
     ? state.ringUps.filter((ringUp) => ringUp.kind === "crew" && ringUp.nightId === night.id && !ringUp.voidedAt).reverse().slice(0, 12)
     : [];
@@ -1677,11 +2178,178 @@ function renderTonight() {
     item.innerHTML = `
       <div>
         <strong>${escapeHtml(person?.name || ringUp.personName || "Unknown")} had ${escapeHtml(ringUp.menuItemName || "a drink")}</strong>
-        <small>Bar register · ${oneDecimal(RNMBDomain.linesConsumption(ringUp.lines, state.types).standardDrinks)} standard drinks</small>
+        <small>${escapeHtml(crewDrinkSource(ringUp))} · ${oneDecimal(RNMBDomain.linesConsumption(ringUp.lines, state.types).standardDrinks)} standard drinks</small>
       </div>
     `;
     timeline.append(item);
   });
+}
+
+/*
+ * End of night and recap (0.4.3, KTD7). Ending a crew night is a review step, not a
+ * confirmation gate: every balance already moved when each drink was logged, and an
+ * ended crew night stays editable so the recap can add a missed drink or void a
+ * wrong one. Host nights are not touched here — they end in the register, where
+ * ending still needs every tab closed and locks the night afterwards.
+ */
+
+/** The active night when it is a crew night, else null (a host night has no recap here). */
+function recapNight() {
+  const night = activeNight();
+  return night && night.kind !== "host" ? night : null;
+}
+
+/** What one recap line says: what was drunk, how much of it, and what it charged. */
+function recapDrinkLines(drink) {
+  const cost = drink.costCents === null ? "no charge" : `${centsText(drink.costCents)} at cost`;
+  if (drink.kind === "pour") {
+    const bottle = bottleById(drink.bottleId);
+    return {
+      name: bottle ? stockLabel(bottle) : "Stock since removed",
+      detail: `${amountText(typeById(drink.typeId), drink.amount)} · ${cost}`
+    };
+  }
+  return { name: drink.name || "Drink", detail: `${oneDecimal(drink.ounces)} oz · ${cost}` };
+}
+
+function renderNightRecap() {
+  const panel = document.querySelector("#nightRecapPanel");
+  const night = recapNight();
+  panel.hidden = !night;
+  if (!night) return;
+
+  const ended = Boolean(night.endedAt);
+  const endButton = document.querySelector("#endCrewNight");
+  const note = document.querySelector("#nightRecapNote");
+  const list = document.querySelector("#nightRecapList");
+  endButton.hidden = ended;
+  endButton.disabled = recapPending;
+  list.innerHTML = "";
+  list.hidden = !ended;
+
+  if (!ended) {
+    note.textContent = `Ending ${night.name} opens the recap: every drink, who drank it and what it cost, with a tap to add a missed one or void a wrong one. Balances are already up to date, so nothing is waiting on this.`;
+    return;
+  }
+
+  note.textContent = `${night.name} ended. Add a missed drink or void a wrong one — an ended crew night stays editable, and every fix moves the balances straight away.`;
+  const recap = RNMBDomain.nightRecap(state, night.id);
+  if (!recap.length) {
+    list.classList.add("empty-state");
+    list.textContent = "Nobody logged a drink on this night.";
+    return;
+  }
+  list.classList.remove("empty-state");
+
+  recap.forEach((entry) => {
+    const person = personById(entry.personId);
+    const card = document.createElement("article");
+    card.className = "recap-card";
+    card.dataset.recapPerson = entry.personId || "";
+    const drinkCount = `${entry.drinks.length} ${entry.drinks.length === 1 ? "drink" : "drinks"}`;
+    const lines = entry.drinks.map((drink) => {
+      const text = recapDrinkLines(drink);
+      return `
+        <li class="recap-drink" data-recap-drink="${escapeHtml(drink.id)}">
+          <div class="recap-drink-copy">
+            <strong>${escapeHtml(text.name)}</strong>
+            <small>${escapeHtml(text.detail)}</small>
+          </div>
+          <button type="button" class="secondary-button" data-recap-void="${escapeHtml(drink.id)}" data-recap-kind="${drink.kind}"${recapPending ? " disabled" : ""}>Void</button>
+        </li>`;
+    }).join("");
+    // Someone removed from the roster keeps their drinks here under the name the
+    // records snapshotted, but there is nobody left to log a new drink for.
+    const add = person
+      ? `<button type="button" class="secondary-button recap-add" data-recap-add="${escapeHtml(person.id)}"${recapPending ? " disabled" : ""}>Add a missed drink</button>`
+      : `<small class="form-note">No longer on the crew, so nothing new can be logged for them.</small>`;
+    card.innerHTML = `
+      <header class="recap-header">
+        <div class="person-card">
+          <span class="avatar" style="--person-color: ${safeColor(person?.color)}">${initials(entry.name || "?")}</span>
+          <div class="person-copy">
+            <strong>${escapeHtml(entry.name || "Unknown")}</strong>
+            <small data-recap-meta>${drinkCount} · ${oneDecimal(entry.ounces)} oz · ${oneDecimal(entry.standardDrinks)} standard drinks</small>
+          </div>
+        </div>
+        <strong class="recap-total" data-recap-cost>${centsText(entry.costCents)}</strong>
+      </header>
+      <ul class="recap-drinks">${lines}</ul>
+      ${add}
+    `;
+    list.append(card);
+  });
+}
+
+/** End a crew night: confirm, then open the recap. Nothing is locked (KTD7). */
+async function endCrewNight() {
+  const night = recapNight();
+  if (!night || night.endedAt || recapPending) return;
+  if (!crewBalanceAvailable) {
+    showToast(CREW_BALANCE_SQL_MESSAGE);
+    return;
+  }
+  if (!confirm(`End ${night.name}? The recap opens so you can add a missed drink or void a wrong one — an ended crew night stays editable, and every balance is already up to date.`)) return;
+  recapPending = true;
+  renderNightRecap();
+  try {
+    await hostAction(`${night.name} ended. Check the recap for anything missed.`, (db) => db.endNight(night.id));
+  } finally {
+    recapPending = false;
+  }
+  renderNightRecap();
+}
+
+/** Void one drink from the recap: a pour comes back through removePour, a crew ring-up through voidRingUp. */
+async function voidRecapDrink(id, kind) {
+  const night = recapNight();
+  if (!night || recapPending) return;
+
+  if (kind === "ringUp") {
+    const ringUp = state.ringUps.find((entry) => entry.id === id);
+    if (!ringUp) return;
+    const name = ringUp.personName || personById(ringUp.personId)?.name || "crew";
+    if (!confirm(`Void ${ringUp.menuItemName || "this drink"} for ${name}? What it poured goes back into stock, and ${name}'s balance goes back to where it was.`)) return;
+    recapPending = true;
+    renderNightRecap();
+    try {
+      await hostAction("Drink voided. Stock and balances are back to where they were.", (db) => db.voidRingUp(ringUp.id));
+    } finally {
+      recapPending = false;
+    }
+    renderNightRecap();
+    return;
+  }
+
+  const pour = (night.pours || []).find((entry) => entry.id === id);
+  const bottle = bottleById(pour?.bottleId);
+  if (!pour || !bottle) return;
+  const name = personById(pour.personId)?.name || "crew";
+  const measure = amountText(typeById(bottle.typeId), pour.ounces);
+  if (!confirm(`Void ${measure} of ${stockLabel(bottle)} for ${name}? It goes back into stock, and ${name}'s balance goes back to where it was.`)) return;
+  recapPending = true;
+  renderNightRecap();
+  try {
+    // saveState's pattern: change state first, then persist. A failure reloads it.
+    bottle.remaining = round6(Math.min(Number(bottle.size), Number(bottle.remaining) + Number(pour.ounces)));
+    night.pours = night.pours.filter((entry) => entry.id !== id);
+    await saveState("Drink voided. Stock and balances are back to where they were.", (db) => db.removePour(pour, bottle.remaining));
+  } finally {
+    recapPending = false;
+  }
+  renderNightRecap();
+}
+
+/** Point quick log at one person and at the night the recap is showing, then scroll to it. */
+function addMissedDrink(personId) {
+  const night = recapNight();
+  const person = personById(personId);
+  if (!night || !person) return;
+  quickLogPersonId = person.id;
+  quickLogNightId = night.id;
+  renderQuickLog();
+  document.querySelector("#quickLogItems").scrollIntoView({ block: "center" });
+  showToast(`Quick log is ready for ${person.name}. Tap what they had and it lands on ${night.name}.`);
 }
 
 function renderInventory() {
@@ -2104,8 +2772,10 @@ function renderRegister() {
   reconcileRegisterDraft(night);
   // Forget collectors picked for tabs that have since closed (here or on another device).
   const openIds = new Set(openTabsFor(night).map((tab) => tab.id));
-  Array.from(registerCollectors.keys()).forEach((tabId) => {
-    if (!openIds.has(tabId)) registerCollectors.delete(tabId);
+  [registerCollectors, registerWriters].forEach((picked) => {
+    Array.from(picked.keys()).forEach((tabId) => {
+      if (!openIds.has(tabId)) picked.delete(tabId);
+    });
   });
   renderRegisterMenu();
   renderRegisterTargets(night);
@@ -2164,7 +2834,7 @@ function renderRegisterTargets(night) {
     button.dataset.registerCrew = person.id;
     button.setAttribute("aria-pressed", String(registerDraft?.target?.kind === "crew" && registerDraft.target.personId === person.id));
     button.style.setProperty("--person-color", safeColor(person.color));
-    button.innerHTML = `<strong>${escapeHtml(person.name)}</strong><span>Crew · no charge</span>`;
+    button.innerHTML = `<strong>${escapeHtml(person.name)}</strong><span>Crew · at cost</span>`;
     crewTarget.append(button);
   });
 }
@@ -2252,7 +2922,8 @@ function updateRegisterSummary() {
     const tab = state.guestTabs.find((entry) => entry.id === check.target.tabId);
     label = `Ring up ${money(check.priced.priceCents / 100)} to ${tab?.guestName || "the tab"}`;
   } else if (check.ok) {
-    label = `Pour for ${personById(check.target.personId)?.name || "crew"} · no charge`;
+    // A crew drink carries no guest price, but it does debit the drinker what it costs (0.7.9).
+    label = `Pour for ${personById(check.target.personId)?.name || "crew"} · ${centsText(RNMBDomain.crewDrinkCostCents(check.priced.lines))} at cost`;
   }
   confirmButton.textContent = label;
   document.querySelector("#registerHint").textContent = registerPending ? "Saving…" : check.ok ? "" : check.reason;
@@ -2276,9 +2947,25 @@ function renderRegisterTabList(night) {
     const total = money(RNMBDomain.tabTotalCents(tab.id, state.ringUps) / 100);
     // The chosen collector survives a re-render (a save elsewhere, a refresh) until the tab closes.
     const chosen = personById(registerCollectors.get(tab.id)) ? registerCollectors.get(tab.id) : "";
-    const collectors = state.people.map((person) => (
-      `<option value="${escapeHtml(person.id)}"${person.id === chosen ? " selected" : ""}>${escapeHtml(person.name)}</option>`
+    // The same for the crew member writing the tab off, who is charged what its drinks cost (0.7.8, 0.8.8).
+    const writer = personById(registerWriters.get(tab.id)) ? registerWriters.get(tab.id) : "";
+    const peopleOptions = (selected) => state.people.map((person) => (
+      `<option value="${escapeHtml(person.id)}"${person.id === selected ? " selected" : ""}>${escapeHtml(person.name)}</option>`
     )).join("");
+    const collectors = peopleOptions(chosen);
+    const writers = peopleOptions(writer);
+    // Before crew-balance.sql the database has nowhere to keep the author and no
+    // balance for the charge to land on, so neither is offered or claimed.
+    const writeOffCost = centsText(tabWriteOffCostCents(tab.id));
+    const writerField = crewBalanceAvailable ? `
+        <label>
+          <span class="field-label">Written off by</span>
+          <select name="writtenOffBy" data-writer-for="${escapeHtml(tab.id)}">
+            <option value=""${writer ? "" : " selected"}>Pick a crew member</option>
+            ${writers}
+          </select>
+        </label>` : "";
+    const writeOffLabel = crewBalanceAvailable ? `Write off ${writeOffCost}` : "Write off";
     card.innerHTML = `
       <header>
         <strong>${escapeHtml(tab.guestName)}</strong>
@@ -2293,8 +2980,8 @@ function renderRegisterTabList(night) {
             ${collectors}
           </select>
         </label>
-        <button class="register-primary register-pay" type="button" data-pay-tab="${escapeHtml(tab.id)}">Paid ${total}</button>
-        <button class="register-secondary register-write-off" type="button" data-write-off-tab="${escapeHtml(tab.id)}">Write off</button>
+        <button class="register-primary register-pay" type="button" data-pay-tab="${escapeHtml(tab.id)}">Paid ${total}</button>${writerField}
+        <button class="register-secondary register-write-off" type="button" data-write-off-tab="${escapeHtml(tab.id)}">${writeOffLabel}</button>
       </div>
     `;
     list.append(card);
@@ -2339,14 +3026,37 @@ async function payRegisterTab(tabId) {
   if (closed) registerCollectors.delete(tabId);
 }
 
-/** 2.8.3: write a tab off, after a confirm. Its drinks stay on record, valued against their buyers. */
+/** What a written-off tab costs its author (0.8.8): the cost of the stock its drinks drew, per drink. */
+function tabWriteOffCostCents(tabId) {
+  return tabItems(tabId).reduce((total, item) => total + RNMBDomain.crewDrinkCostCents(item.lines), 0);
+}
+
+/**
+ * 2.8.3, 0.7.8: write a tab off, after a confirm. Its drinks stay on record, valued
+ * against their buyers, and the crew member who wrote it off covers what they cost.
+ */
 async function writeOffRegisterTab(tabId) {
   const tab = state.guestTabs.find((entry) => entry.id === tabId && entry.status === "open");
   if (!tab) return;
+  // No crew balances means no author column and no balance to charge: the tab is
+  // written off plainly, and nothing claims a charge that is never recorded.
+  const writer = crewBalanceAvailable ? personById(registerWriters.get(tabId)) : null;
+  if (!writer && crewBalanceAvailable) {
+    showToast(`Pick who is writing off ${tab.guestName}'s tab. Whoever writes it off covers what its drinks cost.`);
+    return;
+  }
   const amount = money(RNMBDomain.tabTotalCents(tab.id, state.ringUps) / 100);
-  if (!confirm(`Write off ${tab.guestName}'s tab (${amount})? Nobody collects it, and it cannot be reopened.`)) return;
-  const closed = await hostAction(`${tab.guestName}'s tab written off.`, (db) => db.closeTab({ id: tab.id, status: "written_off" }));
-  if (closed) registerCollectors.delete(tabId);
+  const cost = centsText(tabWriteOffCostCents(tabId));
+  const charge = writer ? ` ${writer.name} is charged ${cost}, what its drinks cost.` : "";
+  if (!confirm(`Write off ${tab.guestName}'s tab (${amount})?${charge} Nobody collects it, and it cannot be reopened.`)) return;
+  const closed = await hostAction(
+    writer ? `${tab.guestName}'s tab written off by ${writer.name}, at ${cost}.` : `${tab.guestName}'s tab written off.`,
+    (db) => db.closeTab({ id: tab.id, status: "written_off", writtenOffBy: writer ? writer.id : undefined })
+  );
+  if (closed) {
+    registerCollectors.delete(tabId);
+    registerWriters.delete(tabId);
+  }
 }
 
 /** 2.8.4: a host night ends only once every tab is closed; the refusal names the guests still open. */
@@ -2366,6 +3076,7 @@ async function endRegisterNight() {
   if (ended) {
     registerDraft = null;
     registerCollectors.clear();
+    registerWriters.clear();
     renderRegister();
   }
 }
@@ -2382,7 +3093,7 @@ async function confirmRegisterRingUp() {
   const { night, menuItem, target } = check;
   const message = target.kind === "guest"
     ? `${menuItem.name} rung up to ${state.guestTabs.find((tab) => tab.id === target.tabId)?.guestName || "the tab"}.`
-    : `${menuItem.name} poured for ${personById(target.personId)?.name || "crew"}. No charge.`;
+    : `${menuItem.name} poured for ${personById(target.personId)?.name || "crew"} · ${centsText(RNMBDomain.crewDrinkCostCents(check.priced.lines))} at cost.`;
   registerPending = true;
   renderRegister();
   let saved = false;
@@ -2429,9 +3140,6 @@ This dashboard is not connected to the shared database. Tabs, drinks and stock c
 
 function renderLedger() {
   const ledger = document.querySelector("#ledgerList");
-  const settle = document.querySelector("#settleList");
-  const spends = spendByPerson();
-  const share = state.people.length ? totalSpend() / state.people.length : 0;
 
   ledger.innerHTML = "";
   ledger.classList.toggle("empty-state", state.bottles.length === 0);
@@ -2453,36 +3161,202 @@ function renderLedger() {
     });
   }
 
-  settle.innerHTML = "";
-  settle.classList.toggle("empty-state", state.people.length === 0 || totalSpend() === 0);
-  if (!state.people.length || totalSpend() === 0) {
-    settle.textContent = "Need people and receipts first.";
+  renderBalances();
+  renderPayments();
+}
+
+const centsText = (cents) => money(cents / 100);
+
+/** A balance in words: who is owed, who owes, who is square, with a friendly nudge (0.9.2). */
+function balanceWords(cents) {
+  if (cents > 0) return { className: "is-owed", status: `is owed ${centsText(cents)}`, amount: `+${centsText(cents)}`, quip: "Their bottles are doing the heavy lifting." };
+  if (cents < 0) return { className: "is-owes", status: `owes ${centsText(-cents)}`, amount: `-${centsText(-cents)}`, quip: "Next Venmo is on them. No rush, no drama." };
+  return { className: "is-square", status: "all square", amount: centsText(0), quip: "Clean slate. Cheers to that." };
+}
+
+/*
+ * Crew Balances (0.5.2, 0.9.2, KTD1, KTD3): each person's running balance and the
+ * fewest payments that settle everyone, both derived from the records on every
+ * render. Before crew-balance.sql the numbers would be wrong (no drink costs), so
+ * the panel shows the notice and no figures at all.
+ */
+function renderBalances() {
+  const notice = document.querySelector("#balanceNotice");
+  const summary = document.querySelector("#balanceSummary");
+  const list = document.querySelector("#balanceList");
+  const suggestions = document.querySelector("#paymentSuggestions");
+  notice.hidden = crewBalanceAvailable;
+  notice.textContent = crewBalanceAvailable ? "" : CREW_BALANCE_SQL_MESSAGE;
+  list.innerHTML = "";
+  suggestions.innerHTML = "";
+  if (!crewBalanceAvailable) {
+    summary.textContent = "";
+    list.innerHTML = `<p class="empty-state">Balances show up here once crew balances are set up.</p>`;
+    suggestions.innerHTML = `<p class="empty-state">No suggestions until then.</p>`;
     return;
   }
-  state.people.forEach((person) => {
-    const delta = (spends.get(person.id) || 0) - share;
-    const item = document.createElement("div");
-    item.className = "stack-item";
-    item.innerHTML = `<strong>${escapeHtml(person.name)}</strong><br><small>${delta >= 0 ? "is owed" : "owes"} ${money(Math.abs(delta))}</small>`;
-    settle.append(item);
+
+  const balances = RNMBDomain.crewBalances(state);
+  if (!balances.length) {
+    summary.textContent = "";
+    list.innerHTML = `<p class="empty-state">Add the crew first, then every drink keeps score here.</p>`;
+    suggestions.innerHTML = `<p class="empty-state">Nothing to settle.</p>`;
+    return;
+  }
+  const owed = balances.filter((entry) => entry.cents > 0).length;
+  const owing = balances.filter((entry) => entry.cents < 0).length;
+  const net = balances.reduce((sum, entry) => sum + entry.cents, 0);
+  // Pours logged before drink costs existed move no money; say so rather than look wrong.
+  const uncosted = state.nights.reduce((count, night) => count + (night.pours || []).filter((pour) => pour.costCents === null).length, 0);
+  summary.textContent = [
+    owed || owing ? `${owed} owed · ${owing} ${owing === 1 ? "owes" : "owe"} · everything nets to ${centsText(net)}.` : "Everyone's square. The ledger has never looked so peaceful.",
+    uncosted ? `${uncosted} older ${uncosted === 1 ? "pour was" : "pours were"} logged before drink costs, so ${uncosted === 1 ? "it counts" : "they count"} as $0.00.` : ""
+  ].filter(Boolean).join(" ");
+
+  balances.forEach((entry) => {
+    const person = entry.personId ? personById(entry.personId) : null;
+    const words = balanceWords(entry.cents);
+    const row = document.createElement("article");
+    row.className = `balance-row ${words.className}`;
+    row.dataset.balancePerson = entry.name;
+    row.innerHTML = `
+      <span class="avatar" style="--person-color: ${safeColor(person?.color)}">${initials(entry.name || "?")}</span>
+      <div class="person-copy">
+        <strong>${escapeHtml(entry.name || "Unknown")}${person ? "" : " <small class=\"balance-gone\">(no longer on the roster)</small>"}</strong>
+        <small data-balance-status>${escapeHtml(words.status)}</small>
+        <small class="balance-quip">${escapeHtml(words.quip)}</small>
+      </div>
+      <strong class="balance-amount" data-balance-amount>${escapeHtml(words.amount)}</strong>
+    `;
+    list.append(row);
   });
 
-  // Without this line the figures above look wrong rather than incomplete: money
-  // on a bottle with no live buyer still inflates everyone's share but credits
-  // no one, so the deltas come to -unassigned instead of zero. Say so on screen.
-  const unassigned = unassignedSpend();
-  if (unassigned > 0) {
-    const note = document.createElement("div");
-    note.className = "stack-item";
-    note.innerHTML = `<strong>Unassigned purchases</strong><br><small>${money(unassigned)} has no buyer on the roster, so nobody is credited for it. Re-add the buyer, or subtract it before settling.</small>`;
-    settle.append(note);
+  const payments = RNMBDomain.suggestPayments(balances);
+  if (!payments.length) {
+    suggestions.innerHTML = `<p class="empty-state">Nothing to settle. Pour one for the ledger.</p>`;
+    return;
   }
+  payments.forEach((payment) => {
+    const payable = Boolean(personById(payment.fromPersonId) && personById(payment.toPersonId));
+    const row = document.createElement("div");
+    row.className = "payment-row";
+    row.dataset.suggestedPayment = "";
+    row.innerHTML = `
+      <span class="payment-copy">
+        <strong data-payment-text>${escapeHtml(`${payment.fromName} pays ${payment.toName} ${centsText(payment.amountCents)}`)}</strong>
+        <small>${payable ? "Send the Venmo, then tap Paid." : "Someone here is no longer on the roster, so this one is settled outside the app."}</small>
+      </span>
+      <button class="payment-button" type="button" data-pay-suggestion data-from="${escapeHtml(payment.fromPersonId || "")}" data-to="${escapeHtml(payment.toPersonId || "")}" data-amount="${payment.amountCents}"${payable && !paymentPending ? "" : " disabled"}>Paid</button>
+    `;
+    suggestions.append(row);
+  });
+}
+
+/** The manual payment form and the recent payments, each with Void (0.5.4, KTD5). */
+function renderPayments() {
+  const form = document.querySelector("#paymentForm");
+  const locked = !crewBalanceAvailable || paymentPending;
+  [["fromPersonId", "Who paid?"], ["toPersonId", "Who got paid?"]].forEach(([name, prompt]) => {
+    const select = form.querySelector(`select[name='${name}']`);
+    const chosen = select.value;
+    select.innerHTML = `<option value="">${prompt}</option>${state.people.map((person) => (
+      `<option value="${escapeHtml(person.id)}">${escapeHtml(person.name)}</option>`
+    )).join("")}`;
+    if (personById(chosen)) select.value = chosen;
+  });
+  form.querySelectorAll("select, input, button").forEach((control) => {
+    control.disabled = locked;
+  });
+
+  const list = document.querySelector("#paymentList");
+  if (!crewBalanceAvailable) {
+    list.innerHTML = `<p class="empty-state">Payments can be recorded once crew balances are set up.</p>`;
+    return;
+  }
+  const recent = [...state.payments]
+    .sort((a, b) => String(b.paidAt || "").localeCompare(String(a.paidAt || "")))
+    .slice(0, 10);
+  if (!recent.length) {
+    list.innerHTML = `<p class="empty-state">No payments yet. The first Venmo is always the hardest.</p>`;
+    return;
+  }
+  list.innerHTML = "";
+  recent.forEach((payment) => {
+    const when = payment.paidAt ? new Date(payment.paidAt) : null;
+    const date = when && !Number.isNaN(when.getTime()) ? when.toLocaleDateString([], { month: "short", day: "numeric" }) : "";
+    const row = document.createElement("div");
+    row.className = `payment-row${payment.voidedAt ? " is-voided" : ""}`;
+    row.dataset.paymentId = payment.id;
+    row.innerHTML = `
+      <span class="payment-copy">
+        <strong data-payment-text>${escapeHtml(`${payment.fromName} paid ${payment.toName} ${centsText(payment.amountCents)}`)}</strong>
+        <small>${escapeHtml(date)}${payment.voidedAt ? " · voided, so it no longer counts" : ""}</small>
+      </span>
+      ${payment.voidedAt
+        ? `<span class="pill">Voided</span>`
+        : `<button class="payment-button is-quiet" type="button" data-void-payment="${escapeHtml(payment.id)}"${paymentPending ? " disabled" : ""}>Void</button>`}
+    `;
+    list.append(row);
+  });
+}
+
+/** Record one payment through the repository, keeping one id per payment draft until it saves. */
+async function savePayment(from, to, amountCents) {
+  const key = `${from.id}|${to.id}|${amountCents}`;
+  const id = draftId(paymentDraftIds, key);
+  paymentPending = true;
+  renderLedger();
+  let saved = false;
+  try {
+    saved = await hostAction(
+      `Payment recorded: ${from.name} paid ${to.name} ${centsText(amountCents)}.`,
+      (db) => db.recordPayment({ id, fromPersonId: from.id, toPersonId: to.id, amountCents })
+    );
+  } finally {
+    paymentPending = false;
+  }
+  if (saved) paymentDraftIds.delete(key);
+  renderLedger();
+  return saved;
+}
+
+/** Paid on a suggested payment (0.9.2): confirm first, then record it. */
+async function recordSuggestedPayment(button) {
+  if (paymentPending) return;
+  if (!crewBalanceAvailable) {
+    showToast(CREW_BALANCE_SQL_MESSAGE);
+    return;
+  }
+  const from = personById(button.dataset.from);
+  const to = personById(button.dataset.to);
+  const amountCents = Number(button.dataset.amount);
+  if (!from || !to || !Number.isInteger(amountCents) || amountCents <= 0) {
+    showToast("Both people need to be on the roster to record this payment.");
+    return;
+  }
+  if (!confirm(`Record that ${from.name} paid ${to.name} ${centsText(amountCents)}? Tap OK once the Venmo has actually gone through.`)) return;
+  await savePayment(from, to, amountCents);
+}
+
+async function voidPayment(paymentId) {
+  if (paymentPending) return;
+  const payment = state.payments.find((entry) => entry.id === paymentId);
+  if (!payment || payment.voidedAt) return;
+  if (!confirm(`Void ${payment.fromName}'s ${centsText(payment.amountCents)} payment to ${payment.toName}? Both balances go back to how they were before it.`)) return;
+  paymentPending = true;
+  renderLedger();
+  try {
+    await hostAction("Payment voided. Both balances are back where they were.", (db) => db.voidPayment(payment.id));
+  } finally {
+    paymentPending = false;
+  }
+  renderLedger();
 }
 
 /*
  * Host nights in Ledger (2.8.5, 2.8.6, 0.5.1): per host night, running or ended,
  * who holds the money guests paid and whose stock it belongs to (margin included),
- * and the value written off per buyer. Separate from Settle Up, which it never touches.
+ * and the value written off per buyer. The same tabs feed Crew Balances (0.8.7, 0.8.8).
  */
 function renderHostNights() {
   const target = document.querySelector("#hostNightList");
@@ -2731,6 +3605,7 @@ document.querySelector("#nightForm").addEventListener("submit", async (event) =>
 
 document.querySelector("#nightSelect").addEventListener("change", async (event) => {
   state.activeNightId = event.target.value;
+  quickLogNightId = null;
   await saveState("Active night switched.", (db) => db.updateSettings(state, ["active_night_id"]));
 });
 
@@ -2742,37 +3617,17 @@ document.querySelector("#pourForm").addEventListener("submit", async (event) => 
     return;
   }
   const data = new FormData(event.currentTarget);
-  const bottle = bottleById(data.get("bottleId"));
-  const type = typeById(bottle?.typeId);
-  // In the type's measure: ounces, or a count for counted stock (KTD5). The
-  // field keeps its old name, and so does the pour's `ounces` property.
-  const ounces = Number(data.get("ounces"));
-  if (!bottle || !type || !(ounces > 0)) {
-    showToast("Pick a stocked bottle and a valid pour.");
+  let pour;
+  try {
+    // In the type's measure: ounces, or a count for counted stock (KTD5). The
+    // field keeps its old name, and so does the pour's `ounces` property.
+    pour = preparePour(night, { personId: data.get("personId"), bottleId: data.get("bottleId"), ounces: Number(data.get("ounces")) });
+  } catch (error) {
+    showToast(error.userMessage || "Pick a stocked bottle and a valid pour.");
     return;
   }
-  if (!(Number(type.abv) > 0)) {
-    showToast(`${type.name} has no alcohol, so it is not logged as a pour.`);
-    return;
-  }
-  if (isCounted(type) && !Number.isInteger(ounces)) {
-    showToast(`${type.name} is counted stock, so log a whole number of units.`);
-    return;
-  }
-  if (ounces > Number(bottle.remaining)) {
-    showToast("That pour exceeds the bottle inventory.");
-    return;
-  }
-
-  bottle.remaining = Math.max(0, Number(bottle.remaining) - ounces);
-  const pour = {
-    id: uid(),
-    personId: data.get("personId"),
-    bottleId: bottle.id,
-    ounces,
-    abv: type.abv,
-    timestamp: new Date().toISOString()
-  };
+  const bottle = bottleById(pour.bottleId);
+  bottle.remaining = Math.max(0, Number(bottle.remaining) - pour.ounces);
   night.pours.push(pour);
 
   const personTotal = activeNightTotals().byPerson.get(data.get("personId"))?.drinks || 0;
@@ -2798,9 +3653,11 @@ document.body.addEventListener("click", async (event) => {
   }
 
   // KTD6: money history is never destroyed, so a stock item that drinks were
-  // sold from stays. Checked here for both repositories, before anything changes.
-  if (bottleId && bottleHasSales(bottleId)) {
-    showToast(SOLD_BOTTLE_MESSAGE);
+  // sold from — or that crew pours were charged against — stays. Checked here
+  // for both repositories, before anything changes.
+  const bottleRefusal = bottleId ? bottleDeleteRefusal(bottleId) : null;
+  if (bottleRefusal) {
+    showToast(bottleRefusal);
   } else if (bottleId && confirm("Remove this bottle and its receipt from the dashboard?")) {
     state.bottles = state.bottles.filter((bottle) => bottle.id !== bottleId);
     state.stockAdjustments = state.stockAdjustments.filter((adjustment) => adjustment.bottleId !== bottleId);
@@ -2810,17 +3667,41 @@ document.body.addEventListener("click", async (event) => {
     await saveState("Bottle removed.", (db) => db.removeBottle(bottleId));
   }
 
-  if (personId && confirm("Remove this person and related pours? Receipts remain unassigned.")) {
+  // KTD9 (0.5.7): nobody leaves the roster with money still riding on them.
+  const unsettled = personId && crewBalanceAvailable
+    ? RNMBDomain.crewBalances(state).find((entry) => entry.personId === personId && entry.cents !== 0)
+    : null;
+  // Removing someone also deletes the pours they drank, which can move other people's
+  // balances even when theirs reads $0.00; that is refused the same way.
+  const shifted = personId && crewBalanceAvailable && !unsettled ? RNMBDomain.balanceChangesOnRemoval(state, personId) : [];
+  if (unsettled) {
+    const words = balanceWords(unsettled.cents);
+    showToast(`${unsettled.name} ${words.status}, so they stay on the roster for now. Settle up in the Ledger until they read $0.00, then remove them.`);
+  } else if (shifted.length) {
+    const name = personById(personId)?.name || "This person";
+    showToast(`${name} drank from other people's bottles, and removing ${name} would erase those drinks and change ${shifted.map((entry) => entry.name).join(", ")}'s balance. ${name} stays on the roster.`);
+  } else if (personId && confirm("Remove this person and related pours? Receipts remain unassigned.")) {
     state.people = state.people.filter((person) => person.id !== personId);
     state.bottles.forEach((bottle) => {
       if (bottle.buyerId === personId) bottle.buyerId = "";
     });
     state.nights.forEach((night) => {
-      night.pours = night.pours.filter((pour) => pour.personId !== personId);
+      night.pours = night.pours
+        .filter((pour) => pour.personId !== personId)
+        .map((pour) => (pour.buyerId === personId ? { ...pour, buyerId: null } : pour));
     });
     // As the database does (on delete set null): the reference goes, the name
-    // snapshot stays on every tab, ring-up and line.
-    state.guestTabs = state.guestTabs.map((tab) => (tab.collectorId === personId ? { ...tab, collectorId: null } : tab));
+    // snapshot stays on every pour, tab, ring-up, line and payment.
+    state.guestTabs = state.guestTabs.map((tab) => ({
+      ...tab,
+      collectorId: tab.collectorId === personId ? null : tab.collectorId,
+      writtenOffBy: tab.writtenOffBy === personId ? null : tab.writtenOffBy
+    }));
+    state.payments = state.payments.map((payment) => ({
+      ...payment,
+      fromPersonId: payment.fromPersonId === personId ? null : payment.fromPersonId,
+      toPersonId: payment.toPersonId === personId ? null : payment.toPersonId
+    }));
     state.ringUps = state.ringUps.map((ringUp) => ({
       ...ringUp,
       personId: ringUp.personId === personId ? null : ringUp.personId,
@@ -2953,6 +3834,78 @@ document.querySelector("#menuList").addEventListener("click", async (event) => {
 resetMenuItemForm();
 
 // ---- Bar register ----
+// ---- Tonight: quick log (0.4.2) ----
+document.querySelector("#quickLogPeople").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-quick-person]");
+  if (!button || button.disabled) return;
+  // Tapping the chosen person again clears the choice, so the panel never logs to the wrong one.
+  quickLogPersonId = quickLogPersonId === button.dataset.quickPerson ? null : button.dataset.quickPerson;
+  // Choosing a person here is a fresh start, so any night the recap pinned is let go.
+  quickLogNightId = null;
+  renderQuickLog();
+});
+
+document.querySelector("#quickLogItems").addEventListener("click", async (event) => {
+  const button = event.target.closest("button");
+  if (!button || button.disabled || quickLogPending) return;
+  // Read the night once, here, so a refresh mid-tap cannot move the drink to another night.
+  const night = quickLogNight();
+  if (button.dataset.quickBottle) await quickLogBottle(button.dataset.quickBottle, night);
+  else if (button.dataset.quickMenu) await quickLogMenuItem(button.dataset.quickMenu, night);
+});
+
+// ---- Tonight: end of night and recap (0.4.3) ----
+document.querySelector("#nightRecapPanel").addEventListener("click", async (event) => {
+  const control = event.target.closest("button");
+  if (!control || control.disabled || recapPending) return;
+  if (control.id === "endCrewNight") {
+    await endCrewNight();
+    return;
+  }
+  if (control.dataset.recapAdd) {
+    addMissedDrink(control.dataset.recapAdd);
+    return;
+  }
+  if (control.dataset.recapVoid) await voidRecapDrink(control.dataset.recapVoid, control.dataset.recapKind);
+});
+
+// ---- Ledger: settle up (0.5.4, 0.9.2) ----
+document.querySelector("#ledger").addEventListener("click", async (event) => {
+  const control = event.target.closest("button");
+  if (!control || control.disabled) return;
+  if (control.hasAttribute("data-pay-suggestion")) {
+    await recordSuggestedPayment(control);
+    return;
+  }
+  if (control.dataset.voidPayment) await voidPayment(control.dataset.voidPayment);
+});
+
+document.querySelector("#paymentForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (paymentPending) return;
+  if (!crewBalanceAvailable) {
+    showToast(CREW_BALANCE_SQL_MESSAGE);
+    return;
+  }
+  const form = event.currentTarget;
+  const from = personById(form.fromPersonId.value);
+  const to = personById(form.toPersonId.value);
+  const amountCents = RNMBDomain.dollarsToCents(form.amount.value);
+  if (!from || !to) {
+    showToast("Pick who paid and who got paid.");
+    return;
+  }
+  if (from.id === to.id) {
+    showToast("A payment goes between two different crew members.");
+    return;
+  }
+  if (amountCents === null || amountCents <= 0) {
+    showToast("Enter the amount in dollars, like 3.20.");
+    return;
+  }
+  if (await savePayment(from, to, amountCents)) form.amount.value = "";
+});
+
 window.addEventListener("hashchange", () => {
   // Leaving the register drops an unfinished order, so the dashboard's refresh is not held off by it.
   if (!isRegisterRoute() && !registerPending) registerDraft = null;
@@ -3059,6 +4012,12 @@ document.querySelector("#register").addEventListener("change", (event) => {
     else registerCollectors.delete(event.target.dataset.collectorFor);
     return;
   }
+  if (event.target.matches("select[data-writer-for]")) {
+    // Likewise: remembered until Write off is confirmed (0.7.8).
+    if (event.target.value) registerWriters.set(event.target.dataset.writerFor, event.target.value);
+    else registerWriters.delete(event.target.dataset.writerFor);
+    return;
+  }
   if (registerPending || !event.target.matches("select[name='sourceBottle']")) return;
   const item = registerMenuItem();
   const index = Number(event.target.dataset.ingredient);
@@ -3122,6 +4081,29 @@ function bottleHasSales(bottleId) {
   return state.ringUps.some((ringUp) => ringUp.lines.some((line) => line.bottleId === bottleId));
 }
 
+/**
+ * Crew pours drawn from this stock item that carry a cost. Deleting the item
+ * deletes them (rnmb_pours.bottle_id cascades in the shared database, and the
+ * local handler filters them out), which would take the drinker's debit and the
+ * buyer's credit with it — a silent shift in somebody else's balance.
+ */
+function bottleHasCostedPours(bottleId) {
+  return state.nights.some((night) => (night.pours || []).some((pour) => (
+    pour.bottleId === bottleId && pour.costCents !== null && pour.costCents !== undefined
+  )));
+}
+
+/**
+ * KTD6: why a stock item can no longer be deleted, or null when it can be.
+ * Money history is never destroyed — a sold drink or a charged crew pour keeps
+ * the item, which is emptied instead.
+ */
+function bottleDeleteRefusal(bottleId) {
+  if (bottleHasSales(bottleId)) return SOLD_BOTTLE_MESSAGE;
+  if (bottleHasCostedPours(bottleId)) return POURED_BOTTLE_MESSAGE;
+  return null;
+}
+
 /** The export archive: the whole state, every host-mode collection included. */
 function archiveData() {
   return JSON.parse(JSON.stringify(state));
@@ -3171,7 +4153,7 @@ document.querySelector("#importData").addEventListener("change", async (event) =
     }
     // Host-mode collections are optional (older archives have none), but when
     // present they must be lists, and every ring-up must carry its lines.
-    const hostCollections = ["menuItems", "guestTabs", "ringUps", "stockAdjustments"];
+    const hostCollections = ["menuItems", "guestTabs", "ringUps", "stockAdjustments", "payments"];
     if (hostCollections.some((key) => imported[key] !== undefined && !Array.isArray(imported[key]))) {
       throw new Error("Invalid archive");
     }
@@ -3216,6 +4198,9 @@ window.__rnmb = Object.freeze({
   get repository() { return repository; },
   get syncMode() { return syncMode; },
   get hostModeAvailable() { return hostModeAvailable; },
+  get crewBalanceAvailable() { return crewBalanceAvailable; },
+  crewBalances: () => RNMBDomain.crewBalances(state),
+  preparePour,
   get registerDraft() { return registerDraft; },
   archiveData,
   buildRingUp,
