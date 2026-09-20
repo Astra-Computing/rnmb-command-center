@@ -1101,6 +1101,38 @@ body.is-register .app-shell {
   color: var(--text);
 }
 
+/* Crew drinks on a host night: the same indented list as the buyers, with room
+   for the Void button. It wraps to its own line on a phone rather than squeezing
+   the drink's name. */
+.host-night-crew-drinks {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0 0 0 12px;
+  border-left: 2px solid var(--line);
+  list-style: none;
+}
+
+.host-night-crew-drinks li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.host-night-crew-drinks li > span:first-child {
+  flex: 1 1 60%;
+}
+
+.host-night-crew-drinks li > span + span {
+  color: var(--muted);
+}
+
+.host-night-crew-drinks button {
+  flex: 0 0 auto;
+}
+
 .progress {
   overflow: hidden;
   height: 12px;

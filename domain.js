@@ -101,6 +101,9 @@
  *               crew pours and unvoided crew ring-ups grouped by drinker, oldest first, each drink
  *               { kind: "pour"|"ringUp", id, bottleId, typeId, menuItemId, name, amount, ounces, standardDrinks,
  *               costCents (null = charges nobody), at }; roster order first, then anyone removed since
+ *   crewDrinksOnNight(state, nightId) -> [{ kind, id, name, personId, personName, costCents, ... }]: the same
+ *               drinks nightRecap groups, flattened and newest first, each carrying the drinker. A host night
+ *               holds these alongside its guest tabs, and they stay correctable after it ends
  *   recentLogItems(state, personId, limit = 8) -> [{ kind: "bottle"|"menu", id }]: the distinct stock items a
  *               person poured and menu items they had as unvoided crew ring-ups, newest first
  *   normalizeNight / normalizeMenuItem / normalizeTab / normalizeRingUp / normalizeAdjustment /
@@ -1228,6 +1231,34 @@ var RNMBDomain = (function () {
    * unvoided crew ring-ups. Items no longer in state are skipped, and a repeat keeps
    * only its newest place. Ties in time keep the later record first.
    */
+  /**
+   * Every crew drink charged on one night, flattened out of nightRecap and newest
+   * first, each carrying who drank it. nightRecap already decides what counts as a
+   * crew drink and what it charges, so this stays the same answer in a flat shape.
+   *
+   * A host night can hold these as well as its guest tabs: a crew pour or a crew
+   * ring-up made while the bar was open. They charge a crew member at cost and sit
+   * on no tab, which is why they stay correctable after the night ends, and why the
+   * Ledger lists them per host night.
+   */
+  function crewDrinksOnNight(state, nightId) {
+    var drinks = [];
+    nightRecap(state, nightId).forEach(function (entry) {
+      listOf(entry.drinks).forEach(function (drink) {
+        drinks.push(Object.assign({}, drink, { personId: entry.personId, personName: entry.name }));
+      });
+    });
+    // nightRecap sorts each person's drinks oldest first; newest first reads better
+    // as a list of "what just went wrong". Ties keep a stable order by id.
+    drinks.sort(function (a, b) {
+      var timeA = timeOf(a.at);
+      var timeB = timeOf(b.at);
+      if (timeA !== timeB) return timeB - timeA;
+      return String(a.id) < String(b.id) ? -1 : String(a.id) > String(b.id) ? 1 : 0;
+    });
+    return drinks;
+  }
+
   function recentLogItems(state, personId, limit) {
     var source = state || {};
     var max = limit === undefined ? 8 : limit;
@@ -1596,6 +1627,7 @@ var RNMBDomain = (function () {
     quickLogAmount: quickLogAmount,
     recentLogItems: recentLogItems,
     nightRecap: nightRecap,
+    crewDrinksOnNight: crewDrinksOnNight,
     normalizeNight: normalizeNight,
     normalizePour: normalizePour,
     normalizeMenuItem: normalizeMenuItem,
