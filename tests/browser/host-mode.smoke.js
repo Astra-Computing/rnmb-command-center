@@ -90,6 +90,7 @@ async function startLocalHostNightWithTab(page) {
 }
 
 const SOLD_BOTTLE_MESSAGE = "Drinks have been sold from this stock item, so it cannot be deleted. Set its remaining level to empty instead.";
+const POURED_BOTTLE_MESSAGE = "Crew drinks have been poured from this stock item and charged against it, so it cannot be deleted. Set its remaining level to empty instead.";
 
 /** Click, then wait for a toast shown after the click (a repeated message cannot match an earlier one). */
 async function clickForToast(session, selector, text) {
@@ -3586,6 +3587,140 @@ const scenarios = [
         } finally {
           await session.close();
         }
+      }
+    }
+  },
+
+  {
+    name: "Crew review #1 a stock item a crew pour was charged against cannot be deleted; an untouched one still can",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const pouchId = await bottleIdOf(page, "Diplomatic Pouch");
+        const coolerId = await bottleIdOf(page, "Cooler Battalion");
+        await logPourViaForm(session, { personName: "Casey", bottleId: pouchId, amount: 5 });
+        const before = await balanceCents(page);
+        assert.ok(before.Casey < 0 && before.Sam > 0, "the pour charges Casey and credits Sam, who bought the wine");
+
+        await page.click('.tab-button[data-tab="inventory"]');
+        await clickForToast(session, `#inventoryList [data-bottle-id="${pouchId}"] [data-remove-bottle]`, POURED_BOTTLE_MESSAGE);
+        const after = await page.evaluate((id) => ({
+          kept: window.__rnmb.state.bottles.some((bottle) => bottle.id === id),
+          pours: window.__rnmb.state.nights.flatMap((night) => night.pours).filter((pour) => pour.bottleId === id).length
+        }), pouchId);
+        assert.deepEqual(after, { kept: true, pours: 1 }, "the stock item and the pour it was charged for both stay");
+        assert.deepEqual(await balanceCents(page), before, "nobody's balance moved");
+
+        // A stock item nothing has been drawn from is still deleted, as before.
+        const count = await page.evaluate(() => window.__rnmb.state.bottles.length);
+        await clickForToast(session, `#inventoryList [data-bottle-id="${coolerId}"] [data-remove-bottle]`, "Bottle removed.");
+        assert.equal(await page.evaluate(() => window.__rnmb.state.bottles.length), count - 1);
+        assert.equal(await page.locator(`#inventoryList [data-bottle-id="${coolerId}"]`).count(), 0);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Crew review #4 without crew-balance.sql the register write-off asks for no author and claims no charge",
+    async run({ browser }) {
+      const { seed } = hostModeSeed();
+      const stub = hostModeStub(seed, { crewBalance: false });
+      stub.rpc.rnmb_open_tab = (payload) => {
+        stub.store.rnmb_guest_tabs.push({ id: payload.id, night_id: payload.night_id, guest_name: payload.guest_name, status: "open", opened_at: payload.opened_at });
+        return payload.id;
+      };
+      stub.rpc.rnmb_close_tab = (payload) => {
+        Object.assign(stub.store.rnmb_guest_tabs.find((tab) => tab.id === payload.id), { status: payload.status, closed_at: new Date().toISOString() });
+        return payload.id;
+      };
+      const payments404 = (message) => resourceStatusError(message, 404, (url) => url.includes("/rest/v1/rnmb_payments?"));
+      const session = await openPage(browser, { routes: stub.routes, allowConsole: payments404 });
+      const { page } = session;
+      try {
+        await session.waitForToast("Connected to Supabase.");
+        assert.equal(await page.evaluate(() => window.__rnmb.crewBalanceAvailable), false);
+        await startHostNightViaForm(session, "Pre-migration night");
+        await openRegister(session);
+        await openTabViaRegister(session, "Riley");
+
+        const card = tabCard(page, "Riley");
+        assert.equal(await card.locator("select[name='writtenOffBy']").count(), 0, "no author picker without crew balances");
+        assert.equal(squash(await card.locator("[data-write-off-tab]").textContent()), "Write off", "and no cost on the button");
+        assert.equal(await card.locator("select[name='collectorId']").count(), 1, "the collector picker is untouched");
+
+        const tabId = await card.getAttribute("data-tab-id");
+        let dialogMessage = "";
+        page.once("dialog", (dialog) => { dialogMessage = dialog.message(); });
+        await clickForToast(session, `#registerTabList [data-write-off-tab="${tabId}"]`, "Riley's tab written off.");
+        assert.equal(dialogMessage, "Write off Riley's tab ($0.00)? Nobody collects it, and it cannot be reopened.");
+        assert.ok(!/charged/.test(dialogMessage), "the confirm claims no charge");
+
+        const closeCall = stub.log.find((entry) => entry.path === "rpc/rnmb_close_tab");
+        assert.deepEqual(Object.keys(closeCall.body.payload).sort(), ["id", "status"], "no author is sent");
+        assert.deepEqual(await page.evaluate(() => {
+          const tab = window.__rnmb.state.guestTabs.find((entry) => entry.guestName === "Riley");
+          return [tab.status, tab.writtenOffBy, tab.writtenOffByName];
+        }), ["written_off", null, null]);
+        assert.deepEqual(stub.unexpected, []);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Crew review #5 an ended host night keeps its guest items locked but its crew drinks correctable",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const { night } = await startHostNightViaForm(session, "Locked night");
+        await openRegister(session);
+        await openTabViaRegister(session, "Riley");
+        await ringUpToTab(session, "Bourbon Neat", "Riley");
+        const bourbon = await bottleIdOf(page, "The Briefing Bottle");
+
+        await registerItem(page, "Bourbon Neat").click();
+        await registerCrew(page, "Casey").click();
+        await clickForToast(session, "#registerConfirm", "Bourbon Neat poured for Casey · $2.76 at cost.");
+        const charged = await balanceCents(page);
+        assert.equal(charged.Casey, -276, "the crew drink debits Casey at cost");
+
+        await payTabViaRegister(session, "Riley", "Jordan");
+        await clickForToast(session, "#registerEndNight", "Locked night ended. Its summary is under Host nights in Ledger.");
+        assert.ok(await page.evaluate((id) => window.__rnmb.state.nights.find((entry) => entry.id === id).endedAt, night.id));
+
+        const stockBefore = await stockOf(page, bourbon);
+        const outcome = await page.evaluate(async () => {
+          const r = window.__rnmb;
+          const crew = r.state.ringUps.find((entry) => entry.kind === "crew");
+          const guest = r.state.ringUps.find((entry) => entry.kind === "guest");
+          const guestVoid = await r.hostAction("Guest item voided.", (db) => db.voidRingUp(guest.id));
+          const crewVoid = await r.hostAction("Crew drink voided.", (db) => db.voidRingUp(crew.id));
+          return {
+            guestVoid,
+            crewVoid,
+            guestVoided: Boolean(r.state.ringUps.find((entry) => entry.id === guest.id).voidedAt),
+            crewVoided: Boolean(r.state.ringUps.find((entry) => entry.id === crew.id).voidedAt)
+          };
+        });
+        assert.equal(outcome.guestVoid, false, "a guest item on an ended host night stays frozen");
+        assert.equal(outcome.guestVoided, false);
+        assert.equal(outcome.crewVoid, true, "a crew drink charged at cost stays correctable");
+        assert.equal(outcome.crewVoided, true);
+        assert.equal(await stockOf(page, bourbon), Math.round((stockBefore + 2) * 100) / 100, "the crew drink's stock comes back");
+        assert.equal((await balanceCents(page)).Casey, 0, "and so does Casey's balance");
+
+        const toasts = await session.toasts();
+        assert.ok(toasts.includes("This host night has ended, so its items can no longer be voided."), "the guest refusal is still shown");
+        session.assertClean();
+      } finally {
+        await session.close();
       }
     }
   }

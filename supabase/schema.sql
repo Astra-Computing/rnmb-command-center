@@ -620,8 +620,12 @@ begin
     raise exception 'RNMB: that item was already voided.';
   end if;
 
+  -- An ended host night freezes the guest tabs that were counted against the
+  -- cash. A crew drink is on no tab and is charged at cost, so it stays
+  -- correctable like a crew night's, or a drink rung up to the wrong person
+  -- would be a permanent debit with nowhere to undo it.
   select * into v_night from public.rnmb_nights where id = v_ring_up.night_id for share;
-  if v_night.kind = 'host' and v_night.ended_at is not null then
+  if v_night.kind = 'host' and v_night.ended_at is not null and v_ring_up.kind = 'guest' then
     raise exception 'RNMB: this host night has ended, so its items can no longer be voided.';
   end if;
 
@@ -1194,6 +1198,51 @@ begin
 end;
 $$;
 
+-- Remove a crew member from the roster, but only while nothing the delete
+-- destroys was carrying money. Of the nine columns that name a person, exactly
+-- one cascades: rnmb_pours.person_id, the drinker. Deleting the person deletes
+-- those pours, and a cost-stamped pour is a debit against the drinker and a
+-- credit to whoever bought the bottle, so that credit would vanish with it.
+-- Every other reference is `on delete set null` beside a name snapshot, so the
+-- payment, tab, ring-up, line or bottle survives and its money stays under the
+-- name. Requirement 0.5.7 is enforced here, where the rows are, with the person
+-- locked first, because a browser can be working from a copy of the balances
+-- that is minutes old; the dashboard keeps its own finer check ("their own
+-- balance is not $0.00 yet") as the friendly first message.
+-- payload: id
+create or replace function public.rnmb_remove_person(payload jsonb)
+returns uuid
+language plpgsql
+set search_path = public
+as $$
+declare
+  v_id uuid;
+  v_name text;
+begin
+  if not public.rnmb_authorized() then
+    raise exception 'RNMB: the passphrase is missing or wrong, so nothing was saved.'
+      using errcode = '42501';
+  end if;
+
+  v_id := nullif(payload ->> 'id', '')::uuid;
+  select name into v_name from public.rnmb_people where id = v_id for update;
+  if not found then
+    raise exception 'RNMB: that crew member does not exist.';
+  end if;
+
+  if exists (
+    select 1 from public.rnmb_pours
+     where person_id = v_id and cost_cents is not null
+  ) then
+    raise exception 'RNMB: % drank drinks that cost money, and removing them would erase those drinks and change somebody else''s balance, so they stay on the roster.', v_name;
+  end if;
+
+  delete from public.rnmb_people where id = v_id;
+
+  return v_id;
+end;
+$$;
+
 -- Same grants as rnmb_authorized(): nobody by default, then the two roles the
 -- publishable key can act as.
 revoke all on function public.rnmb_ring_up(jsonb) from public;
@@ -1208,6 +1257,7 @@ revoke all on function public.rnmb_add_crew_pour(jsonb) from public;
 revoke all on function public.rnmb_remove_crew_pour(jsonb) from public;
 revoke all on function public.rnmb_record_payment(jsonb) from public;
 revoke all on function public.rnmb_void_payment(jsonb) from public;
+revoke all on function public.rnmb_remove_person(jsonb) from public;
 
 grant execute on function public.rnmb_ring_up(jsonb) to anon, authenticated;
 grant execute on function public.rnmb_void_ring_up(jsonb) to anon, authenticated;
@@ -1221,6 +1271,7 @@ grant execute on function public.rnmb_add_crew_pour(jsonb) to anon, authenticate
 grant execute on function public.rnmb_remove_crew_pour(jsonb) to anon, authenticated;
 grant execute on function public.rnmb_record_payment(jsonb) to anon, authenticated;
 grant execute on function public.rnmb_void_payment(jsonb) to anon, authenticated;
+grant execute on function public.rnmb_remove_person(jsonb) to anon, authenticated;
 
 -- Set a real passphrase before anyone uses the dashboard.
 insert into public.rnmb_access (id, passphrase)

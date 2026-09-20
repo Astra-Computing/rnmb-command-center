@@ -76,6 +76,7 @@ let hostModeAvailable = true;
 const HOST_MODE_SQL_MESSAGE = "Host mode is not set up on the shared database yet. Run supabase/host-mode.sql in Supabase, then reload.";
 const NOT_SAVING_MESSAGE = "This host night belongs to the shared database, and this browser is not connected to it, so nothing was saved. Reload the page to reconnect, then try again.";
 const SOLD_BOTTLE_MESSAGE = "Drinks have been sold from this stock item, so it cannot be deleted. Set its remaining level to empty instead.";
+const POURED_BOTTLE_MESSAGE = "Crew drinks have been poured from this stock item and charged against it, so it cannot be deleted. Set its remaining level to empty instead.";
 // Crew balances (crew-balance KTD6): false when the shared database has not run
 // supabase/crew-balance.sql -- rnmb_payments answers 404, or rnmb_pours has no
 // cost columns (and always when host mode itself is missing). Local mode always
@@ -292,9 +293,13 @@ const hostRules = {
     if (!ringUp) throw refusal("That ring-up does not exist.");
     if (ringUp.voidedAt) throw refusal("That item was already voided.");
     const night = state.nights.find((entry) => entry.id === ringUp.nightId);
-    // A crew night's items stay voidable after it ends (KTD7); host nights keep their locks.
+    // A crew night's items stay voidable after it ends (KTD7); host nights keep
+    // their locks, but only over guest items. An ended host night freezes the
+    // tab totals that were counted against the cash; a crew drink touches no tab
+    // and is charged at cost, so leaving it locked would make a wrong person's
+    // debit permanent with nowhere to correct it.
     if (night?.kind !== "crew") {
-      if (night?.endedAt) throw refusal("This host night has ended, so its items can no longer be voided.");
+      if (night?.endedAt && ringUp.kind === "guest") throw refusal("This host night has ended, so its items can no longer be voided.");
       if (local && night?.startedLocally !== true) throw refusal(NOT_SAVING_MESSAGE);
     }
     if (ringUp.kind === "guest") {
@@ -1168,7 +1173,10 @@ function createSupabaseRepository(config) {
       await patchWhere("rnmb_bottles", `id=eq.${pour.bottleId}`, { remaining_oz: restoredRemaining });
     },
     async removeBottle(bottleId) {
-      if (bottleHasSales(bottleId)) throw refusal(SOLD_BOTTLE_MESSAGE);
+      // rnmb_ring_up_lines.bottle_id restricts, but rnmb_pours.bottle_id
+      // cascades, so a charged crew pour has to be refused before the request.
+      const refused = bottleDeleteRefusal(bottleId);
+      if (refused) throw refusal(refused);
       try {
         await deleteWhere("rnmb_bottles", `id=eq.${bottleId}`);
       } catch (error) {
@@ -1178,6 +1186,16 @@ function createSupabaseRepository(config) {
       }
     },
     async removePerson(personId) {
+      // KTD9 (0.5.7): the browser's copy of the balances can be minutes old, so
+      // the rule that keeps money from being orphaned runs where the rows are.
+      // rnmb_remove_person locks the person and refuses while a cost-stamped
+      // pour still names them as the drinker, because that is the one reference
+      // the delete destroys rather than setting null. Before crew-balance.sql
+      // there is no such function, and no pour cost to protect.
+      if (crewBalanceAvailable) {
+        await rpc("rnmb_remove_person", { id: personId });
+        return;
+      }
       await deleteWhere("rnmb_people", `id=eq.${personId}`);
     },
 
@@ -2936,7 +2954,18 @@ function renderRegisterTabList(night) {
     )).join("");
     const collectors = peopleOptions(chosen);
     const writers = peopleOptions(writer);
+    // Before crew-balance.sql the database has nowhere to keep the author and no
+    // balance for the charge to land on, so neither is offered or claimed.
     const writeOffCost = centsText(tabWriteOffCostCents(tab.id));
+    const writerField = crewBalanceAvailable ? `
+        <label>
+          <span class="field-label">Written off by</span>
+          <select name="writtenOffBy" data-writer-for="${escapeHtml(tab.id)}">
+            <option value=""${writer ? "" : " selected"}>Pick a crew member</option>
+            ${writers}
+          </select>
+        </label>` : "";
+    const writeOffLabel = crewBalanceAvailable ? `Write off ${writeOffCost}` : "Write off";
     card.innerHTML = `
       <header>
         <strong>${escapeHtml(tab.guestName)}</strong>
@@ -2951,15 +2980,8 @@ function renderRegisterTabList(night) {
             ${collectors}
           </select>
         </label>
-        <button class="register-primary register-pay" type="button" data-pay-tab="${escapeHtml(tab.id)}">Paid ${total}</button>
-        <label>
-          <span class="field-label">Written off by</span>
-          <select name="writtenOffBy" data-writer-for="${escapeHtml(tab.id)}">
-            <option value=""${writer ? "" : " selected"}>Pick a crew member</option>
-            ${writers}
-          </select>
-        </label>
-        <button class="register-secondary register-write-off" type="button" data-write-off-tab="${escapeHtml(tab.id)}">Write off ${writeOffCost}</button>
+        <button class="register-primary register-pay" type="button" data-pay-tab="${escapeHtml(tab.id)}">Paid ${total}</button>${writerField}
+        <button class="register-secondary register-write-off" type="button" data-write-off-tab="${escapeHtml(tab.id)}">${writeOffLabel}</button>
       </div>
     `;
     list.append(card);
@@ -3016,7 +3038,9 @@ function tabWriteOffCostCents(tabId) {
 async function writeOffRegisterTab(tabId) {
   const tab = state.guestTabs.find((entry) => entry.id === tabId && entry.status === "open");
   if (!tab) return;
-  const writer = personById(registerWriters.get(tabId));
+  // No crew balances means no author column and no balance to charge: the tab is
+  // written off plainly, and nothing claims a charge that is never recorded.
+  const writer = crewBalanceAvailable ? personById(registerWriters.get(tabId)) : null;
   if (!writer && crewBalanceAvailable) {
     showToast(`Pick who is writing off ${tab.guestName}'s tab. Whoever writes it off covers what its drinks cost.`);
     return;
@@ -3629,9 +3653,11 @@ document.body.addEventListener("click", async (event) => {
   }
 
   // KTD6: money history is never destroyed, so a stock item that drinks were
-  // sold from stays. Checked here for both repositories, before anything changes.
-  if (bottleId && bottleHasSales(bottleId)) {
-    showToast(SOLD_BOTTLE_MESSAGE);
+  // sold from — or that crew pours were charged against — stays. Checked here
+  // for both repositories, before anything changes.
+  const bottleRefusal = bottleId ? bottleDeleteRefusal(bottleId) : null;
+  if (bottleRefusal) {
+    showToast(bottleRefusal);
   } else if (bottleId && confirm("Remove this bottle and its receipt from the dashboard?")) {
     state.bottles = state.bottles.filter((bottle) => bottle.id !== bottleId);
     state.stockAdjustments = state.stockAdjustments.filter((adjustment) => adjustment.bottleId !== bottleId);
@@ -4053,6 +4079,29 @@ document.querySelector("#registerTabForm").addEventListener("submit", async (eve
 
 function bottleHasSales(bottleId) {
   return state.ringUps.some((ringUp) => ringUp.lines.some((line) => line.bottleId === bottleId));
+}
+
+/**
+ * Crew pours drawn from this stock item that carry a cost. Deleting the item
+ * deletes them (rnmb_pours.bottle_id cascades in the shared database, and the
+ * local handler filters them out), which would take the drinker's debit and the
+ * buyer's credit with it — a silent shift in somebody else's balance.
+ */
+function bottleHasCostedPours(bottleId) {
+  return state.nights.some((night) => (night.pours || []).some((pour) => (
+    pour.bottleId === bottleId && pour.costCents !== null && pour.costCents !== undefined
+  )));
+}
+
+/**
+ * KTD6: why a stock item can no longer be deleted, or null when it can be.
+ * Money history is never destroyed — a sold drink or a charged crew pour keeps
+ * the item, which is emptied instead.
+ */
+function bottleDeleteRefusal(bottleId) {
+  if (bottleHasSales(bottleId)) return SOLD_BOTTLE_MESSAGE;
+  if (bottleHasCostedPours(bottleId)) return POURED_BOTTLE_MESSAGE;
+  return null;
 }
 
 /** The export archive: the whole state, every host-mode collection included. */

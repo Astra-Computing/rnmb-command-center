@@ -5,9 +5,10 @@
 -- line rolls every change back, including the test people, stock, nights,
 -- tabs and payments it makes.
 --
--- What you should see: one row, `checks_passed` with a number and a `result`
--- saying every check passed. If a rule is broken, the editor instead shows an
--- error starting with "CHECK FAILED" that names the check and what happened.
+-- What you should see: one row, `checks_passed` reading 11 and a `result`
+-- saying every check passed. A lower number means a section was removed, not
+-- that a rule is broken; if a rule is broken, the editor instead shows an error
+-- starting with "CHECK FAILED" that names the check and what happened.
 --
 -- Why it is built this way: the SQL editor runs as the table owner, which skips
 -- row-level security, and sends no x-rnmb-key header. So the script copies the
@@ -35,7 +36,8 @@ begin
   if to_regclass('public.rnmb_payments') is null
      or to_regprocedure('public.rnmb_end_night(jsonb)') is null
      or to_regprocedure('public.rnmb_record_payment(jsonb)') is null
-     or to_regprocedure('public.rnmb_void_payment(jsonb)') is null then
+     or to_regprocedure('public.rnmb_void_payment(jsonb)') is null
+     or to_regprocedure('public.rnmb_remove_person(jsonb)') is null then
     raise exception 'CHECK SETUP: run supabase/crew-balance.sql before this script.';
   end if;
   if not exists (select 1 from public.rnmb_access where passphrase <> '') then
@@ -604,7 +606,8 @@ declare
     $c$select public.rnmb_void_ring_up('{"id": "a7000000-0000-4000-8000-000000000001"}'::jsonb)$c$,
     $c$select public.rnmb_add_crew_pour('{"id": "a8000000-0000-4000-8000-000000000009", "night_id": "a5000000-0000-4000-8000-000000000001", "person_id": "a1000000-0000-4000-8000-000000000001", "bottle_id": "a3000000-0000-4000-8000-000000000001", "ounces": 1}'::jsonb)$c$,
     $c$select public.rnmb_end_night('{"id": "a5000000-0000-4000-8000-000000000001"}'::jsonb)$c$,
-    $c$select public.rnmb_end_host_night('{"id": "a5000000-0000-4000-8000-000000000002"}'::jsonb)$c$
+    $c$select public.rnmb_end_host_night('{"id": "a5000000-0000-4000-8000-000000000002"}'::jsonb)$c$,
+    $c$select public.rnmb_remove_person('{"id": "a1000000-0000-4000-8000-000000000009"}'::jsonb)$c$
   ];
   v_fingerprint text := $f$
     select concat_ws('|',
@@ -616,6 +619,7 @@ declare
       (select count(*) from public.rnmb_ring_ups where voided_at is not null),
       (select count(*) from public.rnmb_nights where ended_at is not null),
       (select count(*) from public.rnmb_pours),
+      (select count(*) from public.rnmb_people),
       (select coalesce(sum(remaining_oz), 0) from public.rnmb_bottles)
     )
   $f$;
@@ -751,7 +755,8 @@ $$;
 
 -- 11. A host night with an open tab still refuses to end, through either
 --     function. Once its tabs close it ends, and then every ring-up, crew pour
---     and void on it raises.
+--     and guest void on it raises — but a crew drink rung up on it stays
+--     voidable, because it is charged at cost and touches no counted tab.
 do $$
 declare
   v_err text;
@@ -845,28 +850,184 @@ begin
     raise exception 'CHECK FAILED (pour on ended host night): expected "has ended", got: %', coalesce(v_err, 'no error');
   end if;
 
+  -- A guest item on the ended night is frozen: its tab was counted against the
+  -- cash.
   v_err := null;
   begin
-    perform public.rnmb_void_ring_up('{"id": "a7000000-0000-4000-8000-000000000002"}'::jsonb);
+    perform public.rnmb_void_ring_up('{"id": "a7000000-0000-4000-8000-000000000004"}'::jsonb);
   exception when others then
     v_err := sqlerrm;
   end;
   if v_err is null or v_err not like '%has ended%' then
-    raise exception 'CHECK FAILED (void on ended host night): expected "has ended", got: %', coalesce(v_err, 'no error');
+    raise exception 'CHECK FAILED (guest void on ended host night): expected "has ended", got: %', coalesce(v_err, 'no error');
   end if;
 
   if exists (select 1 from public.rnmb_ring_ups where id in ('a7000000-0000-4000-8000-000000000006', 'a7000000-0000-4000-8000-000000000007'))
      or exists (select 1 from public.rnmb_pours where id = 'a8000000-0000-4000-8000-000000000006')
-     or exists (select 1 from public.rnmb_ring_ups where id = 'a7000000-0000-4000-8000-000000000002' and voided_at is not null)
+     or exists (select 1 from public.rnmb_ring_ups where id in ('a7000000-0000-4000-8000-000000000002', 'a7000000-0000-4000-8000-000000000004') and voided_at is not null)
      or (select remaining_oz from public.rnmb_bottles where id = 'a3000000-0000-4000-8000-000000000002') <> 5 then
     raise exception 'CHECK FAILED (ended host night): something was written.';
+  end if;
+
+  -- The crew drink on the same ended night is still correctable: it charges its
+  -- drinker at cost, so locking it would make a wrong person's debit permanent.
+  perform public.rnmb_void_ring_up('{"id": "a7000000-0000-4000-8000-000000000002"}'::jsonb);
+  if not exists (select 1 from public.rnmb_ring_ups where id = 'a7000000-0000-4000-8000-000000000002' and voided_at is not null)
+     or (select remaining_oz from public.rnmb_bottles where id = 'a3000000-0000-4000-8000-000000000002') <> 6 then
+    raise exception 'CHECK FAILED (crew void on ended host night): the crew drink was not voided, or the house bottle does not read 6.';
+  end if;
+  if exists (select 1 from public.rnmb_ring_ups where id = 'a7000000-0000-4000-8000-000000000004' and voided_at is not null) then
+    raise exception 'CHECK FAILED (crew void on ended host night): the guest item was voided too.';
   end if;
 
   perform set_config('rnmb.checks_passed', (current_setting('rnmb.checks_passed')::integer + 1)::text, true);
 end;
 $$;
 
--- 12. The result. Reaching this line means no check raised.
+-- 12. rnmb_remove_person keeps 0.5.7 in the database, where two devices working
+--     from copies of the balances minutes apart cannot race past it. Exactly one
+--     column the delete touches destroys a row — rnmb_pours.person_id, the
+--     drinker — so a crew member with a cost-stamped pour is refused. Everyone
+--     else leaves, and the payment, crew drink, line and tab that named them keep
+--     their money under the name snapshot beside the null.
+do $$
+declare
+  v_err text;
+  v_people integer;
+  v_row record;
+begin
+  select count(*) into v_people from public.rnmb_people;
+
+  insert into public.rnmb_people (id, name) values
+    ('a1000000-0000-4000-8000-000000000005', 'Dana'),     -- nothing on record
+    ('a1000000-0000-4000-8000-000000000006', 'Erin'),     -- drank a costed pour
+    ('a1000000-0000-4000-8000-000000000007', 'Frankie'),  -- was paid, not voided
+    ('a1000000-0000-4000-8000-000000000008', 'Gray'),     -- has a crew drink
+    ('a1000000-0000-4000-8000-000000000010', 'Harper'),   -- bought poured-from stock
+    ('a1000000-0000-4000-8000-000000000011', 'Ira'),      -- collected a tab
+    ('a1000000-0000-4000-8000-000000000012', 'Jules');    -- bought Erin's pour
+
+  -- Erin's pour carries a cost and cascades away with her, which would take
+  -- Jules's credit for it too. Jules is only the buyer, which is set null beside
+  -- buyer_name, so the pour and the credit outlive her.
+  insert into public.rnmb_pours (id, night_id, person_id, bottle_id, ounces, abv_snapshot, cost_cents, buyer_id, buyer_name)
+  values (
+    'a8000000-0000-4000-8000-000000000007',
+    'a5000000-0000-4000-8000-000000000001',
+    'a1000000-0000-4000-8000-000000000006',
+    'a3000000-0000-4000-8000-000000000001',
+    1, 40, 118, 'a1000000-0000-4000-8000-000000000012', 'Jules'
+  );
+
+  perform public.rnmb_record_payment('{"id": "a9000000-0000-4000-8000-000000000010", "from_person_id": "a1000000-0000-4000-8000-000000000002", "to_person_id": "a1000000-0000-4000-8000-000000000007", "amount_cents": 100}'::jsonb);
+
+  -- Gray's crew drink on the ended crew night, and a drink drawn from Harper's
+  -- stock (the line names Harper as the buyer, nobody else).
+  perform public.rnmb_ring_up('{
+    "id": "a7000000-0000-4000-8000-000000000008",
+    "night_id": "a5000000-0000-4000-8000-000000000001",
+    "kind": "crew",
+    "person_id": "a1000000-0000-4000-8000-000000000008",
+    "menu_item_id": "a4000000-0000-4000-8000-000000000001",
+    "lines": [{"bottle_id": "a3000000-0000-4000-8000-000000000002", "amount": 1, "cost_cents": 12.5}]
+  }'::jsonb);
+
+  insert into public.rnmb_bottles (id, type_id, nickname, size_oz, remaining_oz, price, buyer_id, purchase_date) values
+    ('a3000000-0000-4000-8000-000000000003', 'a2000000-0000-4000-8000-000000000001', 'Harper tequila', 10, 10, 20, 'a1000000-0000-4000-8000-000000000010', '2026-09-17');
+  perform public.rnmb_ring_up('{
+    "id": "a7000000-0000-4000-8000-00000000000a",
+    "night_id": "a5000000-0000-4000-8000-000000000001",
+    "kind": "crew",
+    "person_id": "a1000000-0000-4000-8000-000000000002",
+    "menu_item_id": "a4000000-0000-4000-8000-000000000001",
+    "lines": [{"bottle_id": "a3000000-0000-4000-8000-000000000003", "amount": 1, "cost_cents": 200}]
+  }'::jsonb);
+
+  -- Ira collected a tab on the (now ended) host night.
+  insert into public.rnmb_guest_tabs (id, night_id, guest_name, status, collector_id, collector_name, amount_cents, closed_at) values
+    ('a6000000-0000-4000-8000-000000000004', 'a5000000-0000-4000-8000-000000000002', 'Guest D', 'paid', 'a1000000-0000-4000-8000-000000000011', 'Ira', 0, now());
+
+  -- The one refusal: it names Erin and leaves her on the roster.
+  v_err := null;
+  begin
+    perform public.rnmb_remove_person('{"id": "a1000000-0000-4000-8000-000000000006"}'::jsonb);
+  exception when others then
+    v_err := sqlerrm;
+  end;
+  if v_err is null or v_err not like 'RNMB: Erin drank drinks that cost money%' then
+    raise exception 'CHECK FAILED (remove person, costed pour): expected "drank drinks that cost money", got: %', coalesce(v_err, 'no error');
+  end if;
+
+  v_err := null;
+  begin
+    perform public.rnmb_remove_person('{"id": "a1000000-0000-4000-8000-000000000009"}'::jsonb);
+  exception when others then
+    v_err := sqlerrm;
+  end;
+  if v_err is null or v_err not like '%that crew member does not exist%' then
+    raise exception 'CHECK FAILED (remove unknown person): expected "does not exist", got: %', coalesce(v_err, 'no error');
+  end if;
+
+  if (select count(*) from public.rnmb_people) <> v_people + 7 then
+    raise exception 'CHECK FAILED (remove person): a refused removal deleted somebody anyway.';
+  end if;
+
+  -- Everybody whose removal destroys nothing goes, including the five an earlier
+  -- draft of this rule would have kept forever: 0.5.7 says settle up and leave,
+  -- not stay because you were ever named.
+  perform public.rnmb_remove_person('{"id": "a1000000-0000-4000-8000-000000000005"}'::jsonb); -- Dana
+  perform public.rnmb_remove_person('{"id": "a1000000-0000-4000-8000-000000000007"}'::jsonb); -- Frankie
+  perform public.rnmb_remove_person('{"id": "a1000000-0000-4000-8000-000000000008"}'::jsonb); -- Gray
+  perform public.rnmb_remove_person('{"id": "a1000000-0000-4000-8000-000000000010"}'::jsonb); -- Harper
+  perform public.rnmb_remove_person('{"id": "a1000000-0000-4000-8000-000000000011"}'::jsonb); -- Ira
+  perform public.rnmb_remove_person('{"id": "a1000000-0000-4000-8000-000000000012"}'::jsonb); -- Jules
+
+  if (select count(*) from public.rnmb_people) <> v_people + 1
+     or not exists (select 1 from public.rnmb_people where id = 'a1000000-0000-4000-8000-000000000006') then
+    raise exception 'CHECK FAILED (remove person): the six removable people did not all go, or Erin went with them.';
+  end if;
+
+  -- Every record they were named on is still there, still carrying its money,
+  -- with the id null and the name snapshot intact.
+  select from_person_id, to_person_id, to_name, amount_cents, voided_at into v_row
+    from public.rnmb_payments where id = 'a9000000-0000-4000-8000-000000000010';
+  if not found or v_row.to_person_id is not null or v_row.to_name <> 'Frankie'
+     or v_row.amount_cents <> 100 or v_row.voided_at is not null
+     or v_row.from_person_id <> 'a1000000-0000-4000-8000-000000000002'::uuid then
+    raise exception 'CHECK FAILED (remove person): Frankie''s payment did not survive as an unvoided 100 cents to the name Frankie.';
+  end if;
+
+  select person_id, person_name into v_row
+    from public.rnmb_ring_ups where id = 'a7000000-0000-4000-8000-000000000008';
+  if not found or v_row.person_id is not null or v_row.person_name <> 'Gray' then
+    raise exception 'CHECK FAILED (remove person): Gray''s crew drink did not survive under the name Gray.';
+  end if;
+
+  select buyer_id, buyer_name, cost_cents into v_row
+    from public.rnmb_ring_up_lines
+   where ring_up_id = 'a7000000-0000-4000-8000-00000000000a';
+  if not found or v_row.buyer_id is not null or v_row.buyer_name <> 'Harper' or v_row.cost_cents <> 200 then
+    raise exception 'CHECK FAILED (remove person): the line drawn from Harper''s stock did not survive under the name Harper.';
+  end if;
+
+  select collector_id, collector_name, status into v_row
+    from public.rnmb_guest_tabs where id = 'a6000000-0000-4000-8000-000000000004';
+  if not found or v_row.collector_id is not null or v_row.collector_name <> 'Ira' or v_row.status <> 'paid' then
+    raise exception 'CHECK FAILED (remove person): Ira''s collected tab did not survive under the name Ira.';
+  end if;
+
+  select person_id, buyer_id, buyer_name, cost_cents into v_row
+    from public.rnmb_pours where id = 'a8000000-0000-4000-8000-000000000007';
+  if not found or v_row.person_id <> 'a1000000-0000-4000-8000-000000000006'::uuid
+     or v_row.buyer_id is not null or v_row.buyer_name <> 'Jules' or v_row.cost_cents <> 118 then
+    raise exception 'CHECK FAILED (remove person): Erin''s pour lost its cost or Jules''s name when Jules left.';
+  end if;
+
+  perform set_config('rnmb.checks_passed', (current_setting('rnmb.checks_passed')::integer + 1)::text, true);
+end;
+$$;
+
+-- 13. The result. Reaching this line means no check raised.
 select current_setting('rnmb.checks_passed')::integer as checks_passed,
        'All crew-balance checks passed. Everything was rolled back.' as result;
 
