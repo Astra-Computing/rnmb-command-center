@@ -100,6 +100,8 @@ Host mode replaces a flat cover charge with a tab per guest.
 
 **Closing out:** each open tab is closed as *Paid* (choose who collected the money; the amount is the tab total) or *Write off* (choose who is writing it off — they cover what its drinks cost). *End night* works once every tab is closed. **Ledger → Host Nights** shows what each collector holds and which buyers it belongs to, plus the value written off from each buyer's stock. Both feed the crew balances: the collector carries what they collected, and a write-off lands on whoever wrote it off.
 
+Each host night's card also lists the **crew drinks** charged on it — the drinks and pours that went to a crew member rather than onto a guest's tab — with a *Void* button on each. That stays available after the night ends, which is the one thing an ended host night still allows. A guest item does not: its tab total was counted as cash when the night closed, so it is frozen. A crew drink was only ever charged at cost to one person's balance and sits on no tab, so a drink rung up to the wrong crew member can still be put right. Voiding one returns the stock and moves the balance back.
+
 A red *This browser only* banner on the register means nothing is being saved to the shared database.
 
 ### Rolling host mode out
