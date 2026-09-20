@@ -843,7 +843,7 @@ test("normalizeState on nothing at all is an empty state", () => {
   const state = D.normalizeState({});
   assert.deepEqual(state, {
     people: [], types: [], bottles: [], nights: [],
-    menuItems: [], guestTabs: [], ringUps: [], stockAdjustments: [],
+    menuItems: [], guestTabs: [], ringUps: [], stockAdjustments: [], payments: [],
     activeNightId: "", responsibleMode: true, markupPercent: 0, roundingIncrementCents: 25
   });
 });
@@ -862,7 +862,8 @@ test("normalizeState keeps host nights, the browser-only local mark only when li
   });
   assert.deepEqual(state.nights[0], { id: "h1", name: "Party", date: "2026-09-16", kind: "host", endedAt: null, pours: [], startedLocally: true });
   assert.deepEqual(state.nights[1], { id: "h2", name: "Old party", date: "2026-09-01", kind: "host", endedAt: "2026-09-02T03:00:00Z", pours: [] });
-  assert.deepEqual(state.nights[2], { id: "c1", name: "Crew", date: "2026-09-01", kind: "crew", endedAt: null, pours: [] });
+  // KTD7: a crew night (an unknown kind reads as crew) keeps its ended time.
+  assert.deepEqual(state.nights[2], { id: "c1", name: "Crew", date: "2026-09-01", kind: "crew", endedAt: "2026-09-02T03:00:00Z", pours: [] });
   assert.equal(state.responsibleMode, false);
   assert.equal(state.markupPercent, 50);
   assert.equal(state.roundingIncrementCents, 50);
@@ -895,7 +896,8 @@ test("normalizeState normalizes menu items, tabs, ring-ups with their lines, and
   assert.deepEqual(state.menuItems[1], { id: "m2", name: "Odd", kind: "cocktail", ingredients: [] });
   assert.deepEqual(state.guestTabs[0], {
     id: "g1", nightId: "h1", guestName: "Riley", status: "open",
-    collectorId: null, collectorName: null, amountCents: null, openedAt: null, closedAt: null
+    collectorId: null, collectorName: null, amountCents: null, writtenOffBy: null, writtenOffByName: null,
+    openedAt: null, closedAt: null
   });
   assert.deepEqual(state.ringUps[0], {
     id: "r1", nightId: "h1", kind: "guest", tabId: "g1", personId: null, personName: null,
@@ -918,4 +920,754 @@ test("normalizeState is idempotent", () => {
     ringUps: [{ id: "r1", nightId: "h1", kind: "guest", tabId: "g1", priceCents: 100, lines: [{ bottleId: "b1", amount: 1 }] }]
   });
   assert.deepEqual(D.normalizeState(JSON.parse(JSON.stringify(once))), once);
+});
+
+// ---------- crew running balance (U1: KTD1-KTD4) ------------------------------
+
+const crew = [
+  { id: "p-sam", name: "Sam" },
+  { id: "p-alex", name: "Alex" },
+  { id: "p-jordan", name: "Jordan" },
+  { id: "p-casey", name: "Casey" }
+];
+
+// Sam's $40, 25 oz bottle: 160 cents per ounce.
+const samBottle = () => ({ id: "b-sam", typeId: "t-tequila", size: 25, remaining: 22, price: 40, buyerId: "p-sam", date: "2026-09-01" });
+
+const crewPour = (id, personId, costCents, buyerId, buyerName, extra) =>
+  Object.assign({ id, personId, bottleId: "b-sam", ounces: 1, abv: 40, timestamp: "2026-09-17T20:00:00Z", costCents, buyerId, buyerName }, extra);
+
+const centsOf = (balances, key) => {
+  const entry = balances.find((row) => row.personId === key || (row.personId === null && row.name === key));
+  return entry ? entry.cents : undefined;
+};
+
+const ae1State = () => ({
+  people: crew,
+  bottles: [samBottle()],
+  nights: [{
+    id: "n1", name: "Friday", date: "2026-09-17", kind: "crew", endedAt: null,
+    pours: [
+      crewPour("x1", "p-alex", 320, "p-sam", "Sam", { ounces: 2 }),
+      crewPour("x2", "p-sam", 160, "p-sam", "Sam", { ounces: 1 })
+    ]
+  }],
+  ringUps: [],
+  guestTabs: [],
+  payments: []
+});
+
+test("pourCostCents is the unit cost times the amount, rounded half-up once", () => {
+  assert.equal(D.pourCostCents(samBottle(), 2), 320);
+  assert.equal(D.pourCostCents(samBottle(), 1), 160);
+  // $1 over 4 oz is 25 cents an ounce: half an ounce is 12.5 cents and rounds up to 13.
+  assert.equal(D.pourCostCents({ size: 4, price: 1 }, 0.5), 13);
+  // $10 over 3 oz: 3 oz is 999.999... in floating point and must still be 1000.
+  assert.equal(D.pourCostCents({ size: 3, price: 10 }, 3), 1000);
+  assert.equal(D.pourCostCents({ size: 3, price: 10 }, 0.5), 167);
+  assert.equal(D.pourCostCents({ size: 12, price: 18 }, 1), 150); // 1 unit of a counted 12-pack
+  assert.equal(D.pourCostCents({ sizeOz: 25, price: 40 }, 1), 160); // legacy bottle shape
+  assert.equal(D.pourCostCents(samBottle(), 0), 0);
+  assert.throws(() => D.pourCostCents(samBottle(), -1), RangeError);
+  assert.throws(() => D.pourCostCents(samBottle(), Number.NaN), RangeError);
+  assert.throws(() => D.pourCostCents({ size: 0, price: 10 }, 1), RangeError);
+});
+
+test("ringUpCostCents rounds the unrounded total once and allocates it back to the lines", () => {
+  const result = D.ringUpCostCents([{ costCents: 33.5 }, { costCents: 33.5 }, { costCents: 33.5 }]);
+  // Rounding each line would give 34 + 34 + 34 = 102; the total 100.5 rounds once to 101.
+  assert.equal(result.totalCents, 101);
+  assert.deepEqual(result.lineCents, [34, 34, 33]);
+  const uneven = D.ringUpCostCents([{ costCents: 100.4 }, { costCents: 50.35 }, { costCents: 30.3 }]);
+  assert.equal(uneven.totalCents, 181);
+  assert.equal(sum(uneven.lineCents), 181);
+  assert.ok(uneven.lineCents.every(Number.isInteger));
+  assert.deepEqual(D.ringUpCostCents([]), { totalCents: 0, lineCents: [] });
+  assert.deepEqual(D.ringUpCostCents([{ costCents: 0.2 }]), { totalCents: 0, lineCents: [0] });
+});
+
+test("AE1: two pours from Sam's 160-cent-per-ounce bottle give Alex -320 and Sam +320", () => {
+  const balances = D.crewBalances(ae1State());
+  assert.equal(centsOf(balances, "p-alex"), -320);
+  assert.equal(centsOf(balances, "p-sam"), 320);
+  assert.equal(centsOf(balances, "p-jordan"), 0);
+  assert.equal(centsOf(balances, "p-casey"), 0);
+  assert.equal(sum(balances.map((row) => row.cents)), 0);
+  assert.deepEqual(balances.map((row) => row.name), ["Sam", "Alex", "Jordan", "Casey"]);
+  assert.deepEqual(balances[0], { personId: "p-sam", name: "Sam", cents: 320 });
+});
+
+test("AE2: a recorded 320-cent payment from Alex to Sam zeroes both; a voided payment has no effect", () => {
+  const payment = {
+    id: "pay1", fromPersonId: "p-alex", fromName: "Alex", toPersonId: "p-sam", toName: "Sam",
+    amountCents: 320, paidAt: "2026-09-17T23:00:00Z", voidedAt: null
+  };
+  const paid = Object.assign(ae1State(), { payments: [payment] });
+  const balances = D.crewBalances(paid);
+  assert.equal(centsOf(balances, "p-alex"), 0);
+  assert.equal(centsOf(balances, "p-sam"), 0);
+
+  const voided = Object.assign(ae1State(), { payments: [Object.assign({}, payment, { voidedAt: "2026-09-17T23:05:00Z" })] });
+  assert.deepEqual(D.crewBalances(voided), D.crewBalances(ae1State()));
+});
+
+const ae3State = () => {
+  const margarita = D.priceRingUp(
+    [
+      { bottleId: "b-tequila", amount: 2 },
+      { bottleId: "b-triple", amount: 1 },
+      { bottleId: "b-lime", amount: 1 }
+    ],
+    ae1Context(ae1Bottles())
+  );
+  const samLine = (costCents) => ({ bottleId: "b-tequila", typeId: "t-tequila", amount: 1, costCents, shareCents: 125, buyerId: "p-sam", buyerName: "Sam", abv: 40 });
+  return {
+    people: crew,
+    bottles: ae1Bottles(),
+    nights: [{ id: "h1", name: "Party", date: "2026-09-17", kind: "host", endedAt: null, pours: [] }],
+    guestTabs: [
+      { id: "g-paid", nightId: "h1", guestName: "Riley", status: "paid", collectorId: "p-casey", collectorName: "Casey", amountCents: 500, writtenOffBy: null, writtenOffByName: null },
+      { id: "g-off", nightId: "h1", guestName: "Quinn", status: "written_off", collectorId: null, collectorName: null, amountCents: null, writtenOffBy: "p-jordan", writtenOffByName: "Jordan" },
+      { id: "g-open", nightId: "h1", guestName: "Morgan", status: "open", collectorId: null, collectorName: null, amountCents: null, writtenOffBy: null, writtenOffByName: null }
+    ],
+    ringUps: [
+      { id: "r1", nightId: "h1", kind: "guest", tabId: "g-paid", priceCents: 500, voidedAt: null, lines: margarita.lines },
+      // Two written-off drinks whose costs round to 120 each: $2.40 from Sam's bottle.
+      { id: "r2", nightId: "h1", kind: "guest", tabId: "g-off", priceCents: 250, voidedAt: null, lines: [samLine(119.6)] },
+      { id: "r3", nightId: "h1", kind: "guest", tabId: "g-off", priceCents: 250, voidedAt: null, lines: [samLine(120.4)] },
+      { id: "r4", nightId: "h1", kind: "guest", tabId: "g-off", priceCents: 900, voidedAt: "2026-09-17T21:00:00Z", lines: [samLine(700)] },
+      { id: "r5", nightId: "h1", kind: "guest", tabId: "g-open", priceCents: 500, voidedAt: null, lines: margarita.lines }
+    ],
+    payments: []
+  };
+};
+
+test("AE3: the paid and written-off tabs give Sam +601, Alex +120, Jordan -221, Casey -500", () => {
+  const balances = D.crewBalances(ae3State());
+  assert.equal(centsOf(balances, "p-sam"), 601);
+  assert.equal(centsOf(balances, "p-alex"), 120);
+  assert.equal(centsOf(balances, "p-jordan"), -221);
+  assert.equal(centsOf(balances, "p-casey"), -500);
+  assert.equal(sum(balances.map((row) => row.cents)), 0);
+});
+
+test("AE4: a stock adjustment changes no balance", () => {
+  const before = D.crewBalances(ae1State());
+  const corrected = ae1State();
+  corrected.bottles[0].remaining = 6;
+  corrected.stockAdjustments = [{ id: "a1", bottleId: "b-sam", previousRemaining: 10, newRemaining: 6, adjustedAt: "2026-09-17T22:00:00Z" }];
+  assert.deepEqual(D.crewBalances(corrected), before);
+});
+
+test("a three-bottle crew ring-up with fractional line costs debits the rounded total and credits lines summing exactly to it", () => {
+  const line = (bottleId, buyerId, buyerName) => ({ bottleId, typeId: "t-tequila", amount: 1, costCents: 33.5, shareCents: null, buyerId, buyerName, abv: 40 });
+  const state = {
+    people: crew,
+    ringUps: [
+      {
+        id: "c1", nightId: "n1", kind: "crew", personId: "p-casey", personName: "Casey", priceCents: null, voidedAt: null,
+        lines: [line("b1", "p-sam", "Sam"), line("b2", "p-alex", "Alex"), line("b3", "p-jordan", "Jordan")]
+      },
+      {
+        id: "c2", nightId: "n1", kind: "crew", personId: "p-casey", personName: "Casey", priceCents: null, voidedAt: "2026-09-17T21:00:00Z",
+        lines: [line("b1", "p-sam", "Sam")]
+      }
+    ]
+  };
+  const balances = D.crewBalances(state);
+  assert.equal(centsOf(balances, "p-casey"), -101);
+  assert.equal(centsOf(balances, "p-sam") + centsOf(balances, "p-alex") + centsOf(balances, "p-jordan"), 101);
+  assert.deepEqual([centsOf(balances, "p-sam"), centsOf(balances, "p-alex"), centsOf(balances, "p-jordan")], [34, 34, 33]);
+});
+
+test("a drink from one's own bottle nets to zero", () => {
+  const state = {
+    people: crew,
+    nights: [{ id: "n1", pours: [crewPour("x1", "p-sam", 480, "p-sam", "Sam", { ounces: 3 })] }],
+    ringUps: [{
+      id: "c1", nightId: "n1", kind: "crew", personId: "p-alex", personName: "Alex", voidedAt: null,
+      lines: [{ bottleId: "b-triple", typeId: "t-triple", amount: 1, costCents: 78.87, shareCents: null, buyerId: "p-alex", buyerName: "Alex", abv: 30 }]
+    }]
+  };
+  assert.ok(D.crewBalances(state).every((row) => row.cents === 0));
+});
+
+test("people missing from the roster still appear by snapshot name; records without cost, buyer or author move no money", () => {
+  const state = {
+    people: crew,
+    nights: [{
+      id: "n1",
+      pours: [
+        crewPour("legacy", "p-alex", null, null, null), // logged before cost stamping
+        crewPour("unowned", "p-alex", 200, null, null) // a bottle nobody bought
+      ]
+    }],
+    ringUps: [
+      {
+        id: "c1", nightId: "n1", kind: "crew", personId: null, personName: "Pat", voidedAt: null,
+        lines: [
+          { bottleId: "b1", typeId: "t-tequila", amount: 1, costCents: 150, shareCents: null, buyerId: null, buyerName: "Riley", abv: 40 },
+          { bottleId: "b2", typeId: "t-lime", amount: 1, costCents: 99, shareCents: null, buyerId: null, buyerName: "", abv: 0 }
+        ]
+      },
+      {
+        id: "c2", nightId: "n1", kind: "crew", personId: "p-gone", personName: "Drew", voidedAt: null,
+        lines: [{ bottleId: "b1", typeId: "t-tequila", amount: 0.5, costCents: 75, shareCents: null, buyerId: "p-sam", buyerName: "Sam", abv: 40 }]
+      },
+      { id: "g1", nightId: "n1", kind: "guest", tabId: "t-legacy", priceCents: 300, voidedAt: null, lines: [{ bottleId: "b1", amount: 1, costCents: 150, shareCents: 300, buyerId: "p-sam", buyerName: "Sam" }] }
+    ],
+    guestTabs: [
+      // A write-off from before the author was recorded: nobody to debit.
+      { id: "t-legacy", nightId: "n1", guestName: "Old", status: "written_off", writtenOffBy: null, writtenOffByName: null }
+    ],
+    payments: []
+  };
+  const balances = D.crewBalances(state);
+  assert.equal(centsOf(balances, "Pat"), -150);
+  assert.equal(centsOf(balances, "Riley"), 150);
+  assert.deepEqual(balances.find((row) => row.personId === "p-gone"), { personId: "p-gone", name: "Drew", cents: -75 });
+  assert.equal(centsOf(balances, "p-sam"), 75);
+  assert.equal(centsOf(balances, "p-alex"), 0);
+  assert.equal(sum(balances.map((row) => row.cents)), 0);
+  // Roster first, in roster order, then everyone else by name.
+  assert.deepEqual(balances.map((row) => row.name), ["Sam", "Alex", "Jordan", "Casey", "Drew", "Pat", "Riley"]);
+});
+
+test("crewBalances of an empty or partial state lists the roster at zero", () => {
+  assert.deepEqual(D.crewBalances({}), []);
+  assert.deepEqual(D.crewBalances({ people: [{ id: "p1", name: "Sam" }] }), [{ personId: "p1", name: "Sam", cents: 0 }]);
+});
+
+// ---------- suggested payments (KTD3) ------------------------------------------
+
+const row = (personId, name, cents) => ({ personId, name, cents });
+
+const settle = (balances, payments) => {
+  const left = new Map(balances.map((entry) => [entry.personId, entry.cents]));
+  payments.forEach((payment) => {
+    assert.ok(Number.isInteger(payment.amountCents) && payment.amountCents > 0, "payments are positive whole cents");
+    left.set(payment.fromPersonId, left.get(payment.fromPersonId) + payment.amountCents);
+    left.set(payment.toPersonId, left.get(payment.toPersonId) - payment.amountCents);
+  });
+  return [...left.values()];
+};
+
+// Seeded Mulberry32: the same 200 fixtures on every run.
+const prng = (seed) => {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+};
+
+const shuffled = (list, random) => {
+  const copy = list.slice();
+  for (let i = copy.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
+};
+
+test("{+500, +300, -500, -300} suggests two payments, and shuffled inputs give the identical list", () => {
+  const balances = [row("a", "Alex", 500), row("b", "Blair", 300), row("c", "Casey", -500), row("d", "Drew", -300)];
+  const payments = D.suggestPayments(balances);
+  assert.equal(payments.length, 2);
+  assert.deepEqual(
+    payments.map((p) => [p.fromPersonId, p.toPersonId, p.amountCents]).sort(),
+    [["c", "a", 500], ["d", "b", 300]]
+  );
+  assert.deepEqual(Object.keys(payments[0]), ["fromPersonId", "fromName", "toPersonId", "toName", "amountCents"]);
+  assert.ok(settle(balances, payments).every((cents) => cents === 0));
+  const random = prng(7);
+  for (let i = 0; i < 20; i += 1) assert.deepEqual(D.suggestPayments(shuffled(balances, random)), payments);
+});
+
+test("{+700, -300, -400} suggests two payments, and shuffled inputs give the identical list", () => {
+  const balances = [row("s", "Sam", 700), row("a", "Alex", -300), row("j", "Jordan", -400)];
+  const payments = D.suggestPayments(balances);
+  assert.equal(payments.length, 2);
+  assert.deepEqual(
+    payments.map((p) => [p.fromName, p.toName, p.amountCents]).sort(),
+    [["Alex", "Sam", 300], ["Jordan", "Sam", 400]]
+  );
+  const random = prng(11);
+  for (let i = 0; i < 20; i += 1) assert.deepEqual(D.suggestPayments(shuffled(balances, random)), payments);
+});
+
+test("the exact search finds fewer payments than greedy would: {+600, +500, -500, -400, -200} settles in three", () => {
+  const balances = [row("a", "Avery", 600), row("b", "Blair", 500), row("c", "Casey", -500), row("d", "Drew", -400), row("e", "Emery", -200)];
+  const payments = D.suggestPayments(balances);
+  assert.equal(payments.length, 3); // greedy (largest debtor to largest creditor) needs four
+  assert.ok(settle(balances, payments).every((cents) => cents === 0));
+});
+
+test("people with the same name tie-break by id, so the list is still identical when shuffled", () => {
+  const balances = [row("p2", "Sam", 500), row("p1", "Sam", 500), row("p3", "Alex", -500), row("p4", "Alex", -500)];
+  const payments = D.suggestPayments(balances);
+  assert.equal(payments.length, 2);
+  const random = prng(3);
+  for (let i = 0; i < 20; i += 1) assert.deepEqual(D.suggestPayments(shuffled(balances, random)), payments);
+});
+
+test("zero balances are ignored and nothing to settle suggests nothing", () => {
+  assert.deepEqual(D.suggestPayments([]), []);
+  assert.deepEqual(D.suggestPayments([row("a", "Alex", 0), row("b", "Blair", 0)]), []);
+  assert.deepEqual(D.suggestPayments(undefined), []);
+  const payments = D.suggestPayments([row("a", "Alex", 0), row("b", "Blair", -250), row("c", "Casey", 250)]);
+  assert.deepEqual(payments, [{ fromPersonId: "b", fromName: "Blair", toPersonId: "c", toName: "Casey", amountCents: 250 }]);
+});
+
+test("a removed person (null id) can pay and be paid by name", () => {
+  const payments = D.suggestPayments([row(null, "Pat", -150), row(null, "Riley", 150)]);
+  assert.deepEqual(payments, [{ fromPersonId: null, fromName: "Pat", toPersonId: null, toName: "Riley", amountCents: 150 }]);
+});
+
+test("more than 10 non-zero balances uses the greedy fallback and still settles everyone", () => {
+  // The exact minimum here is 6 payments ({+600,-400,-200}, {+500,-500} and three 100-cent pairs);
+  // largest-debtor-to-largest-creditor needs 7 (500, 400, then Emery's 200 split across two 100s).
+  const balances = [
+    row("a", "Avery", 600), row("b", "Blair", 500), row("c", "Casey", -500), row("d", "Drew", -400), row("e", "Emery", -200),
+    row("f", "Finley", 100), row("g", "Gray", 100), row("h", "Harper", 100),
+    row("i", "Indy", -100), row("j", "Jules", -100), row("k", "Kai", -100)
+  ];
+  const payments = D.suggestPayments(balances);
+  assert.equal(payments.length, 7);
+  assert.ok(settle(balances, payments).every((cents) => cents === 0));
+  const random = prng(5);
+  for (let i = 0; i < 10; i += 1) assert.deepEqual(D.suggestPayments(shuffled(balances, random)), payments);
+});
+
+test("ten non-zero balances still use the exact search", () => {
+  const balances = [
+    row("a", "Avery", 600), row("b", "Blair", 500), row("c", "Casey", -500), row("d", "Drew", -400), row("e", "Emery", -200),
+    row("f", "Finley", 100), row("g", "Gray", 100), row("i", "Indy", -100), row("j", "Jules", -100), row("z", "Zero", 0)
+  ];
+  const payments = D.suggestPayments(balances);
+  assert.equal(payments.length, 5); // 9 non-zero people in 4 zero-sum groups
+  assert.ok(settle(balances, payments).every((cents) => cents === 0));
+});
+
+// ---------- property: balances always sum to zero (0.5.6) ----------------------
+
+const randomFixture = (random) => {
+  const pick = (list) => list[Math.floor(random() * list.length)];
+  const int = (max) => Math.floor(random() * (max + 1));
+  const roster = crew.slice(0, 2 + int(2));
+  // Records may name removed people: an id no longer on the roster, or only a name snapshot.
+  const everyone = roster.map((p) => ({ id: p.id, name: p.name })).concat([
+    { id: "p-gone", name: "Drew" },
+    { id: null, name: "Pat" }
+  ]);
+  const someone = () => pick(everyone);
+  const maybeBuyer = () => (random() < 0.1 ? { id: null, name: "" } : someone());
+  const line = () => {
+    const buyer = maybeBuyer();
+    return { bottleId: "b" + int(5), typeId: "t", amount: 1, costCents: Math.round(random() * 50000) / 100, shareCents: null, buyerId: buyer.id, buyerName: buyer.name, abv: 40 };
+  };
+  const pours = [];
+  for (let i = int(8); i > 0; i -= 1) {
+    const drinker = someone();
+    const buyer = maybeBuyer();
+    pours.push({ id: "x" + i, personId: drinker.id, bottleId: "b1", ounces: 1, abv: 40, timestamp: null, costCents: random() < 0.1 ? null : int(900), buyerId: buyer.id, buyerName: buyer.name });
+  }
+  const ringUps = [];
+  const guestTabs = [];
+  for (let i = int(6); i > 0; i -= 1) {
+    const person = someone();
+    const lines = Array.from({ length: 1 + int(3) }, line);
+    ringUps.push({ id: "c" + i, nightId: "n1", kind: "crew", personId: person.id, personName: person.name, priceCents: null, voidedAt: random() < 0.2 ? "2026-09-17T21:00:00Z" : null, lines });
+  }
+  for (let t = int(4); t > 0; t -= 1) {
+    const tabId = "g" + t;
+    const status = pick(["open", "paid", "written_off"]);
+    let total = 0;
+    for (let i = int(3); i > 0; i -= 1) {
+      const lines = Array.from({ length: 1 + int(3) }, line);
+      const price = D.priceCents(sum(lines.map((l) => l.costCents)), int(100), pick([1, 25, 50]));
+      D.allocateShares(price, lines.map((l) => l.costCents)).forEach((share, index) => { lines[index].shareCents = share; });
+      const voided = random() < 0.2;
+      if (!voided) total += price;
+      ringUps.push({ id: tabId + "-r" + i, nightId: "n1", kind: "guest", tabId, priceCents: price, voidedAt: voided ? "2026-09-17T21:00:00Z" : null, lines });
+    }
+    const collector = status === "paid" ? someone() : { id: null, name: null };
+    const writer = status === "written_off" && random() < 0.9 ? someone() : { id: null, name: null };
+    guestTabs.push({
+      id: tabId, nightId: "n1", guestName: "Guest " + t, status,
+      collectorId: collector.id, collectorName: collector.name, amountCents: status === "paid" ? total : null,
+      writtenOffBy: writer.id, writtenOffByName: writer.name
+    });
+  }
+  const payments = [];
+  for (let i = int(4); i > 0; i -= 1) {
+    const from = someone();
+    const to = someone();
+    payments.push({ id: "pay" + i, fromPersonId: from.id, fromName: from.name, toPersonId: to.id, toName: to.name, amountCents: 1 + int(5000), paidAt: null, voidedAt: random() < 0.2 ? "2026-09-17T23:00:00Z" : null });
+  }
+  return { people: roster, nights: [{ id: "n1", pours }], ringUps, guestTabs, payments };
+};
+
+test("property: balances sum to zero across 200 random fixtures of pours, ring-ups, tabs and payments, and the suggestions settle them", () => {
+  const random = prng(20260917);
+  for (let n = 0; n < 200; n += 1) {
+    const fixture = randomFixture(random);
+    const balances = D.crewBalances(fixture);
+    assert.ok(balances.every((entry) => Number.isInteger(entry.cents)), "fixture " + n + ": whole cents");
+    assert.equal(sum(balances.map((entry) => entry.cents)), 0, "fixture " + n + ": sums to zero");
+    // Normalizing the state first changes nothing.
+    assert.deepEqual(D.crewBalances(D.normalizeState(fixture)), balances, "fixture " + n + ": normalized state agrees");
+    const payments = D.suggestPayments(balances);
+    const nonZero = balances.filter((entry) => entry.cents !== 0).length;
+    assert.ok(payments.length <= Math.max(0, nonZero - 1), "fixture " + n + ": at most one payment fewer than people owed or owing");
+    const left = new Map(balances.map((entry) => [(entry.personId || "") + "|" + entry.name, entry.cents]));
+    payments.forEach((p) => {
+      const fromKey = (p.fromPersonId || "") + "|" + p.fromName;
+      const toKey = (p.toPersonId || "") + "|" + p.toName;
+      left.set(fromKey, left.get(fromKey) + p.amountCents);
+      left.set(toKey, left.get(toKey) - p.amountCents);
+    });
+    assert.ok([...left.values()].every((cents) => cents === 0), "fixture " + n + ": suggestions settle everyone");
+  }
+});
+
+// ---------- normalizers for the new records --------------------------------------
+
+test("normalizePayment returns every field in a fixed order with numeric cents and null times", () => {
+  assert.deepEqual(
+    D.normalizePayment({ id: "pay1", fromPersonId: "p-alex", fromName: "Alex", toPersonId: "p-sam", toName: "Sam", amountCents: "320", paidAt: "2026-09-17T23:00:00Z" }),
+    { id: "pay1", fromPersonId: "p-alex", fromName: "Alex", toPersonId: "p-sam", toName: "Sam", amountCents: 320, paidAt: "2026-09-17T23:00:00Z", voidedAt: null }
+  );
+  assert.deepEqual(D.normalizePayment({ id: "pay2", fromPersonId: "", toPersonId: null }), {
+    id: "pay2", fromPersonId: null, fromName: "", toPersonId: null, toName: "", amountCents: 0, paidAt: null, voidedAt: null
+  });
+});
+
+test("normalizeState defaults payments, pour cost and buyer fields, and the write-off author to null", () => {
+  const state = D.normalizeState({
+    nights: [{
+      id: "n1", name: "Friday", date: "2026-09-17",
+      pours: [
+        { id: "x1", personId: "p-alex", bottleId: "b1", ounces: 2, abv: 40, timestamp: "2026-09-17T20:00:00Z" },
+        { id: "x2", personId: "p-sam", bottleId: "b1", ounces: 1, abv: 40, timestamp: "2026-09-17T20:05:00Z", costCents: "160", buyerId: "p-sam", buyerName: "Sam" }
+      ]
+    }],
+    guestTabs: [{ id: "g1", nightId: "h1", guestName: "Quinn", status: "written_off", writtenOffBy: "p-jordan", writtenOffByName: "Jordan" }],
+    payments: [{ id: "pay1", fromPersonId: "p-alex", fromName: "Alex", toPersonId: "p-sam", toName: "Sam", amountCents: 320 }]
+  });
+  assert.deepEqual(state.nights[0].pours[0], {
+    id: "x1", personId: "p-alex", bottleId: "b1", ounces: 2, abv: 40, timestamp: "2026-09-17T20:00:00Z", costCents: null, buyerId: null, buyerName: null
+  });
+  assert.deepEqual(state.nights[0].pours[1], {
+    id: "x2", personId: "p-sam", bottleId: "b1", ounces: 1, abv: 40, timestamp: "2026-09-17T20:05:00Z", costCents: 160, buyerId: "p-sam", buyerName: "Sam"
+  });
+  assert.equal(state.guestTabs[0].writtenOffBy, "p-jordan");
+  assert.equal(state.guestTabs[0].writtenOffByName, "Jordan");
+  assert.deepEqual(state.payments, [{ id: "pay1", fromPersonId: "p-alex", fromName: "Alex", toPersonId: "p-sam", toName: "Sam", amountCents: 320, paidAt: null, voidedAt: null }]);
+  assert.deepEqual(D.normalizeState(JSON.parse(JSON.stringify(state))), state);
+});
+
+// ---------- U3: crew balance payloads and pour stamping ---------------------------
+
+test("KTD7: normalizeNight keeps a crew night's ended time, and an unknown kind is a crew night that keeps it", () => {
+  assert.deepEqual(
+    D.normalizeNight({ id: "c1", name: "Friday", date: "2026-09-17", kind: "crew", endedAt: "2026-09-18T02:00:00Z" }),
+    { id: "c1", name: "Friday", date: "2026-09-17", kind: "crew", endedAt: "2026-09-18T02:00:00Z", pours: [] }
+  );
+  assert.equal(D.normalizeNight({ id: "c2", kind: "weird", endedAt: "" }).endedAt, null);
+});
+
+test("an archive without payments normalizes to an empty payments collection", () => {
+  const archive = { people: [{ id: "p-sam", name: "Sam" }], types: [], bottles: [], nights: [], guestTabs: [], ringUps: [] };
+  assert.deepEqual(D.normalizeState(archive).payments, []);
+  assert.deepEqual(D.normalizeState({ ...archive, payments: null }).payments, []);
+});
+
+test("pourRow writes today's pour columns, adding cost and buyer only when crew balances are available (literal true)", () => {
+  const pour = { id: "x1", personId: "p-alex", bottleId: "b1", ounces: 2, abv: 40, timestamp: "2026-09-17T20:00:00Z", costCents: 320, buyerId: "p-sam", buyerName: "Sam" };
+  const today = { id: "x1", night_id: "n1", person_id: "p-alex", bottle_id: "b1", ounces: 2, abv_snapshot: 40, poured_at: "2026-09-17T20:00:00Z" };
+  assert.deepEqual(D.pourRow(pour, "n1", false), today);
+  assert.deepEqual(D.pourRow(pour, "n1", "yes"), today);
+  assert.deepEqual(D.pourRow(pour, "n1", undefined), today);
+  assert.deepEqual(D.pourRow(pour, "n1", true), { ...today, cost_cents: 320, buyer_id: "p-sam", buyer_name: "Sam" });
+  assert.deepEqual(D.pourRow({ id: "x2", personId: "p-alex", bottleId: "b1", ounces: 1, abv: 40, timestamp: "t" }, "n1", true), {
+    id: "x2", night_id: "n1", person_id: "p-alex", bottle_id: "b1", ounces: 1, abv_snapshot: 40, poured_at: "t",
+    cost_cents: null, buyer_id: null, buyer_name: null
+  });
+});
+
+test("paymentRow writes every rnmb_payments column in snake_case", () => {
+  assert.deepEqual(
+    D.paymentRow({ id: "pay1", fromPersonId: "p-alex", fromName: "Alex", toPersonId: "p-sam", toName: "Sam", amountCents: 320, paidAt: "2026-09-17T23:00:00Z" }),
+    { id: "pay1", from_person_id: "p-alex", from_name: "Alex", to_person_id: "p-sam", to_name: "Sam", amount_cents: 320, paid_at: "2026-09-17T23:00:00Z", voided_at: null }
+  );
+});
+
+test("stampPour fixes the pour's whole-cent cost and the bottle buyer's snapshot, as rnmb_add_crew_pour does", () => {
+  const bottle = { id: "b1", typeId: "t-tequila", size: 25, remaining: 20, price: 40, buyerId: "p-sam" };
+  const pour = { id: "x1", personId: "p-alex", bottleId: "b1", ounces: 2, abv: 40, timestamp: "t" };
+  assert.deepEqual(D.stampPour(pour, bottle, people), { ...pour, costCents: 320, buyerId: "p-sam", buyerName: "Sam" });
+  assert.equal(pour.costCents, undefined, "the input pour is not changed");
+  // 30 dollars / 25.36 oz x 1.5 oz = 177.44... cents -> 177
+  assert.equal(D.stampPour({ ...pour, ounces: 1.5 }, { ...bottle, size: 25.36, price: 30 }, people).costCents, 177);
+  // A buyer no longer on the roster (or none) credits nobody.
+  assert.deepEqual(D.stampPour(pour, { ...bottle, buyerId: "p-gone" }, people), { ...pour, costCents: 320, buyerId: null, buyerName: null });
+  assert.deepEqual(D.stampPour(pour, { ...bottle, buyerId: "" }, people), { ...pour, costCents: 320, buyerId: null, buyerName: null });
+});
+
+test("hasCrewBalanceRecords spots anything a database without crew-balance.sql has nowhere to keep", () => {
+  const plain = D.normalizeState({
+    nights: [{ id: "n1", kind: "crew", pours: [{ id: "x1", personId: "p", bottleId: "b", ounces: 1, abv: 40, timestamp: "t" }] }],
+    guestTabs: [{ id: "g1", nightId: "h1", guestName: "Quinn", status: "written_off" }]
+  });
+  assert.equal(D.hasCrewBalanceRecords(plain), false);
+  assert.equal(D.hasCrewBalanceRecords(D.normalizeState({})), false);
+  assert.equal(D.hasCrewBalanceRecords({}), false);
+  const withPayment = { ...plain, payments: [D.normalizePayment({ id: "pay1", amountCents: 5 })] };
+  assert.equal(D.hasCrewBalanceRecords(withPayment), true);
+  const stamped = D.normalizeState({ nights: [{ id: "n1", pours: [{ id: "x1", costCents: 0 }] }] });
+  assert.equal(D.hasCrewBalanceRecords(stamped), true);
+  const author = D.normalizeState({ guestTabs: [{ id: "g1", status: "written_off", writtenOffByName: "Jordan" }] });
+  assert.equal(D.hasCrewBalanceRecords(author), true);
+  const endedCrew = D.normalizeState({ nights: [{ id: "n1", kind: "crew", endedAt: "2026-09-18T02:00:00Z" }] });
+  assert.equal(D.hasCrewBalanceRecords(endedCrew), true);
+  const endedHost = D.normalizeState({ nights: [{ id: "h1", kind: "host", endedAt: "2026-09-18T02:00:00Z" }] });
+  assert.equal(D.hasCrewBalanceRecords(endedHost), false);
+});
+
+// ---------- crew U4/U5 helpers: payment amounts, crew drink cost, quick log ------------
+
+test("dollarsToCents reads a typed dollar amount as whole cents, or null when it is not one", () => {
+  assert.equal(D.dollarsToCents("3.20"), 320);
+  assert.equal(D.dollarsToCents("3.2"), 320);
+  assert.equal(D.dollarsToCents(" $12 "), 1200);
+  assert.equal(D.dollarsToCents(".5"), 50);
+  assert.equal(D.dollarsToCents("0"), 0);
+  assert.equal(D.dollarsToCents(4.35), 435, "4.35 * 100 is 434.99999 in floating point; still 435");
+  assert.equal(D.dollarsToCents("1,000.00"), null, "no thousands separators");
+  for (const bad of ["", " ", "abc", "-3", "3.205", "3.", "1e3", null, undefined, NaN, Infinity, -1]) {
+    assert.equal(D.dollarsToCents(bad), null, `${String(bad)} is not a dollar amount`);
+  }
+});
+
+test("crewDrinkCostCents is exactly what crewBalances debits the drinker for a crew drink's lines", () => {
+  const lines = [
+    { bottleId: "b1", costCents: 236.593, buyerId: "p-sam", buyerName: "Sam" },
+    { bottleId: "b2", costCents: 78.864, buyerId: "p-alex", buyerName: "Alex" },
+    { bottleId: "b3", costCents: 12.5, buyerId: null, buyerName: "" }
+  ];
+  // Only lines someone bought count: 236.593 + 78.864 = 315.457 -> 315.
+  assert.equal(D.crewDrinkCostCents(lines), 315);
+  assert.equal(D.crewDrinkCostCents([]), 0);
+  assert.equal(D.crewDrinkCostCents(undefined), 0);
+  assert.equal(D.crewDrinkCostCents([{ costCents: null, buyerName: "Sam" }, { costCents: -4, buyerId: "p-sam" }]), 0);
+  const state = {
+    people,
+    ringUps: [{ id: "r1", nightId: "n1", kind: "crew", personId: "p-jordan", personName: "Jordan", voidedAt: null, lines }]
+  };
+  const jordan = D.crewBalances(state).find((entry) => entry.personId === "p-jordan");
+  assert.equal(jordan.cents, -D.crewDrinkCostCents(lines));
+});
+
+test("quickLogAmount is 1.5 oz for poured stock and 1 unit for counted stock", () => {
+  assert.equal(D.quickLogAmount(types[0]), 1.5);
+  assert.equal(D.quickLogAmount(types[3]), 1);
+  assert.equal(D.quickLogAmount({ measure: "unit" }), 1);
+  assert.equal(D.quickLogAmount(null), 1.5);
+});
+
+test("recentLogItems lists the last eight distinct bottles and menu items a person logged, newest first", () => {
+  const bottles = ["b1", "b2", "b3", "b4", "b5", "b6", "b7"].map((id) => ({ id, typeId: "t-tequila", size: 25, remaining: 10 }));
+  const menuItems = [{ id: "m1", name: "Margarita" }, { id: "m2", name: "Paloma" }, { id: "m3", name: "Shot" }];
+  const pour = (id, personId, bottleId, timestamp) => ({ id, personId, bottleId, ounces: 1, timestamp });
+  const crew = (id, personId, menuItemId, rungAt, extra = {}) => ({ id, kind: "crew", personId, menuItemId, rungAt, voidedAt: null, lines: [], ...extra });
+  const state = {
+    bottles,
+    menuItems,
+    nights: [
+      { id: "n1", pours: [pour("x1", "p-sam", "b1", "2026-09-10T20:00:00Z"), pour("x2", "p-sam", "b2", "2026-09-10T21:00:00Z"), pour("x3", "p-alex", "b3", "2026-09-10T22:00:00Z")] },
+      { id: "n2", pours: [pour("x4", "p-sam", "b1", "2026-09-12T20:00:00Z"), pour("x5", "p-sam", "b-gone", "2026-09-12T23:00:00Z")] }
+    ],
+    ringUps: [
+      crew("r1", "p-sam", "m1", "2026-09-11T20:00:00Z"),
+      crew("r2", "p-sam", "m2", "2026-09-12T21:00:00+00:00"),
+      crew("r3", "p-sam", "m3", "2026-09-13T20:00:00Z", { voidedAt: "2026-09-13T20:01:00Z" }),
+      crew("r4", "p-sam", null, "2026-09-13T21:00:00Z"),
+      { id: "g1", kind: "guest", personId: null, tabId: "t1", menuItemId: "m3", rungAt: "2026-09-14T20:00:00Z", voidedAt: null, lines: [] }
+    ]
+  };
+  assert.deepEqual(D.recentLogItems(state, "p-sam"), [
+    { kind: "menu", id: "m2" },
+    { kind: "bottle", id: "b1" },
+    { kind: "menu", id: "m1" },
+    { kind: "bottle", id: "b2" }
+  ], "voided, guest, removed-item and other people's records never count; a repeat keeps its newest place");
+  assert.deepEqual(D.recentLogItems(state, "p-alex"), [{ kind: "bottle", id: "b3" }]);
+  assert.deepEqual(D.recentLogItems(state, "p-nobody"), []);
+  assert.deepEqual(D.recentLogItems(state, ""), []);
+  assert.deepEqual(D.recentLogItems({}, "p-sam"), []);
+
+  const busy = {
+    bottles,
+    menuItems,
+    nights: [{ id: "n1", pours: bottles.map((bottle, index) => pour(`y${index}`, "p-sam", bottle.id, `2026-09-15T20:0${index}:00Z`)) }],
+    ringUps: menuItems.map((item, index) => crew(`z${index}`, "p-sam", item.id, `2026-09-15T21:0${index}:00Z`))
+  };
+  const recent = D.recentLogItems(busy, "p-sam");
+  assert.equal(recent.length, 8, "eight at most");
+  assert.deepEqual(recent.slice(0, 4), [{ kind: "menu", id: "m3" }, { kind: "menu", id: "m2" }, { kind: "menu", id: "m1" }, { kind: "bottle", id: "b7" }]);
+  assert.equal(D.recentLogItems(busy, "p-sam", 3).length, 3, "the limit can be set");
+});
+
+test("balanceChangesOnRemoval names everyone whose balance would move if a person left the roster (0.5.7, KTD9)", () => {
+  const roster = [...people, { id: "p-casey", name: "Casey" }];
+  const pour = (id, personId, buyerId, buyerName, costCents) => ({ id, personId, bottleId: "b", ounces: 1, abv: 40, timestamp: "t", costCents, buyerId, buyerName });
+  const payment = (id, fromPersonId, fromName, toPersonId, toName, amountCents) => ({ id, fromPersonId, fromName, toPersonId, toName, amountCents, paidAt: "t", voidedAt: null });
+
+  // Casey drank 207c of Sam's bottle and paid Sam back: Casey reads 0, but removing Casey
+  // deletes the pour (the database cascades pours), which would leave Sam 207c short.
+  const drankAndPaid = {
+    people: roster,
+    nights: [{ id: "n1", pours: [pour("x1", "p-casey", "p-sam", "Sam", 207)] }],
+    payments: [payment("pay1", "p-casey", "Casey", "p-sam", "Sam", 207)]
+  };
+  assert.equal(D.crewBalances(drankAndPaid).find((entry) => entry.personId === "p-casey").cents, 0);
+  assert.deepEqual(D.balanceChangesOnRemoval(drankAndPaid, "p-casey"), [{ personId: "p-sam", name: "Sam", beforeCents: 0, afterCents: -207 }]);
+
+  // Alex drank from Casey's bottle and paid Casey: the pour and payment stay under Casey's
+  // name snapshot, so nobody else moves and Casey can go.
+  const boughtAndWasPaid = {
+    people: roster,
+    nights: [{ id: "n1", pours: [pour("x1", "p-alex", "p-casey", "Casey", 320), pour("x2", "p-casey", "p-casey", "Casey", 100)] }],
+    payments: [payment("pay1", "p-alex", "Alex", "p-casey", "Casey", 320)],
+    ringUps: [{ id: "r1", kind: "crew", personId: "p-casey", personName: "Casey", voidedAt: null, lines: [{ costCents: 50, buyerId: "p-casey", buyerName: "Casey" }] }],
+    guestTabs: []
+  };
+  assert.deepEqual(D.balanceChangesOnRemoval(boughtAndWasPaid, "p-casey"), []);
+  assert.deepEqual(D.balanceChangesOnRemoval({ people: roster }, "p-casey"), []);
+  assert.deepEqual(D.balanceChangesOnRemoval({}, "p-casey"), []);
+  assert.equal(drankAndPaid.nights[0].pours.length, 1, "the input state is not changed");
+});
+
+test("balanceChangesOnRemoval sees a shift that lands on somebody already off the roster (0.5.7, KTD9)", () => {
+  const roster = [...people, { id: "p-casey", name: "Casey" }];
+  // Erin left at $0.00; her name stays on the stock she bought. Casey drinks 1840c of it,
+  // so Casey reads -1840 and Erin +1840 under her snapshot alone.
+  const pours = [{ id: "x1", personId: "p-casey", personName: "Casey", bottleId: "b", ounces: 1, abv: 40, timestamp: "t", costCents: 1840, buyerId: null, buyerName: "Erin" }];
+  const state = { people: roster, nights: [{ id: "n1", pours }] };
+  assert.deepEqual(
+    D.crewBalances(state).filter((entry) => entry.cents !== 0),
+    [{ personId: "p-casey", name: "Casey", cents: -1840 }, { personId: null, name: "Erin", cents: 1840 }]
+  );
+  // Removing Casey deletes the pour, which takes Erin's 1840c credit with it — a shift
+  // nobody authorised, on a party with no id at all.
+  assert.deepEqual(
+    D.balanceChangesOnRemoval(state, "p-casey"),
+    [{ personId: null, name: "Erin", beforeCents: 1840, afterCents: 0 }]
+  );
+  // A crew ring-up is not deleted with its drinker, only unlinked, and it keeps the
+  // name it was rung up under — so the same drink as a ring-up moves nobody.
+  const rung = {
+    people: roster,
+    ringUps: [{ id: "r1", kind: "crew", personId: "p-casey", personName: "Casey", voidedAt: null, lines: [{ costCents: 500, buyerId: null, buyerName: "Erin" }] }]
+  };
+  assert.deepEqual(D.balanceChangesOnRemoval(rung, "p-casey"), []);
+});
+
+test("nightRecap groups one night's drinks by who drank them, with the cents each one charges (0.4.3)", () => {
+  const roster = [...people, { id: "p-casey", name: "Casey" }];
+  const bottles = [
+    { id: "b-rye", typeId: "t-tequila", size: 25, remaining: 20, price: 40, buyerId: "p-sam" },
+    { id: "b-lager", typeId: "t-lager", size: 12, remaining: 10, price: 24, buyerId: "p-alex" },
+    { id: "b-nobody", typeId: "t-tequila", size: 25, remaining: 25, price: 50, buyerId: "" }
+  ];
+  const pour = (id, personId, bottleId, amount, at, extra = {}) => Object.assign(
+    { id, personId, bottleId, ounces: amount, abv: 40, timestamp: at, costCents: null, buyerId: null, buyerName: "" },
+    extra
+  );
+  const line = (typeId, amount, costCents, buyerId, buyerName) => ({ typeId, amount, abv: 40, costCents, buyerId, buyerName });
+  const crew = (id, nightId, personId, personName, menuItemName, at, lines, extra = {}) => Object.assign(
+    { id, nightId, kind: "crew", personId, personName, menuItemId: "m1", menuItemName, rungAt: at, voidedAt: null, lines },
+    extra
+  );
+
+  const state = {
+    people: roster,
+    types,
+    bottles,
+    nights: [
+      {
+        id: "n1",
+        kind: "crew",
+        pours: [
+          // Alex drinks 1.5 oz of Sam's rye: 160c an ounce, so 240c to Sam.
+          pour("po1", "p-alex", "b-rye", 1.5, "2026-09-17T20:00:00Z", { costCents: 240, buyerId: "p-sam", buyerName: "Sam" }),
+          // One counted lager: 200c to Alex, who bought it, so it nets to nothing.
+          pour("po2", "p-alex", "b-lager", 1, "2026-09-17T22:00:00Z", { costCents: 200, buyerId: "p-alex", buyerName: "Alex" }),
+          // Nobody bought this bottle, so the pour charges nobody at all.
+          pour("po3", "p-jordan", "b-nobody", 2, "2026-09-17T21:00:00Z", { costCents: 400 })
+        ]
+      },
+      { id: "n2", kind: "crew", pours: [pour("po4", "p-sam", "b-rye", 3, "2026-09-16T20:00:00Z", { costCents: 480, buyerId: "p-sam", buyerName: "Sam" })] }
+    ],
+    ringUps: [
+      crew("r1", "n1", "p-jordan", "Jordan", "Margarita", "2026-09-17T21:30:00Z", [line("t-tequila", 2, 320, "p-sam", "Sam"), line("t-lime", 1, 12, "p-jordan", "Jordan")]),
+      crew("r2", "n1", "p-alex", "Alex", "Voided one", "2026-09-17T23:00:00Z", [line("t-tequila", 2, 320, "p-sam", "Sam")], { voidedAt: "2026-09-17T23:01:00Z" }),
+      crew("r3", "n2", "p-casey", "Casey", "Other night", "2026-09-16T21:00:00Z", [line("t-tequila", 2, 320, "p-sam", "Sam")]),
+      { id: "g1", nightId: "n1", kind: "guest", tabId: "tab1", personId: null, personName: "", menuItemName: "Guest drink", rungAt: "2026-09-17T20:30:00Z", voidedAt: null, lines: [line("t-tequila", 2, 320, "p-sam", "Sam")] }
+    ],
+    guestTabs: [],
+    payments: []
+  };
+
+  const recap = D.nightRecap(state, "n1");
+  assert.deepEqual(recap.map((entry) => entry.name), ["Alex", "Jordan"], "roster order, and only people who drank that night");
+
+  const alex = recap[0];
+  assert.deepEqual(alex.drinks.map((drink) => [drink.kind, drink.id, drink.costCents]), [["pour", "po1", 240], ["pour", "po2", 200]], "oldest first; the voided ring-up is gone");
+  assert.equal(alex.drinks[0].bottleId, "b-rye");
+  assert.equal(alex.drinks[0].typeId, "t-tequila");
+  assert.equal(alex.drinks[0].amount, 1.5);
+  assert.equal(alex.drinks[0].ounces, 1.5);
+  assert.equal(alex.drinks[1].ounces, 12, "a counted unit measures as its unit volume");
+  assert.equal(alex.costCents, 440);
+  assert.equal(alex.ounces, 13.5);
+
+  const jordan = recap[1];
+  assert.deepEqual(jordan.drinks.map((drink) => [drink.kind, drink.id, drink.costCents]), [["pour", "po3", null], ["ringUp", "r1", 332]], "a pour of nobody's bottle charges nobody");
+  assert.equal(jordan.drinks[1].name, "Margarita");
+  assert.equal(jordan.drinks[1].menuItemId, "m1");
+  assert.equal(jordan.drinks[1].ounces, 3, "the ring-up's lines measured together");
+  assert.equal(jordan.costCents, 332, "an uncharged drink adds nothing to the total");
+  assert.equal(jordan.ounces, 5);
+
+  // What the recap says each person was charged is exactly what crewBalances took off them.
+  const oneNight = Object.assign({}, state, { nights: [state.nights[0]], ringUps: state.ringUps.filter((entry) => entry.nightId === "n1") });
+  const owed = Object.fromEntries(D.crewBalances(oneNight).map((entry) => [entry.name, entry.cents]));
+  assert.equal(owed.Alex, -240, "Alex is charged 440c and credited 200c for their own lager");
+  assert.equal(owed.Jordan, -320, "Jordan is charged 332c and credited 12c for their own lime");
+
+  assert.deepEqual(D.nightRecap(state, "n2").map((entry) => [entry.name, entry.drinks.length]), [["Sam", 1], ["Casey", 1]]);
+  assert.deepEqual(D.nightRecap(state, "missing"), []);
+  assert.deepEqual(D.nightRecap({}, "n1"), []);
+  assert.deepEqual(D.nightRecap(), []);
+  assert.equal(state.nights[0].pours.length, 3, "the input state is not changed");
+});
+
+test("nightRecap keeps a drinker who has left the roster, after everyone still on it (0.4.3)", () => {
+  const state = {
+    people: [{ id: "p-sam", name: "Sam" }],
+    types,
+    bottles: [],
+    nights: [{ id: "n1", kind: "crew", pours: [] }],
+    ringUps: [
+      { id: "r1", nightId: "n1", kind: "crew", personId: null, personName: "Zoe", menuItemName: "Shot", rungAt: "2026-09-17T20:00:00Z", voidedAt: null, lines: [{ typeId: "t-tequila", amount: 1.5, abv: 40, costCents: 100, buyerId: "p-sam", buyerName: "Sam" }] },
+      { id: "r2", nightId: "n1", kind: "crew", personId: null, personName: "Ada", menuItemName: "Shot", rungAt: "2026-09-17T21:00:00Z", voidedAt: null, lines: [{ typeId: "t-tequila", amount: 1.5, abv: 40, costCents: 100, buyerId: "p-sam", buyerName: "Sam" }] },
+      { id: "r3", nightId: "n1", kind: "crew", personId: "p-sam", personName: "Sam", menuItemName: "Shot", rungAt: "2026-09-17T22:00:00Z", voidedAt: null, lines: [{ typeId: "t-tequila", amount: 1.5, abv: 40, costCents: 100, buyerId: "p-sam", buyerName: "Sam" }] }
+    ]
+  };
+  assert.deepEqual(D.nightRecap(state, "n1").map((entry) => [entry.name, entry.personId]), [["Sam", "p-sam"], ["Ada", null], ["Zoe", null]], "the roster first, then anyone removed since, by name");
 });
