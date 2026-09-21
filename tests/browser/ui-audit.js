@@ -121,7 +121,11 @@ function auditInPage() {
       const needed = textWidth(el, content) + (tag === "select" ? 22 : 2);
 
       if (content && inner > 0 && needed > inner + 2) {
-        push({ kind: "field-too-small", where: path(el), text: label(el),
+        // A select and an input fail differently. A truncated input hides what
+        // you typed and you cannot get it back on screen; a truncated select
+        // only shortens the closed label, because the native popup renders every
+        // option at full width. Same measurement, different severity.
+        push({ kind: tag === "select" ? "select-label-truncated" : "field-too-small", where: path(el), text: label(el),
           detail: `"${content}" needs about ${Math.round(needed)}px but the field gives ${Math.round(inner)}px` });
       }
       // A field far wider than anything it can hold reads as a mistake.
@@ -245,10 +249,16 @@ const screens = [
   }
 ];
 
+// Desktop, the awkward middle, tablet, and the phone sizes people actually hold.
+// 320 is the narrowest screen still in use and the one everything breaks on first.
 const widths = [
   { label: "1440", viewport: { width: 1440, height: 1000 } },
   { label: "1024", viewport: { width: 1024, height: 900 } },
-  { label: "400", viewport: { width: 400, height: 900 } }
+  { label: "768", viewport: { width: 768, height: 1024 } },
+  { label: "430", viewport: { width: 430, height: 932 } },
+  { label: "390", viewport: { width: 390, height: 844 } },
+  { label: "360", viewport: { width: 360, height: 800 } },
+  { label: "320", viewport: { width: 320, height: 568 } }
 ];
 
 async function main() {
@@ -285,7 +295,7 @@ async function main() {
     grouped.get(key).screens.add(f.screen);
   }
 
-  const order = ["page-error", "audit-failed", "page-scrolls-sideways", "text-clipped", "spills-parent", "field-too-small", "field-oversized", "row-uneven"];
+  const order = ["page-error", "audit-failed", "page-scrolls-sideways", "text-clipped", "spills-parent", "field-too-small", "field-oversized", "row-uneven", "select-label-truncated"];
   const rows = Array.from(grouped.values()).sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind));
 
   console.log(`UI audit against ${baseUrl}\n${"=".repeat(60)}`);

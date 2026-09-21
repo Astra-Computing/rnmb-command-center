@@ -10,6 +10,8 @@
   --accent-2: #22c55e;
   --blue: #38bdf8;
   --red: #ef4444;
+  /* Owing money reads as a light red, not a caution yellow. */
+  --red-soft: #fca5a5;
   --yellow: #facc15;
   --shadow: 0 20px 60px rgba(0, 0, 0, 0.28);
 }
@@ -430,6 +432,32 @@ small,
 .inventory-card header > *,
 .inventory-card .person-copy {
   min-width: 0;
+}
+
+/* The type name on the first line, the bottle's nickname on the second, each
+   kept to one line. They were inline in an unstyled div, so they ran together
+   and wrapped wherever the card happened to end. */
+.stock-identity {
+  display: grid;
+  gap: 2px;
+  /* Takes the room the ABV pill leaves and truncates inside it; without an
+     explicit basis it kept a slice of its own content width and pushed the
+     pill past the header's edge. */
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.inventory-card header > .pill {
+  flex: 0 0 auto;
+}
+
+.stock-identity strong,
+.stock-identity small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .inventory-card header,
@@ -1114,7 +1142,7 @@ body.is-register .app-shell {
 }
 
 .balance-row.is-owes {
-  border-left-color: var(--yellow);
+  border-left-color: var(--red-soft);
 }
 
 .balance-row .person-copy strong,
@@ -1140,7 +1168,7 @@ body.is-register .app-shell {
 }
 
 .is-owes .balance-amount {
-  color: var(--yellow);
+  color: var(--red-soft);
 }
 
 .is-square .balance-amount {

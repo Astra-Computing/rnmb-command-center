@@ -4036,6 +4036,95 @@ const scenarios = [
         await session.close();
       }
     }
+  },
+  {
+    name: "Inventory shows the type on the first line and the nickname on the second, neither wrapping",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await page.click('.tab-button[data-tab="inventory"]');
+        const identity = page.locator("#inventoryList .stock-identity").first();
+        await identity.waitFor();
+
+        const shape = await identity.evaluate((el) => {
+          const name = el.querySelector("strong");
+          const nick = el.querySelector("small");
+          const box = (node) => { const r = node.getBoundingClientRect(); return { top: Math.round(r.top), bottom: Math.round(r.bottom), height: Math.round(r.height) }; };
+          const style = (node) => { const s = getComputedStyle(node); return { whiteSpace: s.whiteSpace, overflow: s.overflow, textOverflow: s.textOverflow, lineHeight: s.lineHeight }; };
+          return { name: { text: name.textContent, ...box(name), ...style(name) }, nick: { text: nick.textContent, ...box(nick), ...style(nick) } };
+        });
+
+        assert.equal(shape.name.text, "House Bourbon");
+        assert.equal(shape.nick.text, "The Briefing Bottle");
+        assert.ok(shape.nick.top >= shape.name.bottom - 1,
+          `the nickname sits below the name (name bottom ${shape.name.bottom}, nickname top ${shape.nick.top})`);
+        for (const part of ["name", "nick"]) {
+          assert.equal(shape[part].whiteSpace, "nowrap", `${part} does not wrap`);
+          assert.equal(shape[part].textOverflow, "ellipsis", `${part} truncates rather than wrapping`);
+        }
+
+        // A long name must still hold one line each rather than growing the card.
+        await page.evaluate(() => {
+          const r = window.__rnmb;
+          const type = r.state.types.find((t) => t.name === "House Bourbon");
+          type.name = "Extremely Overlong Small Batch Bourbon Whiskey Reserve";
+          const bottle = r.state.bottles.find((b) => b.nickname === "The Briefing Bottle");
+          bottle.nickname = "The Briefing Bottle That Nobody Could Ever Name Briefly";
+          r.render();
+        });
+        const after = await identity.evaluate((el) => {
+          const lines = Array.from(el.children).map((node) => Math.round(node.getBoundingClientRect().height));
+          const card = el.closest(".inventory-card");
+          return { lines, cardOverflows: card.scrollWidth > card.clientWidth + 1 };
+        });
+        assert.equal(after.lines.length, 2, "still exactly two lines");
+        assert.equal(after.cardOverflows, false, "and the card does not overflow");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+  {
+    name: "A crew member who owes money reads in light red, not caution yellow",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        // Casey drinks Alex's bourbon, so Casey owes and Alex is owed.
+        await quickLog(session, "Casey", "The Briefing Bottle", "Logged 1.5 oz of The Briefing Bottle for Casey · $2.07 at cost.");
+        await page.click('.tab-button[data-tab="ledger"]');
+
+        const colours = await page.evaluate(() => {
+          const read = (who) => {
+            const row = Array.from(document.querySelectorAll("#balanceList .balance-row"))
+              .find((entry) => entry.dataset.balancePerson === who);
+            if (!row) return null;
+            return {
+              classes: row.className,
+              amount: getComputedStyle(row.querySelector("[data-balance-amount]")).color,
+              border: getComputedStyle(row).borderLeftColor
+            };
+          };
+          return { owes: read("Casey"), owed: read("Alex") };
+        });
+
+        const YELLOW = "rgb(250, 204, 21)";
+        const LIGHT_RED = "rgb(252, 165, 165)";
+        assert.ok(colours.owes.classes.includes("is-owes"), `Casey owes: ${colours.owes.classes}`);
+        assert.equal(colours.owes.amount, LIGHT_RED, "the amount owed is light red");
+        assert.equal(colours.owes.border, LIGHT_RED, "and so is the row's edge");
+        assert.notEqual(colours.owes.amount, YELLOW, "not the caution yellow it used to be");
+
+        // Being owed is unchanged, so the two states stay distinguishable.
+        assert.ok(colours.owed.classes.includes("is-owed"), `Alex is owed: ${colours.owed.classes}`);
+        assert.equal(colours.owed.amount, "rgb(34, 197, 94)", "being owed stays green");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
   }
 ];
 

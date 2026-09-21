@@ -2397,7 +2397,7 @@ function renderInventory() {
       card.dataset.bottleId = bottle.id;
       card.innerHTML = `
         <header>
-          <div>
+          <div class="stock-identity">
             <strong>${escapeHtml(type?.name || "Unknown")}</strong>
             <small>${escapeHtml(bottle.nickname || type?.category || "Stock")}</small>
           </div>
