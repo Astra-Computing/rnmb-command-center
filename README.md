@@ -6,11 +6,10 @@ A dependency-free dashboard for tracking group beverage inventory, spending, nig
 
 - Shared Supabase persistence for people, beverage types, bottle purchases, and night logs
 - U.S. standard drink calculations using fluid ounces and ABV
-- Every volume can be typed in millilitres instead — `750 ml`, `44ml`, `3cl`, `1 L` — and is stored in ounces
+- Every volume field has a unit dropdown (oz, ml, cl, L) beside it and is stored in ounces; a unit typed into the box wins over the dropdown
 - One running balance per person: every drink costs the drinker what it drew, and credits whoever bought it
 - Quick log: two taps on a phone to record a drink, and an end-of-night recap to fix what was missed
 - Inventory depletion tracking when pours are logged
-- Responsible-use pace checks and hydration reminders
 - JSON export/import for backup or migration
 - Host mode: a bar register for nights with guests, with a menu, recipes, guest tabs and cost-plus-markup prices
 
@@ -95,7 +94,7 @@ Host mode replaces a flat cover charge with a tab per guest.
 
 1. **Inventory**: add stock types. Choose *Poured, ounces* for spirits, liqueurs and fluid mixers (mixers use ABV 0) or *Counted, units* for cans and bottled drinks (give the volume of one unit). Then add the stock you bought, with its price and who paid.
 
-   Anywhere a **volume** is asked for — a bottle's size, a pour, a recipe ingredient, a unit's volume, or setting a level by hand — you can type the unit and it converts: `750 ml` for a bottle, `44 ml` for a shot, `3cl`, `1 L`. A bare number still means ounces, so nothing you already know how to type has changed. The one exception is the **count** of counted stock (how many cans you bought), which is a number of units and not a volume.
+   Anywhere a **volume** is asked for — a bottle's size, a pour, a recipe ingredient, a unit's volume, or setting a level by hand — the box takes a number and the **dropdown beside it** takes the unit: oz, ml, cl or L. Type `750`, pick `ml`, and it stores 25.36 oz. If you paste a unit into the box instead (`750 ml`), that wins over the dropdown. The one exception is the **count** of counted stock (how many cans you bought), which is a number of units and not a volume, so it has no dropdown at all.
 2. **Menu**: build cocktails, straight pours and counted items from those types, and set the markup percentage and the rounding step. Each item shows the price it would ring up at right now, or *Unavailable* when stock can't cover it.
 3. **Tonight**: start a night and choose *Host night*, then follow *Open register*.
 

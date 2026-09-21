@@ -1176,7 +1176,7 @@ const scenarios = [
         await fillIngredientRow(page, 1, { typeId: tripleSec.id, amount: 1 });
         await page.click("#addIngredientRow");
         await fillIngredientRow(page, 2, { typeId: lime.id, amount: 1 });
-        assert.equal((await page.locator("#ingredientRows [data-amount-label]").nth(0).textContent()).trim(), "Amount oz");
+        assert.equal((await page.locator("#ingredientRows [data-amount-label]").nth(0).textContent()).trim(), "Amount", "the unit lives in the dropdown now, not the label");
         await clickForToast(session, "#menuItemSubmit", "Menu item added.");
 
         const saved = await page.evaluate(() => window.__rnmb.state.menuItems.find((item) => item.name === "Margarita"));
@@ -1332,7 +1332,7 @@ const scenarios = [
         assert.equal(await page.inputValue("#menuItemForm [name='kind']"), "straight");
         const row = page.locator("#ingredientRows [data-ingredient-row]");
         assert.equal(await row.count(), 1);
-        assert.equal(await row.nth(0).locator("select").inputValue(), original.ingredients[0].typeId);
+        assert.equal(await row.nth(0).locator("select[name='ingredientType']").inputValue(), original.ingredients[0].typeId);
         assert.equal(await row.nth(0).locator("input[name='ingredientAmount']").inputValue(), "2");
 
         await page.fill("#menuItemForm [name='name']", "Bourbon Short");
@@ -2398,7 +2398,7 @@ const scenarios = [
   },
 
   {
-    name: "Review #2 shared database: night, hydration and host-night saves never send pricing, and a pricing save sends only pricing",
+    name: "Review #2 shared database: night and host-night saves never send pricing or responsible_mode, and a pricing save sends only pricing",
     async run({ browser }) {
       const { ids, seed } = hostModeSeed();
       const stub = hostModeStub(seed);
@@ -2423,15 +2423,13 @@ const scenarios = [
         assert.equal(stub.store.rnmb_settings[0].active_night_id, ids.nightOne);
         assert.equal(Number(stub.store.rnmb_settings[0].markup_percent), 50, "the other device's markup survives a night switch");
 
-        start = stub.log.length;
-        await page.evaluate(() => {
-          const toggle = document.querySelector("#responsibleMode");
-          toggle.checked = false;
-          toggle.dispatchEvent(new Event("change", { bubbles: true }));
-        });
-        await session.waitForToast("Hydration reminders muted.");
-        settingsWritesSince(start).forEach((entry) => assert.deepEqual(settingsKeys(entry).filter((key) => PRICING.includes(key)), [], "the hydration toggle sent no pricing"));
-        assert.equal(stub.store.rnmb_settings[0].responsible_mode, false);
+        // Hydration reminders were removed, so nothing writes responsible_mode any
+        // more. The column keeps whatever it held; the client never sends it.
+        assert.equal(await page.locator("#responsibleMode").count(), 0, "the hydration toggle is gone");
+        settingsWritesSince(0).forEach((entry) => assert.ok(
+          !settingsKeys(entry).includes("responsible_mode"),
+          `no settings write sends responsible_mode: ${JSON.stringify(entry.body)}`
+        ));
 
         start = stub.log.length;
         await page.fill("#nightForm [name='name']", "Night Three");
@@ -3867,36 +3865,55 @@ const scenarios = [
       try {
         const tequila = await page.evaluate(() => window.__rnmb.state.types.find((type) => type.name === "Emergency Tequila").id);
 
-        // 1. Stock size: the bottle is labelled 750 ml, so that is what gets typed.
-        const metric = await addStockViaForm(session, { typeId: tequila, nickname: "Metric bottle", size: "750 ml" });
-        assert.equal(metric.size, 25.36, "750 ml is stored as 25.36 oz");
+        // 1. Stock size: type the number, pick the unit beside it.
+        await page.click('.tab-button[data-tab="inventory"]');
+        await page.selectOption("#bottleForm [name='typeId']", tequila);
+        await page.fill("#bottleForm [name='nickname']", "Metric bottle");
+        await page.fill("#bottleForm [name='sizeOz']", "750");
+        await page.selectOption("#bottleForm [name='sizeOzUnit']", "ml");
+        await clickForToast(session, "#bottleForm button[type='submit']", "Bottle added to inventory.");
+        const metric = await page.evaluate(() => window.__rnmb.state.bottles.find((b) => b.nickname === "Metric bottle"));
+        assert.ok(metric, "the metric bottle was saved");
+        assert.equal(metric.size, 25.36, "750 picked as ml is stored as 25.36 oz");
         assert.equal(metric.remaining, 25.36);
 
         // 2. A pour in millilitres comes off the same bottle in ounces.
         await page.click('.tab-button[data-tab="tonight"]');
         await page.selectOption("#pourForm [name='personId']", await personIdOf(page, "Sam"));
         await page.selectOption("#pourForm [name='bottleId']", metric.id);
-        await page.fill("#pourForm [name='ounces']", "44 ml");
+        await page.fill("#pourForm [name='ounces']", "44");
+        await page.selectOption("#pourForm [name='ouncesUnit']", "ml");
         await clickForToast(session, "#pourForm button[type='submit']", "Pour logged.");
         assert.equal(await stockOf(page, metric.id), 23.87, "44 ml is 1.49 oz off a 25.36 oz bottle");
 
         // 3. Set level, judged against the label rather than converted by hand.
         await page.click('.tab-button[data-tab="inventory"]');
-        await page.fill(`#inventoryList [data-level-form="${metric.id}"] [name='level']`, "500 ml");
+        await page.fill(`#inventoryList [data-level-form="${metric.id}"] [name='level']`, "500");
+        await page.selectOption(`#inventoryList [data-level-form="${metric.id}"] [name='levelUnit']`, "ml");
         await clickForToast(session, `#inventoryList [data-level-form="${metric.id}"] button[type='submit']`, "Stock level set.");
         assert.equal(await stockOf(page, metric.id), 16.91, "500 ml is 16.91 oz");
 
         // 4. A counted type's unit volume is a volume: a can is labelled 355 ml.
-        const can = await addTypeViaForm(session, { name: "Metric can", category: "Beer", measure: "unit", unitOz: "355 ml", abv: 5 });
-        assert.equal(can.unitOz, 12, "355 ml is 12 oz per unit");
+        await page.click('.tab-button[data-tab="inventory"]');
+        await page.fill("#typeForm [name='name']", "Metric can");
+        await page.selectOption("#typeForm [name='category']", "Beer");
+        await page.selectOption("#typeForm [name='measure']", "unit");
+        await page.fill("#typeForm [name='unitOz']", "355");
+        await page.selectOption("#typeForm [name='unitOzUnit']", "ml");
+        await page.fill("#typeForm [name='abv']", "5");
+        await clickForToast(session, "#typeForm button[type='submit']", "Beverage type added.");
+        const can = await page.evaluate(() => window.__rnmb.state.types.find((x) => x.name === "Metric can"));
+        assert.equal(can.unitOz, 12, "355 picked as ml is 12 oz per unit");
 
         // 5. But the COUNT of those cans is a count, not a volume: the field stays
         //    a number input, so "12 ml" cannot even be typed into it.
         await page.click('.tab-button[data-tab="inventory"]');
         await page.selectOption("#bottleForm [name='typeId']", can.id);
         assert.equal(await page.locator("#bottleForm [name='sizeOz']").getAttribute("type"), "number", "a counted size keeps the number spinner");
+        assert.equal(await page.locator("#bottleForm [name='sizeOzUnit']").isHidden(), true, "and offers no unit dropdown -- a count is not a volume");
         await page.selectOption("#bottleForm [name='typeId']", tequila);
-        assert.equal(await page.locator("#bottleForm [name='sizeOz']").getAttribute("type"), "text", "a poured size takes typed units");
+        assert.equal(await page.locator("#bottleForm [name='sizeOz']").getAttribute("type"), "text", "a poured size is a volume");
+        assert.equal(await page.locator("#bottleForm [name='sizeOzUnit']").isVisible(), true, "so its unit dropdown comes back");
 
         // 6. A recipe ingredient in millilitres.
         await page.click('.tab-button[data-tab="menu"]');
@@ -3904,19 +3921,116 @@ const scenarios = [
         await page.selectOption("#menuItemForm [name='kind']", "straight");
         const row = page.locator("#ingredientRows [data-ingredient-row]").first();
         await row.locator("select[name='ingredientType']").selectOption(tequila);
-        await row.locator("input[name='ingredientAmount']").fill("44 ml");
+        await row.locator("input[name='ingredientAmount']").fill("44");
+        await row.locator("select[name='ingredientAmountUnit']").selectOption("ml");
         await clickForToast(session, "#menuItemSubmit", "Menu item added.");
         const saved = await page.evaluate(() => window.__rnmb.state.menuItems.find((item) => item.name === "Metric shot"));
         assert.equal(saved.ingredients[0].amount, 1.49, "the recipe stores 1.49 oz");
 
-        // 7. Nonsense is refused rather than guessed at, and nothing is saved.
+        // 7. A unit typed into the box still wins over the dropdown.
+        await page.click('.tab-button[data-tab="inventory"]');
+        await page.selectOption("#bottleForm [name='typeId']", tequila);
+        await page.fill("#bottleForm [name='nickname']", "Pasted bottle");
+        await page.fill("#bottleForm [name='sizeOz']", "1 L");
+        await page.selectOption("#bottleForm [name='sizeOzUnit']", "oz");
+        await clickForToast(session, "#bottleForm button[type='submit']", "Bottle added to inventory.");
+        const pasted = await page.evaluate(() => window.__rnmb.state.bottles.find((b) => b.nickname === "Pasted bottle"));
+        assert.equal(pasted.size, 33.81, "\"1 L\" typed in the box beats the dropdown saying oz");
+
+        // 8. Nonsense is refused rather than guessed at, and nothing is saved.
         await page.click('.tab-button[data-tab="inventory"]');
         await page.selectOption("#bottleForm [name='typeId']", tequila);
         await page.fill("#bottleForm [name='nickname']", "Bad units");
         await page.fill("#bottleForm [name='sizeOz']", "5 gallons");
-        await clickForToast(session, "#bottleForm button[type='submit']", "Pick a type and a size above zero. A size can be ounces or millilitres, like 750 ml.");
+        await clickForToast(session, "#bottleForm button[type='submit']", "Pick a type and a size above zero.");
         assert.equal(await page.evaluate(() => window.__rnmb.state.bottles.some((entry) => entry.nickname === "Bad units")), false, "nothing was saved");
 
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+  {
+    name: "A crew member's initials stay readable on any colour, light or dark",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        // A very dark colour is the case a fixed dark ink got wrong.
+        await page.click('.tab-button[data-tab="crew"]');
+        await page.fill("#personForm [name='name']", "Midnight");
+        await page.evaluate(() => {
+          const input = document.querySelector("#personForm [name='color']");
+          input.value = "#1e3a8a";
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await clickForToast(session, "#personForm button[type='submit']", "Person added to the roster.");
+
+        await page.fill("#personForm [name='name']", "Daylight");
+        await page.evaluate(() => {
+          const input = document.querySelector("#personForm [name='color']");
+          input.value = "#facc15";
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await clickForToast(session, "#personForm button[type='submit']", "Person added to the roster.");
+
+        const inkFor = (name) => page.evaluate((who) => {
+          const card = Array.from(document.querySelectorAll("#personList .person-card"))
+            .find((entry) => entry.textContent.includes(who));
+          const avatar = card && card.querySelector(".avatar");
+          return avatar ? getComputedStyle(avatar).color : null;
+        }, name);
+
+        assert.equal(await inkFor("Midnight"), "rgb(255, 255, 255)", "white initials on a dark navy");
+        assert.equal(await inkFor("Daylight"), "rgb(17, 17, 17)", "dark initials on a bright yellow");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+  {
+    name: "The register stacks its three dependent steps in one column and keeps anytime work in the other",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await startHostNightViaForm(session, "Layout night");
+        await openRegister(session);
+
+        const box = (selector) => page.locator(selector).boundingBox();
+        const menu = await box(".register-menu-panel");
+        const target = await box(".register-target-panel");
+        const pour = await box(".register-pour-panel");
+        const tabs = await box(".register-tabs-panel");
+
+        // 1 -> 2 -> 3 read downwards, each below the last, all in the same column.
+        assert.ok(menu.y < target.y, `1. Drink sits above 2. For (${menu.y} vs ${target.y})`);
+        assert.ok(target.y < pour.y, `2. For sits above 3. Pour from (${target.y} vs ${pour.y})`);
+        assert.equal(Math.round(menu.x), Math.round(target.x), "1 and 2 share a column");
+        assert.equal(Math.round(menu.x), Math.round(pour.x), "and so does 3");
+
+        // Open tabs is anytime work, so it sits beside the sequence, not inside it.
+        assert.ok(tabs.x > menu.x + menu.width - 1, `open tabs is in the other column (${tabs.x} vs ${menu.x + menu.width})`);
+        assert.ok(tabs.y <= target.y, "and starts alongside the sequence rather than after it");
+
+        // Each step says what it is for.
+        const notes = await page.locator("#registerWork .step-note").allTextContents();
+        assert.ok(notes.length >= 3, `every step carries a note, got ${notes.length}`);
+        assert.ok(notes.some((note) => note.includes("charged at cost")), "the For step explains the two kinds of target");
+
+        // On a phone the same order survives as one column.
+        await page.setViewportSize({ width: 400, height: 900 });
+        const narrow = {
+          menu: await box(".register-menu-panel"),
+          target: await box(".register-target-panel"),
+          pour: await box(".register-pour-panel"),
+          tabs: await box(".register-tabs-panel")
+        };
+        assert.ok(narrow.menu.y < narrow.target.y && narrow.target.y < narrow.pour.y && narrow.pour.y < narrow.tabs.y,
+          "at 400px the panels stack 1, 2, 3, then the anytime column");
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, "and nothing scrolls sideways");
         session.assertClean();
       } finally {
         await session.close();

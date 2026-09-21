@@ -59,7 +59,6 @@ const demoData = () => {
     nights: [{ id: nightId, name: "Friday Recon", date: today(), kind: "crew", endedAt: null, pours: [] }],
     menuItems,
     activeNightId: nightId,
-    responsibleMode: true
   });
 };
 
@@ -1006,7 +1005,6 @@ function createSupabaseRepository(config) {
           voidedAt: payment.voided_at
         })),
         activeNightId: settings.active_night_id || nights[0]?.id || "",
-        responsibleMode: settings.responsible_mode !== false,
         markupPercent: settings.markup_percent,
         roundingIncrementCents: settings.rounding_increment_cents
       });
@@ -1127,8 +1125,8 @@ function createSupabaseRepository(config) {
       }
       await saveSettings(nextState);
     },
-    async updateSettings(nextState, columns = ["active_night_id", "responsible_mode"]) {
-      await saveSettingsColumns(nextState, columns.filter((column) => ["active_night_id", "responsible_mode"].includes(column)));
+    async updateSettings(nextState, columns = ["active_night_id"]) {
+      await saveSettingsColumns(nextState, columns.filter((column) => ["active_night_id"].includes(column)));
     },
     async addPerson(person) {
       await insertRow("rnmb_people", {
@@ -1624,12 +1622,6 @@ function unassignedSpend() {
     .reduce((sum, bottle) => sum + Number(bottle.price || 0), 0);
 }
 
-function statusForDrinks(drinks) {
-  if (drinks >= 4) return { label: "Water order", className: "hot", meta: "Hydration desk is opening a case file." };
-  if (drinks >= 2.5) return { label: "Pace check", className: "warn", meta: "Snack bureau recommends a pause." };
-  return { label: "Green", className: "", meta: "Within dashboard comfort range." };
-}
-
 function setOptions(select, items, labeler, emptyLabel) {
   select.innerHTML = "";
   if (!items.length && emptyLabel) {
@@ -1666,7 +1658,6 @@ function renderTopline() {
   const night = activeNight();
   document.querySelector("#activeNightName").textContent = night?.name || "No active night";
   document.querySelector("#activeNightMeta").textContent = night ? `${night.date} · ${nightPourCount(night)} pours logged` : "Create a night log to start tracking pours.";
-  document.querySelector("#responsibleMode").checked = state.responsibleMode;
   const syncStatus = document.querySelector("#syncStatus");
   if (syncMode === "supabase") {
     const stamp = lastSyncedAt
@@ -1714,22 +1705,42 @@ function renderForms() {
 }
 
 /**
- * Point one amount field at a volume or at a count. A volume is a text field, so
- * a typed unit reaches us -- `type="number"` reports an empty value for "750 ml"
- * and the unit would be silently lost. A count keeps the number spinner.
+ * Point one amount field at a volume or at a count. A volume is a text field with
+ * a unit dropdown beside it, so the box holds a number and the unit is picked
+ * rather than typed. A count is a whole number of units and has no dropdown at
+ * all -- "12 ml of cans" is not a thing -- so it keeps the number spinner.
  */
-function setVolumeField(input, { volume, min, step, placeholder }) {
+function setVolumeField(input, { volume, min, step }) {
   input.type = volume ? "text" : "number";
-  input.placeholder = volume ? placeholder : "";
   if (volume) {
     input.inputMode = "decimal";
     input.autocomplete = "off";
     input.removeAttribute("min");
     input.removeAttribute("step");
-    return;
+  } else {
+    input.min = min;
+    input.step = step;
   }
-  input.min = min;
-  input.step = step;
+  const unit = unitSelectFor(input);
+  if (unit) {
+    unit.hidden = !volume;
+    unit.disabled = !volume || input.disabled;
+  }
+}
+
+/** The unit dropdown that belongs to an amount box, if it has one. */
+function unitSelectFor(input) {
+  return input?.parentElement?.querySelector?.(`[data-unit-for="${input.name}"]`) || null;
+}
+
+/**
+ * Ounces from an amount box: the number in the box read in the unit picked
+ * beside it. A unit typed into the box still wins, so a pasted "750 ml" works
+ * whatever the dropdown says. Returns null when it is not a volume at all.
+ */
+function readVolumeField(input) {
+  const unit = unitSelectFor(input);
+  return RNMBDomain.parseVolumeOunces(input.value, unit && !unit.hidden ? unit.value : undefined);
 }
 
 const POURED_SIZE_DEFAULT = 25.36;
@@ -1746,7 +1757,7 @@ function syncBottleSizeField() {
   input.dataset.measure = measure;
   // Counted stock is a whole number of units, so it keeps the number spinner. A
   // volume is typed, because a number input throws away "750 ml" before we see it.
-  setVolumeField(input, { volume: !counted, min: "1", step: "1", placeholder: "25.36 or 750 ml" });
+  setVolumeField(input, { volume: !counted, min: "1", step: "1" });
   document.querySelector("#bottleSizeLabel").textContent = counted ? "Size units" : "Size oz";
 }
 
@@ -1758,7 +1769,7 @@ function syncPourAmountField() {
   const measure = counted ? RNMBDomain.MEASURE_UNIT : RNMBDomain.MEASURE_OZ;
   if (input.dataset.measure !== measure) input.value = counted ? 1 : 1.5;
   input.dataset.measure = measure;
-  setVolumeField(input, { volume: !counted, min: "1", step: "1", placeholder: "1.5 or 44 ml" });
+  setVolumeField(input, { volume: !counted, min: "1", step: "1" });
   document.querySelector("#pourAmountLabel").textContent = counted ? "Units consumed" : "Ounces consumed";
 }
 
@@ -1774,20 +1785,11 @@ function syncTypeMeasureField() {
 
 function renderOverview() {
   const totals = activeNightTotals();
-  const maxPersonDrinks = Math.max(0, ...Array.from(totals.byPerson.values()).map((entry) => entry.drinks));
-  const check = statusForDrinks(maxPersonDrinks);
-  const alertCard = document.querySelector(".alert-card");
-
   document.querySelector("#metricSpend").textContent = money(totalSpend());
   document.querySelector("#metricSpendMeta").textContent = `${state.bottles.length} purchases logged`;
   document.querySelector("#metricConsumed").textContent = oneDecimal(totals.allDrinks);
   document.querySelector("#metricInventory").textContent = state.bottles.length;
   document.querySelector("#metricInventoryMeta").textContent = `${oneDecimal(totalRemainingStandardDrinks())} standard drinks remaining`;
-  document.querySelector("#metricCheck").textContent = check.label;
-  document.querySelector("#metricCheckMeta").textContent = check.meta;
-  alertCard.classList.toggle("is-caution", check.className === "warn");
-  alertCard.classList.toggle("is-red", check.className === "hot");
-
   renderSpendBars();
   renderLowSupply();
   renderRecentNights();
@@ -1973,7 +1975,8 @@ function renderQuickLog() {
     button.disabled = quickLogPending;
     button.setAttribute("aria-pressed", String(entry.id === quickLogPersonId));
     button.style.setProperty("--person-color", safeColor(entry.color));
-    button.innerHTML = `<span class="avatar" style="--person-color: ${safeColor(entry.color)}">${initials(entry.name)}</span><strong>${escapeHtml(entry.name)}</strong>`;
+    button.style.setProperty("--person-ink", RNMBDomain.contrastInk(safeColor(entry.color)));
+    button.innerHTML = `<span class="avatar" style="--person-color: ${safeColor(entry.color)}; --person-ink: ${RNMBDomain.contrastInk(safeColor(entry.color))}">${initials(entry.name)}</span><strong>${escapeHtml(entry.name)}</strong>`;
     peopleTarget.append(button);
   });
 
@@ -2057,9 +2060,7 @@ async function quickLogBottle(bottleId, onNight) {
   bottle.remaining = round6(Math.max(0, Number(bottle.remaining) - pour.ounces));
   night.pours.push(pour);
   const cost = pour.costCents !== null && pour.buyerName ? `${centsText(pour.costCents)} at cost` : "no charge (nobody on the roster bought it)";
-  let message = `Logged ${amountText(offer.type, pour.ounces)} of ${stockLabel(bottle)} for ${person.name} · ${cost}.`;
-  const status = statusForDrinks(activeNightTotals().byPerson.get(person.id)?.drinks || 0);
-  if (state.responsibleMode && status.className) message += ` ${status.label}: ${status.meta}`;
+  const message = `Logged ${amountText(offer.type, pour.ounces)} of ${stockLabel(bottle)} for ${person.name} · ${cost}.`;
   quickLogPending = true;
   renderQuickLog();
   let saved = false;
@@ -2145,16 +2146,15 @@ function renderTonight() {
   } else {
     state.people.forEach((person) => {
       const entry = totals.byPerson.get(person.id) || { ounces: 0, drinks: 0 };
-      const status = statusForDrinks(entry.drinks);
       const card = document.createElement("article");
       card.className = "consumption-card";
       card.innerHTML = `
         <div class="person-card">
-          <span class="avatar" style="--person-color: ${safeColor(person.color)}">${initials(person.name)}</span>
+          <span class="avatar" style="--person-color: ${safeColor(person.color)}; --person-ink: ${RNMBDomain.contrastInk(safeColor(person.color))}">${initials(person.name)}</span>
           <div class="person-copy"><strong>${escapeHtml(person.name)}</strong><small>${oneDecimal(entry.ounces)} oz total</small></div>
         </div>
         <strong>${oneDecimal(entry.drinks)}</strong>
-        <span class="pill ${status.className}">${status.label}</span>
+        <span class="pill">standard drinks</span>
       `;
       target.append(card);
     });
@@ -2285,7 +2285,7 @@ function renderNightRecap() {
     card.innerHTML = `
       <header class="recap-header">
         <div class="person-card">
-          <span class="avatar" style="--person-color: ${safeColor(person?.color)}">${initials(entry.name || "?")}</span>
+          <span class="avatar" style="--person-color: ${safeColor(person?.color)}; --person-ink: ${RNMBDomain.contrastInk(safeColor(person?.color))}">${initials(entry.name || "?")}</span>
           <div class="person-copy">
             <strong>${escapeHtml(entry.name || "Unknown")}</strong>
             <small data-recap-meta>${drinkCount} · ${oneDecimal(entry.ounces)} oz · ${oneDecimal(entry.standardDrinks)} standard drinks</small>
@@ -2406,10 +2406,10 @@ function renderInventory() {
         <small>${money(bottle.price)} paid by ${escapeHtml(buyer?.name || "Unknown")}</small>
         <form class="level-form" data-level-form="${escapeHtml(bottle.id)}">
           <label>
-            <span>Set level (${counted ? "units" : "oz"})</span>
+            <span>Set level</span>
             ${counted
               ? `<input name="level" type="number" min="0" max="${Number(bottle.size) || 0}" step="1" value="${level}" required>`
-              : `<input name="level" type="text" inputmode="decimal" autocomplete="off" value="${level}" placeholder="${level} or 500 ml" required>`}
+              : `<span class="amount-field"><input name="level" type="text" inputmode="decimal" autocomplete="off" value="${level}" required><select class="unit-select" name="levelUnit" data-unit-for="level" aria-label="Unit"><option value="oz" selected>oz</option><option value="ml">ml</option><option value="cl">cl</option><option value="l">L</option></select></span>`}
           </label>
           <button type="submit">Set</button>
         </form>
@@ -2493,8 +2493,8 @@ function syncIngredientRow(row) {
   }
   input.readOnly = false;
   const counted = isCounted(type);
-  setVolumeField(input, { volume: !counted, min: "1", step: "1", placeholder: "1.5 or 44 ml" });
-  label.textContent = counted ? "Amount units" : "Amount oz";
+  setVolumeField(input, { volume: !counted, min: "1", step: "1" });
+  label.textContent = counted ? "Amount (units)" : "Amount";
 }
 
 function addIngredientRow({ id = "", typeId = "", amount = 1 } = {}) {
@@ -2508,8 +2508,16 @@ function addIngredientRow({ id = "", typeId = "", amount = 1 } = {}) {
       <select name="ingredientType"></select>
     </label>
     <label>
-      <span data-amount-label>Amount oz</span>
-      <input name="ingredientAmount" type="text" inputmode="decimal" autocomplete="off" value="${escapeHtml(String(amount))}" placeholder="1.5 or 44 ml">
+      <span data-amount-label>Amount</span>
+      <span class="amount-field">
+        <input name="ingredientAmount" type="text" inputmode="decimal" autocomplete="off" value="${escapeHtml(String(amount))}">
+        <select class="unit-select" name="ingredientAmountUnit" data-unit-for="ingredientAmount" aria-label="Unit">
+          <option value="oz" selected>oz</option>
+          <option value="ml">ml</option>
+          <option value="cl">cl</option>
+          <option value="l">L</option>
+        </select>
+      </span>
     </label>
     <button class="remove-button" type="button" data-remove-ingredient aria-label="Remove ingredient">×</button>
   `;
@@ -2563,12 +2571,13 @@ function menuItemDraftFromForm() {
     if (!type) return { error: "Pick a stock type for every ingredient." };
     if (kind === "counted" && !isCounted(type)) return { error: `A counted item needs a counted stock type, and ${type.name} is poured.` };
     if (kind === "straight" && isCounted(type)) return { error: `A straight pour needs a poured stock type, and ${type.name} is counted.` };
-    const raw = row.querySelector("input[name='ingredientAmount']").value.trim();
-    // Counted ingredients are always one unit; a poured one is a volume, so a
-    // recipe can be written in millilitres as readily as in ounces.
-    const amount = kind === "counted" ? 1 : (isCounted(type) ? Number(raw) : RNMBDomain.parseVolumeOunces(raw));
+    const amountField = row.querySelector("input[name='ingredientAmount']");
+    const raw = amountField.value.trim();
+    // Counted ingredients are always one unit; a poured one is a volume, read in
+    // whatever unit the dropdown beside the box is set to.
+    const amount = kind === "counted" ? 1 : (isCounted(type) ? Number(raw) : readVolumeField(amountField));
     if (amount === null || !Number.isFinite(amount) || amount <= 0 || (kind !== "counted" && raw === "")) {
-      return { error: "Every ingredient needs an amount above zero, in ounces or millilitres." };
+      return { error: "Every ingredient needs an amount above zero." };
     }
     if (isCounted(type) && !Number.isInteger(amount)) return { error: `${type.name} is counted stock, so use a whole number of units.` };
     ingredients.push({ id: row.dataset.ingredientId || undefined, typeId: type.id, amount });
@@ -2856,6 +2865,7 @@ function renderRegisterTargets(night) {
     button.dataset.registerCrew = person.id;
     button.setAttribute("aria-pressed", String(registerDraft?.target?.kind === "crew" && registerDraft.target.personId === person.id));
     button.style.setProperty("--person-color", safeColor(person.color));
+    button.style.setProperty("--person-ink", RNMBDomain.contrastInk(safeColor(person.color)));
     button.innerHTML = `<strong>${escapeHtml(person.name)}</strong><span>Crew · at cost</span>`;
     crewTarget.append(button);
   });
@@ -3242,7 +3252,7 @@ function renderBalances() {
     row.className = `balance-row ${words.className}`;
     row.dataset.balancePerson = entry.name;
     row.innerHTML = `
-      <span class="avatar" style="--person-color: ${safeColor(person?.color)}">${initials(entry.name || "?")}</span>
+      <span class="avatar" style="--person-color: ${safeColor(person?.color)}; --person-ink: ${RNMBDomain.contrastInk(safeColor(person?.color))}">${initials(entry.name || "?")}</span>
       <div class="person-copy">
         <strong>${escapeHtml(entry.name || "Unknown")}${person ? "" : " <small class=\"balance-gone\">(no longer on the roster)</small>"}</strong>
         <small data-balance-status>${escapeHtml(words.status)}</small>
@@ -3533,7 +3543,7 @@ function renderCrew() {
     const card = document.createElement("div");
     card.className = "person-card";
     card.innerHTML = `
-      <span class="avatar" style="--person-color: ${safeColor(person.color)}">${initials(person.name)}</span>
+      <span class="avatar" style="--person-color: ${safeColor(person.color)}; --person-ink: ${RNMBDomain.contrastInk(safeColor(person.color))}">${initials(person.name)}</span>
       <div class="person-copy">
         <strong>${escapeHtml(person.name)}</strong>
         <small>${money(spent)} logged · ${pourCount} pours</small>
@@ -3571,14 +3581,6 @@ document.querySelectorAll(".tab-button").forEach((button) => {
   button.addEventListener("click", () => activateTab(button.dataset.tab));
 });
 
-document.querySelector("#responsibleMode").addEventListener("change", async (event) => {
-  state.responsibleMode = event.target.checked;
-  await saveState(
-    event.target.checked ? "Hydration reminders on." : "Hydration reminders muted.",
-    (db) => db.updateSettings(state, ["responsible_mode"])
-  );
-});
-
 document.querySelector("#personForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const data = new FormData(event.currentTarget);
@@ -3596,7 +3598,9 @@ document.querySelector("#typeForm").addEventListener("submit", async (event) => 
   const measure = data.get("measure") === RNMBDomain.MEASURE_UNIT ? RNMBDomain.MEASURE_UNIT : RNMBDomain.MEASURE_OZ;
   const abv = Number(data.get("abv"));
   // The volume of one unit, so a can labelled 355 ml can be typed that way.
-  const unitOz = measure === RNMBDomain.MEASURE_UNIT ? RNMBDomain.parseVolumeOunces(data.get("unitOz")) : null;
+  const unitOz = measure === RNMBDomain.MEASURE_UNIT
+    ? readVolumeField(event.currentTarget.querySelector("[name='unitOz']"))
+    : null;
   if (!Number.isFinite(abv) || abv < 0 || abv > 95) {
     showToast("ABV must be between 0 and 95 percent.");
     return;
@@ -3646,11 +3650,10 @@ document.querySelector("#bottleForm").addEventListener("submit", async (event) =
   // The form field keeps its old name; the amount is in the type's measure (KTD5).
   const stockType = typeById(data.get("typeId"));
   // Counted stock is a count; a poured size is a volume, so "750 ml" is accepted.
-  const size = stockType && isCounted(stockType)
-    ? Number(data.get("sizeOz"))
-    : RNMBDomain.parseVolumeOunces(data.get("sizeOz"));
+  const sizeField = event.currentTarget.querySelector("[name='sizeOz']");
+  const size = stockType && isCounted(stockType) ? Number(data.get("sizeOz")) : readVolumeField(sizeField);
   if (!stockType || size === null || !Number.isFinite(size) || size <= 0) {
-    showToast("Pick a type and a size above zero. A size can be ounces or millilitres, like 750 ml.");
+    showToast("Pick a type and a size above zero.");
     return;
   }
   if (isCounted(stockType) && !Number.isInteger(size)) {
@@ -3710,12 +3713,10 @@ document.querySelector("#pourForm").addEventListener("submit", async (event) => 
     // In the type's measure: ounces, or a count for counted stock (KTD5). The
     // field keeps its old name, and so does the pour's `ounces` property.
     const bottleForPour = bottleById(data.get("bottleId"));
-    const rawAmount = data.get("ounces");
-    const amount = isCounted(typeById(bottleForPour?.typeId))
-      ? Number(rawAmount)
-      : RNMBDomain.parseVolumeOunces(rawAmount);
+    const amountField = event.currentTarget.querySelector("[name='ounces']");
+    const amount = isCounted(typeById(bottleForPour?.typeId)) ? Number(data.get("ounces")) : readVolumeField(amountField);
     if (amount === null) {
-      showToast("Enter how much was drunk, in ounces or millilitres, like 1.5 or 44 ml.");
+      showToast("Enter how much was drunk as a number, and pick its unit beside the box.");
       return;
     }
     pour = preparePour(night, { personId: data.get("personId"), bottleId: data.get("bottleId"), ounces: amount });
@@ -3727,10 +3728,7 @@ document.querySelector("#pourForm").addEventListener("submit", async (event) => 
   bottle.remaining = Math.max(0, Number(bottle.remaining) - pour.ounces);
   night.pours.push(pour);
 
-  const personTotal = activeNightTotals().byPerson.get(data.get("personId"))?.drinks || 0;
-  const status = statusForDrinks(personTotal);
-  const message = state.responsibleMode && status.className ? `${status.label}: ${status.meta}` : "Pour logged.";
-  await saveState(message, (db) => db.addPour(night, pour, bottle.remaining));
+  await saveState("Pour logged.", (db) => db.addPour(night, pour, bottle.remaining));
 });
 
 document.body.addEventListener("click", async (event) => {
@@ -3818,10 +3816,11 @@ document.body.addEventListener("submit", async (event) => {
   const bottle = bottleById(form.dataset.levelForm);
   if (!bottle) return;
   const type = typeById(bottle.typeId);
-  const raw = form.querySelector("[name='level']").value.trim();
+  const levelField = form.querySelector("[name='level']");
+  const raw = levelField.value.trim();
   // A level in the bottle is a volume unless the stock is counted, so it reads
   // millilitres too -- handy when what is left is judged against the label.
-  const newRemaining = isCounted(type) ? Number(raw) : RNMBDomain.parseVolumeOunces(raw);
+  const newRemaining = isCounted(type) ? Number(raw) : readVolumeField(levelField);
   if (raw === "" || newRemaining === null || !Number.isFinite(newRemaining) || newRemaining < 0 || newRemaining > Number(bottle.size)) {
     showToast(`Set a level from 0 to ${amountText(type, bottle.size)}.`);
     return;
@@ -4272,7 +4271,7 @@ document.querySelector("#importData").addEventListener("change", async (event) =
       return;
     }
     downloadArchive("backup-before-import");
-    state = normalizeState({ ...imported, responsibleMode: imported.responsibleMode !== false });
+    state = normalizeState(imported);
     await saveState("Dashboard archive imported.");
   } catch {
     showToast("That archive could not be imported.");

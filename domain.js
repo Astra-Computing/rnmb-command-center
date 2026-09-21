@@ -95,9 +95,12 @@
  *               whose balance would move if that person were deleted (their pours cascade, other references
  *               are set null and keep their name snapshots); includes parties already off the roster,
  *               matched by name snapshot with personId null
- *   parseVolumeOunces(value) -> fluid ounces for a typed volume, to 2dp: a bare number is already
- *               ounces ("1.5"), or name the unit and it converts ("750 ml", "1.5 fl oz", "3cl", "1 L").
- *               null for anything else, including a negative, so a caller can tell empty from wrong
+ *   parseVolumeOunces(value, defaultUnit) -> fluid ounces for a typed volume, to 2dp. A unit written into
+ *               the text wins ("750 ml", "1.5 fl oz", "3cl", "1 L"); otherwise defaultUnit applies, and
+ *               without one a bare number is already ounces. null for anything else, including a negative,
+ *               so a caller can tell empty from wrong
+ *   contrastInk(color) -> "#111111" or "#ffffff", whichever reads better on `color` (WCAG relative
+ *               luminance). Falls back to the dark ink for anything unparseable
  *   dollarsToCents(value) -> whole cents for a typed dollar amount ("3.20", "$12", ".5"), else null
  *   quickLogAmount(type) -> 1.5 (oz) for poured stock, 1 (unit) for counted stock
  *   nightRecap(state, nightId) -> [{ personId, name, drinks, ounces, standardDrinks, costCents }]: one night's
@@ -114,7 +117,7 @@
  *   normalizePour(pour) -> the pour with costCents (number|null), buyerId and buyerName (null when absent)
  *   normalizeState(input) -> full browser state: people, types, bottles, nights (kind, endedAt on both kinds, pours
  *               normalized, startedLocally only when true), menuItems, guestTabs, ringUps,
- *               stockAdjustments, payments, activeNightId, responsibleMode, markupPercent,
+ *               stockAdjustments, payments, activeNightId, markupPercent,
  *               roundingIncrementCents
  *   typeRow(type, hostModeAvailable) -> rnmb_beverage_types row (snake_case)
  *   nightRow(night, hostModeAvailable) -> rnmb_nights row
@@ -1231,8 +1234,12 @@ var RNMBDomain = (function () {
    * anything that is not a volume -- empty, a stray word, a negative -- so a
    * caller can tell "typed nothing" from "typed something wrong".
    */
-  function parseVolumeOunces(value) {
-    if (typeof value === "number") return isFinite(value) && value >= 0 ? round2(value) : null;
+  function parseVolumeOunces(value, defaultUnit) {
+    var fallback = normalizeUnit(defaultUnit);
+    if (typeof value === "number") {
+      if (!isFinite(value) || value < 0) return null;
+      return round2(value * (fallback === null ? 1 : VOLUME_UNITS[fallback]));
+    }
     if (typeof value !== "string") return null;
     var text = value.trim().toLowerCase();
     if (!text) return null;
@@ -1242,9 +1249,37 @@ var RNMBDomain = (function () {
     var amount = Number(match[1]);
     if (!isFinite(amount) || amount < 0) return null;
     var unit = match[2].replace(/[. ]/g, "");
-    if (!unit) return round2(amount);
+    // A unit typed into the box beats the one picked beside it, so pasting
+    // "750 ml" still works when the dropdown happens to say oz.
+    if (!unit) return round2(amount * (fallback === null ? 1 : VOLUME_UNITS[fallback]));
     if (!Object.prototype.hasOwnProperty.call(VOLUME_UNITS, unit)) return null;
     return round2(amount * VOLUME_UNITS[unit]);
+  }
+
+  /** A unit name the dropdown can pass, normalized to a VOLUME_UNITS key, or null. */
+  function normalizeUnit(unit) {
+    if (typeof unit !== "string") return null;
+    var key = unit.trim().toLowerCase().replace(/[. ]/g, "");
+    return Object.prototype.hasOwnProperty.call(VOLUME_UNITS, key) ? key : null;
+  }
+
+  /**
+   * Black or white, whichever a person's colour can actually be read against.
+   * WCAG relative luminance, then the better of the two contrast ratios -- the
+   * crossover sits at L = sqrt(1.05 * 0.05) - 0.05, about 0.179. A picked colour
+   * can be anything, so a fixed dark ink went unreadable on dark ones.
+   */
+  function contrastInk(color) {
+    var hex = typeof color === "string" ? color.trim().replace(/^#/, "") : "";
+    if (hex.length === 3) hex = hex[0] + hex[0] + hex[1] + hex[1] + hex[2] + hex[2];
+    if (hex.length === 8) hex = hex.slice(0, 6);
+    if (hex.length !== 6 || !/^[0-9a-f]{6}$/i.test(hex)) return "#111111";
+    var channel = function (pair) {
+      var srgb = parseInt(pair, 16) / 255;
+      return srgb <= 0.03928 ? srgb / 12.92 : Math.pow((srgb + 0.055) / 1.055, 2.4);
+    };
+    var luminance = 0.2126 * channel(hex.slice(0, 2)) + 0.7152 * channel(hex.slice(2, 4)) + 0.0722 * channel(hex.slice(4, 6));
+    return luminance > 0.1791 ? "#111111" : "#ffffff";
   }
 
   function round2(value) {
@@ -1494,7 +1529,6 @@ var RNMBDomain = (function () {
       stockAdjustments: listOf(source.stockAdjustments).map(normalizeAdjustment),
       payments: listOf(source.payments).map(normalizePayment),
       activeNightId: source.activeNightId || (nights[0] && nights[0].id) || "",
-      responsibleMode: source.responsibleMode !== false,
       markupPercent:
         source.markupPercent !== undefined && source.markupPercent !== null && Number.isFinite(markup) && markup >= 0
           ? markup
@@ -1529,7 +1563,6 @@ var RNMBDomain = (function () {
     var row = {
       id: true,
       active_night_id: source.activeNightId || null,
-      responsible_mode: source.responsibleMode !== false
     };
     if (hostModeAvailable === true) {
       var markup = Number(source.markupPercent);
@@ -1671,6 +1704,7 @@ var RNMBDomain = (function () {
     balanceChangesOnRemoval: balanceChangesOnRemoval,
     dollarsToCents: dollarsToCents,
     parseVolumeOunces: parseVolumeOunces,
+    contrastInk: contrastInk,
     quickLogAmount: quickLogAmount,
     recentLogItems: recentLogItems,
     nightRecap: nightRecap,
