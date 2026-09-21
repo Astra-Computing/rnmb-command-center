@@ -224,7 +224,9 @@ small,
 
 .metric-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  /* auto-fit, not a fixed 4: at 1024 four fixed columns were narrower than the
+     numbers inside them, so "3 purchases logged" spilled out of its card. */
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
   gap: 14px;
 }
 
@@ -290,7 +292,9 @@ small,
 
 .form-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  /* auto-fit with a floor: two fixed columns became 116px each at 1024, too
+     narrow for a date input, a stock dropdown or most option text. */
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
   gap: 12px;
 }
 
@@ -301,6 +305,18 @@ small,
   color: var(--muted);
   font-size: 0.82rem;
   font-weight: 700;
+}
+
+/* A short number reads better in a short box; a name or a dropdown still fills
+   the column. Without this, ABV, price, markup and rounding were ~300px wide
+   for two characters. 9rem still clears a comfortable tap target. */
+.form-grid input[type="number"],
+.form-grid input[inputmode="decimal"] {
+  max-width: 9rem;
+}
+
+.form-grid .amount-field {
+  max-width: 15rem;
 }
 
 .form-grid input,
@@ -408,6 +424,14 @@ small,
   padding: 14px;
 }
 
+/* Grid and flex items default to min-width:auto, so a long stock name sized the
+   track wider than the card and every row spilled a few px past its edge. */
+.inventory-card > *,
+.inventory-card header > *,
+.inventory-card .person-copy {
+  min-width: 0;
+}
+
 .inventory-card header,
 .ledger-item,
 .timeline-item,
@@ -426,6 +450,7 @@ small,
 /* Set level on an inventory card: one compact row, input then button. */
 .level-form {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   align-items: end;
 }
@@ -434,7 +459,9 @@ small,
   display: grid;
   flex: 1 1 auto;
   gap: 4px;
-  min-width: 0;
+  /* A floor, not 0: below this the amount box and its unit spilled out of the
+     label rather than shrinking with it. */
+  min-width: 8rem;
   color: var(--muted);
   font-size: 0.76rem;
   font-weight: 700;
@@ -508,10 +535,28 @@ small,
 }
 
 .ingredient-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 7.5rem) auto;
+  /* Flex, not fixed tracks: the amount column holds a number AND its unit
+     dropdown now, and fixed tracks either overflowed the row or crushed the
+     type dropdown to 23px depending on how wide the panel happened to be.
+     Wrapping lets the pair drop to its own line when the panel is narrow. */
+  display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   align-items: end;
+}
+
+.ingredient-row > label:first-child {
+  flex: 1 1 10rem;
+  min-width: 0;
+}
+
+.ingredient-row > label:nth-child(2) {
+  flex: 0 1 12rem;
+  min-width: 8rem;
+}
+
+.ingredient-row > .remove-button {
+  flex: 0 0 auto;
 }
 
 .ingredient-row input[readonly] {
@@ -706,15 +751,40 @@ body.is-register .app-shell {
   align-items: stretch;
 }
 
-.amount-field input {
+.amount-field {
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* Floors so the pair can shrink with its label instead of spilling out of it,
+   and a cap so a box holding "40" is not 196px wide. */
+.amount-field input,
+.form-grid .amount-field input {
+  min-width: 3rem;
+  max-width: 9rem;
+}
+
+.amount-field .unit-select,
+.form-grid .amount-field .unit-select,
+.register .amount-field .unit-select {
+  min-width: 4rem;
+}
+
+/* These beat `.form-grid input, .form-grid select { width: 100% }`, which made
+   the input claim the whole row and shoved the unit dropdown outside it. */
+.amount-field input,
+.form-grid .amount-field input {
   flex: 1 1 auto;
+  width: auto;
   min-width: 0;
 }
 
-.unit-select {
+.amount-field .unit-select,
+.form-grid .amount-field .unit-select,
+.register .amount-field .unit-select {
   flex: 0 0 auto;
   width: auto;
-  min-width: 68px;
+  min-width: 72px;
 }
 
 .unit-select[hidden] {
@@ -852,6 +922,25 @@ body.is-register .app-shell {
   grid-template-columns: minmax(0, 1fr) minmax(0, 6.5rem) auto;
   gap: 8px;
   align-items: end;
+}
+
+/* The bottle name, its buyer and what is left is the longest option text in the
+   app; on a narrow register it never fit beside the amount, so it takes the row
+   and the amount sits under it. */
+@media (max-width: 1200px) {
+  .register-source {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .register-source > label:first-child {
+    grid-column: 1 / -1;
+  }
+}
+
+/* An amount is a few characters; without this it stretched to 412px once the
+   bottle dropdown above it took the full row. */
+.register-source input[name="sourceAmount"] {
+  max-width: 9rem;
 }
 
 .register-source-detail {

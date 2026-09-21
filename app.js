@@ -1697,7 +1697,9 @@ function renderForms() {
   setOptions(
     bottleSelect,
     pourable,
-    (bottle) => `${bottleLabel(bottle)} · ${amountText(typeById(bottle.typeId), bottle.remaining)} left`,
+    // stockLabel, not bottleLabel: "House Bourbon: The Briefing Bottle" needed
+    // 382px of dropdown and never got it. The nickname alone identifies it.
+    (bottle) => `${stockLabel(bottle)} · ${amountText(typeById(bottle.typeId), bottle.remaining)} left`,
     "No stocked bottles"
   );
   if (pourable.some((bottle) => bottle.id === chosenBottle)) bottleSelect.value = chosenBottle;
@@ -2706,12 +2708,19 @@ function exactAmountText(type, amount) {
   return isCounted(type) ? amountText(type, amount) : `${Math.round(Number(amount) * 100) / 100} oz`;
 }
 
-/** What the bartender needs to tell two bottles apart: nickname, buyer, what is left. */
-function registerSourceText(bottle) {
+/**
+ * What the bartender needs to tell two bottles apart: nickname, buyer, what is
+ * left. `compact` drops the bottle's full size, which a dropdown has no room for
+ * -- the detail line under the select still shows it.
+ */
+function registerSourceText(bottle, { compact = false } = {}) {
   if (!bottle) return "Unknown stock item";
   const type = typeById(bottle.typeId);
   const buyer = personById(bottle.buyerId);
-  return `${bottle.nickname || type?.name || "Stock"} · ${buyer?.name || "no buyer"} · ${levelText(type, bottle.remaining, bottle.size)} left`;
+  const left = compact
+    ? `${amountText(type, bottle.remaining)} left`
+    : `${levelText(type, bottle.remaining, bottle.size)} left`;
+  return `${bottle.nickname || type?.name || "Stock"} · ${buyer?.name || "no buyer"} · ${left}`;
 }
 
 /** Drop references a save or refresh has made stale: a removed menu item, a closed tab, a removed person. */
@@ -2889,7 +2898,7 @@ function renderRegisterIngredients() {
       // Keep the chosen item listed even if it has since run dry, so the select shows the truth.
       const choices = bottle && !stocked.includes(bottle) ? [bottle, ...stocked] : stocked;
       const options = choices.map((choice) => (
-        `<option value="${escapeHtml(choice.id)}"${choice.id === source.bottleId ? " selected" : ""}>${escapeHtml(registerSourceText(choice))}</option>`
+        `<option value="${escapeHtml(choice.id)}"${choice.id === source.bottleId ? " selected" : ""}>${escapeHtml(registerSourceText(choice, { compact: true }))}</option>`
       )).join("");
       const amount = Number(source.amount);
       const refs = `data-ingredient="${index}" data-source="${sourceIndex}"`;
