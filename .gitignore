@@ -1,2 +1,9 @@
 .vercel
 .env*
+
+# Local quotebook files. The crew's real quotes stay on the machine that uploaded
+# them and are never committed. Synthetic parser fixtures under
+# tests/fixtures/parser/ are deliberately NOT matched by these patterns.
+quotebook*.txt
+*.quotebook.txt
+/quotebook/
