@@ -1,0 +1,12 @@
+# The Vercel CLI uploads this whole directory and does not read .gitignore, so
+# anything sitting here would be served publicly: a real quotebook dropped in to
+# test, supabase/rls-passphrase.sql with the passphrase filled in, local agent
+# settings. Upload only what the site serves.
+/*
+!/index.html
+!/app.js
+!/domain.js
+!/quotebook.js
+!/styles.css
+!/api
+!/vercel.json
