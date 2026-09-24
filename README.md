@@ -6,10 +6,10 @@ A dependency-free dashboard for tracking group beverage inventory, spending, nig
 
 - Shared Supabase persistence for people, beverage types, bottle purchases, and night logs
 - U.S. standard drink calculations using fluid ounces and ABV
+- Every volume field has a unit dropdown (oz, ml, cl, L) beside it and is stored in ounces; a unit typed into the box wins over the dropdown
 - One running balance per person: every drink costs the drinker what it drew, and credits whoever bought it
 - Quick log: two taps on a phone to record a drink, and an end-of-night recap to fix what was missed
 - Inventory depletion tracking when pours are logged
-- Responsible-use pace checks and hydration reminders
 - JSON export/import for backup or migration
 - Host mode: a bar register for nights with guests, with a menu, recipes, guest tabs and cost-plus-markup prices
 
@@ -93,12 +93,16 @@ Host mode replaces a flat cover charge with a tab per guest.
 **Set up (in the dashboard):**
 
 1. **Inventory**: add stock types. Choose *Poured, ounces* for spirits, liqueurs and fluid mixers (mixers use ABV 0) or *Counted, units* for cans and bottled drinks (give the volume of one unit). Then add the stock you bought, with its price and who paid.
+
+   Anywhere a **volume** is asked for — a bottle's size, a pour, a recipe ingredient, a unit's volume, or setting a level by hand — the box takes a number and the **dropdown beside it** takes the unit: oz, ml, cl or L. Type `750`, pick `ml`, and it stores 25.36 oz. If you paste a unit into the box instead (`750 ml`), that wins over the dropdown. The one exception is the **count** of counted stock (how many cans you bought), which is a number of units and not a volume, so it has no dropdown at all.
 2. **Menu**: build cocktails, straight pours and counted items from those types, and set the markup percentage and the rounding step. Each item shows the price it would ring up at right now, or *Unavailable* when stock can't cover it.
 3. **Tonight**: start a night and choose *Host night*, then follow *Open register*.
 
 **At the bar:** the register lives at `#register` (for example `https://<your-site>/#register`), so the bartender's device can bookmark it. Pick a menu item, then a guest's tab (or open one by name) or a crew member. Check the bottle each ingredient pours from, switch it or add a second bottle when one runs out, and confirm. The price is locked when you confirm. A crew drink is never put on a guest tab: it costs the crew member what it drew, at cost, with no markup.
 
 **Closing out:** each open tab is closed as *Paid* (choose who collected the money; the amount is the tab total) or *Write off* (choose who is writing it off — they cover what its drinks cost). *End night* works once every tab is closed. **Ledger → Host Nights** shows what each collector holds and which buyers it belongs to, plus the value written off from each buyer's stock. Both feed the crew balances: the collector carries what they collected, and a write-off lands on whoever wrote it off.
+
+Each host night's card also lists the **crew drinks** charged on it — the drinks and pours that went to a crew member rather than onto a guest's tab — with a *Void* button on each. That stays available after the night ends, which is the one thing an ended host night still allows. A guest item does not: its tab total was counted as cash when the night closed, so it is frozen. A crew drink was only ever charged at cost to one person's balance and sits on no tab, so a drink rung up to the wrong crew member can still be put right. Voiding one returns the stock and moves the balance back.
 
 A red *This browser only* banner on the register means nothing is being saved to the shared database.
 

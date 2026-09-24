@@ -1176,7 +1176,7 @@ const scenarios = [
         await fillIngredientRow(page, 1, { typeId: tripleSec.id, amount: 1 });
         await page.click("#addIngredientRow");
         await fillIngredientRow(page, 2, { typeId: lime.id, amount: 1 });
-        assert.equal((await page.locator("#ingredientRows [data-amount-label]").nth(0).textContent()).trim(), "Amount oz");
+        assert.equal((await page.locator("#ingredientRows [data-amount-label]").nth(0).textContent()).trim(), "Amount", "the unit lives in the dropdown now, not the label");
         await clickForToast(session, "#menuItemSubmit", "Menu item added.");
 
         const saved = await page.evaluate(() => window.__rnmb.state.menuItems.find((item) => item.name === "Margarita"));
@@ -1332,7 +1332,7 @@ const scenarios = [
         assert.equal(await page.inputValue("#menuItemForm [name='kind']"), "straight");
         const row = page.locator("#ingredientRows [data-ingredient-row]");
         assert.equal(await row.count(), 1);
-        assert.equal(await row.nth(0).locator("select").inputValue(), original.ingredients[0].typeId);
+        assert.equal(await row.nth(0).locator("select[name='ingredientType']").inputValue(), original.ingredients[0].typeId);
         assert.equal(await row.nth(0).locator("input[name='ingredientAmount']").inputValue(), "2");
 
         await page.fill("#menuItemForm [name='name']", "Bourbon Short");
@@ -2398,7 +2398,7 @@ const scenarios = [
   },
 
   {
-    name: "Review #2 shared database: night, hydration and host-night saves never send pricing, and a pricing save sends only pricing",
+    name: "Review #2 shared database: night and host-night saves never send pricing or responsible_mode, and a pricing save sends only pricing",
     async run({ browser }) {
       const { ids, seed } = hostModeSeed();
       const stub = hostModeStub(seed);
@@ -2423,15 +2423,13 @@ const scenarios = [
         assert.equal(stub.store.rnmb_settings[0].active_night_id, ids.nightOne);
         assert.equal(Number(stub.store.rnmb_settings[0].markup_percent), 50, "the other device's markup survives a night switch");
 
-        start = stub.log.length;
-        await page.evaluate(() => {
-          const toggle = document.querySelector("#responsibleMode");
-          toggle.checked = false;
-          toggle.dispatchEvent(new Event("change", { bubbles: true }));
-        });
-        await session.waitForToast("Hydration reminders muted.");
-        settingsWritesSince(start).forEach((entry) => assert.deepEqual(settingsKeys(entry).filter((key) => PRICING.includes(key)), [], "the hydration toggle sent no pricing"));
-        assert.equal(stub.store.rnmb_settings[0].responsible_mode, false);
+        // Hydration reminders were removed, so nothing writes responsible_mode any
+        // more. The column keeps whatever it held; the client never sends it.
+        assert.equal(await page.locator("#responsibleMode").count(), 0, "the hydration toggle is gone");
+        settingsWritesSince(0).forEach((entry) => assert.ok(
+          !settingsKeys(entry).includes("responsible_mode"),
+          `no settings write sends responsible_mode: ${JSON.stringify(entry.body)}`
+        ));
 
         start = stub.log.length;
         await page.fill("#nightForm [name='name']", "Night Three");
@@ -3718,6 +3716,410 @@ const scenarios = [
 
         const toasts = await session.toasts();
         assert.ok(toasts.includes("This host night has ended, so its items can no longer be voided."), "the guest refusal is still shown");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+  {
+    name: "Crew review #5 follow-up: an ended host night's crew drinks can be voided from Ledger, its guest items cannot",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const { night } = await startHostNightViaForm(session, "Ledger fix night");
+        await openRegister(session);
+        await openTabViaRegister(session, "Riley");
+        await ringUpToTab(session, "Bourbon Neat", "Riley");
+        const bourbon = await bottleIdOf(page, "The Briefing Bottle");
+
+        // A crew drink rung up to the wrong person while the bar was open.
+        await registerItem(page, "Bourbon Neat").click();
+        await registerCrew(page, "Casey").click();
+        await clickForToast(session, "#registerConfirm", "Bourbon Neat poured for Casey · $2.76 at cost.");
+        assert.equal((await balanceCents(page)).Casey, -276, "the crew drink debits Casey at cost");
+
+        await payTabViaRegister(session, "Riley", "Jordan");
+        await clickForToast(session, "#registerEndNight", "Ledger fix night ended. Its summary is under Host nights in Ledger.");
+
+        // The register goes with the night, which is why this fix had to live elsewhere.
+        await page.evaluate(() => { location.hash = "#register"; });
+        await page.waitForSelector("#registerClosed:not([hidden])");
+        assert.equal(await page.locator("#registerWork").isHidden(), true, "no register once the night has ended");
+        await page.evaluate(() => { location.hash = ""; });
+
+        // The Ledger's host-night card lists the crew drink, and only the crew drink.
+        await page.click('.tab-button[data-tab="ledger"]');
+        const card = page.locator(`.host-night-card[data-host-night-id="${night.id}"]`);
+        await card.waitFor();
+        const listed = await card.locator("[data-crew-drinks] li").allTextContents();
+        assert.equal(listed.length, 1, `one crew drink listed, and the guest item is not among them; got ${JSON.stringify(listed)}`);
+        assert.ok(listed[0].includes("Casey"), `expected the drinker named, got: ${listed[0]}`);
+        assert.ok(listed[0].includes("$2.76"), `expected the cost shown, got: ${listed[0]}`);
+        const note = await card.locator("[data-crew-drinks] .form-note").textContent();
+        assert.ok(note.includes("charged at cost and can still be put right"), `expected the ended-night note, got: ${note}`);
+
+        const stockBefore = await stockOf(page, bourbon);
+        await clickForToast(session, `.host-night-card[data-host-night-id="${night.id}"] [data-void-crew-drink]`, "Drink voided. Stock and balances are back to where they were.");
+
+        assert.equal((await balanceCents(page)).Casey, 0, "Casey's balance goes back");
+        assert.equal(await stockOf(page, bourbon), Math.round((stockBefore + 2) * 100) / 100, "and the stock comes back");
+        assert.equal(await card.locator("[data-crew-drinks] li").count(), 0, "the voided drink leaves the list");
+        assert.equal(await card.locator("[data-crew-drinks] small").textContent(), "No crew drinks charged.");
+
+        // The guest item on the same ended night is still frozen, and its money still counted.
+        const guestVoid = await page.evaluate(async () => {
+          const r = window.__rnmb;
+          const guest = r.state.ringUps.find((entry) => entry.kind === "guest");
+          const ok = await r.hostAction("Guest item voided.", (db) => db.voidRingUp(guest.id));
+          return { ok, voided: Boolean(r.state.ringUps.find((entry) => entry.id === guest.id).voidedAt) };
+        });
+        assert.equal(guestVoid.ok, false, "a guest item on an ended host night stays frozen");
+        assert.equal(guestVoid.voided, false);
+
+        const toasts = await session.toasts();
+        assert.ok(toasts.includes("This host night has ended, so its items can no longer be voided."), "the guest refusal is still shown");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+  {
+    name: "Crew review #5 follow-up: a running host night lists its crew pours in Ledger, and voiding one there puts the stock and balance back",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const { night } = await startHostNightViaForm(session, "Running night");
+        const bourbon = await bottleIdOf(page, "The Briefing Bottle");
+
+        // Starting a host night makes it the active night, so quick log lands a
+        // crew POUR on it — the other kind of crew drink a host night can hold.
+        await quickLog(session, "Casey", "The Briefing Bottle", "Logged 1.5 oz of The Briefing Bottle for Casey · $2.07 at cost.");
+
+        await page.click('.tab-button[data-tab="ledger"]');
+        const card = page.locator(`.host-night-card[data-host-night-id="${night.id}"]`);
+        await card.waitFor();
+        assert.equal(await card.locator("[data-host-night-status]").textContent(), "Running · 0 open tabs");
+        const listed = await card.locator("[data-crew-drinks] li").allTextContents();
+        assert.equal(listed.length, 1, `the pour is listed while the night runs; got ${JSON.stringify(listed)}`);
+        assert.ok(listed[0].includes("Casey"), `expected the drinker named, got: ${listed[0]}`);
+        assert.ok(listed[0].includes("The Briefing Bottle"), `expected the stock named, got: ${listed[0]}`);
+        assert.equal(await card.locator("[data-crew-drinks] .form-note").count(), 0, "no ended-night note while it runs");
+
+        const stockBefore = await stockOf(page, bourbon);
+        assert.equal((await balanceCents(page)).Casey, -207, "the pour charges Casey at cost");
+
+        await clickForToast(session, `.host-night-card[data-host-night-id="${night.id}"] [data-void-crew-drink]`, "Drink voided. Stock and balances are back to where they were.");
+        assert.equal(await stockOf(page, bourbon), Math.round((stockBefore + 1.5) * 100) / 100, "the poured stock comes back");
+        assert.equal((await balanceCents(page)).Casey, 0, "and Casey's balance with it");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+  {
+    name: "Both End night buttons carry the accent, the same orange as the register's primary action",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const bg = (selector) => page.evaluate(
+          (sel) => getComputedStyle(document.querySelector(sel)).backgroundColor,
+          selector
+        );
+
+        // The crew recap's End night, while a crew night is the active one.
+        await page.click('.tab-button[data-tab="tonight"]');
+        await page.waitForSelector("#endCrewNight:not([hidden])");
+        const crewEnd = await bg("#endCrewNight");
+
+        // Starting a host night makes it active, which hides the crew recap.
+        await startHostNightViaForm(session, "Accent night");
+        await openRegister(session);
+        await openTabViaRegister(session, "Riley");
+        const registerEnd = await bg("#registerEndNight");
+        const registerPay = await bg(".register-pay");
+        const registerOther = await bg("#registerClear");
+
+        assert.equal(registerEnd, registerPay, "the register's End night matches its primary action");
+        assert.equal(crewEnd, registerPay, "and so does the crew recap's End night");
+        assert.notEqual(registerEnd, registerOther, "and neither reads as a plain secondary button");
+
+        // Pin the token itself, so a theme change has to be deliberate.
+        assert.equal(registerPay, "rgb(249, 115, 22)", "--accent is #f97316");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+  {
+    name: "Every volume field takes millilitres as well as ounces, and counted stock still takes only whole units",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        const tequila = await page.evaluate(() => window.__rnmb.state.types.find((type) => type.name === "Emergency Tequila").id);
+
+        // 1. Stock size: type the number, pick the unit beside it.
+        await page.click('.tab-button[data-tab="inventory"]');
+        await page.selectOption("#bottleForm [name='typeId']", tequila);
+        await page.fill("#bottleForm [name='nickname']", "Metric bottle");
+        await page.fill("#bottleForm [name='sizeOz']", "750");
+        await page.selectOption("#bottleForm [name='sizeOzUnit']", "ml");
+        await clickForToast(session, "#bottleForm button[type='submit']", "Bottle added to inventory.");
+        const metric = await page.evaluate(() => window.__rnmb.state.bottles.find((b) => b.nickname === "Metric bottle"));
+        assert.ok(metric, "the metric bottle was saved");
+        assert.equal(metric.size, 25.36, "750 picked as ml is stored as 25.36 oz");
+        assert.equal(metric.remaining, 25.36);
+
+        // 2. A pour in millilitres comes off the same bottle in ounces.
+        await page.click('.tab-button[data-tab="tonight"]');
+        await page.selectOption("#pourForm [name='personId']", await personIdOf(page, "Sam"));
+        await page.selectOption("#pourForm [name='bottleId']", metric.id);
+        await page.fill("#pourForm [name='ounces']", "44");
+        await page.selectOption("#pourForm [name='ouncesUnit']", "ml");
+        await clickForToast(session, "#pourForm button[type='submit']", "Pour logged.");
+        assert.equal(await stockOf(page, metric.id), 23.87, "44 ml is 1.49 oz off a 25.36 oz bottle");
+
+        // 3. Set level, judged against the label rather than converted by hand.
+        await page.click('.tab-button[data-tab="inventory"]');
+        await page.fill(`#inventoryList [data-level-form="${metric.id}"] [name='level']`, "500");
+        await page.selectOption(`#inventoryList [data-level-form="${metric.id}"] [name='levelUnit']`, "ml");
+        await clickForToast(session, `#inventoryList [data-level-form="${metric.id}"] button[type='submit']`, "Stock level set.");
+        assert.equal(await stockOf(page, metric.id), 16.91, "500 ml is 16.91 oz");
+
+        // 4. A counted type's unit volume is a volume: a can is labelled 355 ml.
+        await page.click('.tab-button[data-tab="inventory"]');
+        await page.fill("#typeForm [name='name']", "Metric can");
+        await page.selectOption("#typeForm [name='category']", "Beer");
+        await page.selectOption("#typeForm [name='measure']", "unit");
+        await page.fill("#typeForm [name='unitOz']", "355");
+        await page.selectOption("#typeForm [name='unitOzUnit']", "ml");
+        await page.fill("#typeForm [name='abv']", "5");
+        await clickForToast(session, "#typeForm button[type='submit']", "Beverage type added.");
+        const can = await page.evaluate(() => window.__rnmb.state.types.find((x) => x.name === "Metric can"));
+        assert.equal(can.unitOz, 12, "355 picked as ml is 12 oz per unit");
+
+        // 5. But the COUNT of those cans is a count, not a volume: the field stays
+        //    a number input, so "12 ml" cannot even be typed into it.
+        await page.click('.tab-button[data-tab="inventory"]');
+        await page.selectOption("#bottleForm [name='typeId']", can.id);
+        assert.equal(await page.locator("#bottleForm [name='sizeOz']").getAttribute("type"), "number", "a counted size keeps the number spinner");
+        assert.equal(await page.locator("#bottleForm [name='sizeOzUnit']").isHidden(), true, "and offers no unit dropdown -- a count is not a volume");
+        await page.selectOption("#bottleForm [name='typeId']", tequila);
+        assert.equal(await page.locator("#bottleForm [name='sizeOz']").getAttribute("type"), "text", "a poured size is a volume");
+        assert.equal(await page.locator("#bottleForm [name='sizeOzUnit']").isVisible(), true, "so its unit dropdown comes back");
+
+        // 6. A recipe ingredient in millilitres.
+        await page.click('.tab-button[data-tab="menu"]');
+        await page.fill("#menuItemForm [name='name']", "Metric shot");
+        await page.selectOption("#menuItemForm [name='kind']", "straight");
+        const row = page.locator("#ingredientRows [data-ingredient-row]").first();
+        await row.locator("select[name='ingredientType']").selectOption(tequila);
+        await row.locator("input[name='ingredientAmount']").fill("44");
+        await row.locator("select[name='ingredientAmountUnit']").selectOption("ml");
+        await clickForToast(session, "#menuItemSubmit", "Menu item added.");
+        const saved = await page.evaluate(() => window.__rnmb.state.menuItems.find((item) => item.name === "Metric shot"));
+        assert.equal(saved.ingredients[0].amount, 1.49, "the recipe stores 1.49 oz");
+
+        // 7. A unit typed into the box still wins over the dropdown.
+        await page.click('.tab-button[data-tab="inventory"]');
+        await page.selectOption("#bottleForm [name='typeId']", tequila);
+        await page.fill("#bottleForm [name='nickname']", "Pasted bottle");
+        await page.fill("#bottleForm [name='sizeOz']", "1 L");
+        await page.selectOption("#bottleForm [name='sizeOzUnit']", "oz");
+        await clickForToast(session, "#bottleForm button[type='submit']", "Bottle added to inventory.");
+        const pasted = await page.evaluate(() => window.__rnmb.state.bottles.find((b) => b.nickname === "Pasted bottle"));
+        assert.equal(pasted.size, 33.81, "\"1 L\" typed in the box beats the dropdown saying oz");
+
+        // 8. Nonsense is refused rather than guessed at, and nothing is saved.
+        await page.click('.tab-button[data-tab="inventory"]');
+        await page.selectOption("#bottleForm [name='typeId']", tequila);
+        await page.fill("#bottleForm [name='nickname']", "Bad units");
+        await page.fill("#bottleForm [name='sizeOz']", "5 gallons");
+        await clickForToast(session, "#bottleForm button[type='submit']", "Pick a type and a size above zero.");
+        assert.equal(await page.evaluate(() => window.__rnmb.state.bottles.some((entry) => entry.nickname === "Bad units")), false, "nothing was saved");
+
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+  {
+    name: "A crew member's initials stay readable on any colour, light or dark",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        // A very dark colour is the case a fixed dark ink got wrong.
+        await page.click('.tab-button[data-tab="crew"]');
+        await page.fill("#personForm [name='name']", "Midnight");
+        await page.evaluate(() => {
+          const input = document.querySelector("#personForm [name='color']");
+          input.value = "#1e3a8a";
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await clickForToast(session, "#personForm button[type='submit']", "Person added to the roster.");
+
+        await page.fill("#personForm [name='name']", "Daylight");
+        await page.evaluate(() => {
+          const input = document.querySelector("#personForm [name='color']");
+          input.value = "#facc15";
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await clickForToast(session, "#personForm button[type='submit']", "Person added to the roster.");
+
+        const inkFor = (name) => page.evaluate((who) => {
+          const card = Array.from(document.querySelectorAll("#personList .person-card"))
+            .find((entry) => entry.textContent.includes(who));
+          const avatar = card && card.querySelector(".avatar");
+          return avatar ? getComputedStyle(avatar).color : null;
+        }, name);
+
+        assert.equal(await inkFor("Midnight"), "rgb(255, 255, 255)", "white initials on a dark navy");
+        assert.equal(await inkFor("Daylight"), "rgb(17, 17, 17)", "dark initials on a bright yellow");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+  {
+    name: "The register stacks its three dependent steps in one column and keeps anytime work in the other",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await startHostNightViaForm(session, "Layout night");
+        await openRegister(session);
+
+        const box = (selector) => page.locator(selector).boundingBox();
+        const menu = await box(".register-menu-panel");
+        const target = await box(".register-target-panel");
+        const pour = await box(".register-pour-panel");
+        const tabs = await box(".register-tabs-panel");
+
+        // 1 -> 2 -> 3 read downwards, each below the last, all in the same column.
+        assert.ok(menu.y < target.y, `1. Drink sits above 2. For (${menu.y} vs ${target.y})`);
+        assert.ok(target.y < pour.y, `2. For sits above 3. Pour from (${target.y} vs ${pour.y})`);
+        assert.equal(Math.round(menu.x), Math.round(target.x), "1 and 2 share a column");
+        assert.equal(Math.round(menu.x), Math.round(pour.x), "and so does 3");
+
+        // Open tabs is anytime work, so it sits beside the sequence, not inside it.
+        assert.ok(tabs.x > menu.x + menu.width - 1, `open tabs is in the other column (${tabs.x} vs ${menu.x + menu.width})`);
+        assert.ok(tabs.y <= target.y, "and starts alongside the sequence rather than after it");
+
+        // Each step says what it is for.
+        const notes = await page.locator("#registerWork .step-note").allTextContents();
+        assert.ok(notes.length >= 3, `every step carries a note, got ${notes.length}`);
+        assert.ok(notes.some((note) => note.includes("charged at cost")), "the For step explains the two kinds of target");
+
+        // On a phone the same order survives as one column.
+        await page.setViewportSize({ width: 400, height: 900 });
+        const narrow = {
+          menu: await box(".register-menu-panel"),
+          target: await box(".register-target-panel"),
+          pour: await box(".register-pour-panel"),
+          tabs: await box(".register-tabs-panel")
+        };
+        assert.ok(narrow.menu.y < narrow.target.y && narrow.target.y < narrow.pour.y && narrow.pour.y < narrow.tabs.y,
+          "at 400px the panels stack 1, 2, 3, then the anytime column");
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, "and nothing scrolls sideways");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+  {
+    name: "Inventory shows the type on the first line and the nickname on the second, neither wrapping",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await page.click('.tab-button[data-tab="inventory"]');
+        const identity = page.locator("#inventoryList .stock-identity").first();
+        await identity.waitFor();
+
+        const shape = await identity.evaluate((el) => {
+          const name = el.querySelector("strong");
+          const nick = el.querySelector("small");
+          const box = (node) => { const r = node.getBoundingClientRect(); return { top: Math.round(r.top), bottom: Math.round(r.bottom), height: Math.round(r.height) }; };
+          const style = (node) => { const s = getComputedStyle(node); return { whiteSpace: s.whiteSpace, overflow: s.overflow, textOverflow: s.textOverflow, lineHeight: s.lineHeight }; };
+          return { name: { text: name.textContent, ...box(name), ...style(name) }, nick: { text: nick.textContent, ...box(nick), ...style(nick) } };
+        });
+
+        assert.equal(shape.name.text, "House Bourbon");
+        assert.equal(shape.nick.text, "The Briefing Bottle");
+        assert.ok(shape.nick.top >= shape.name.bottom - 1,
+          `the nickname sits below the name (name bottom ${shape.name.bottom}, nickname top ${shape.nick.top})`);
+        for (const part of ["name", "nick"]) {
+          assert.equal(shape[part].whiteSpace, "nowrap", `${part} does not wrap`);
+          assert.equal(shape[part].textOverflow, "ellipsis", `${part} truncates rather than wrapping`);
+        }
+
+        // A long name must still hold one line each rather than growing the card.
+        await page.evaluate(() => {
+          const r = window.__rnmb;
+          const type = r.state.types.find((t) => t.name === "House Bourbon");
+          type.name = "Extremely Overlong Small Batch Bourbon Whiskey Reserve";
+          const bottle = r.state.bottles.find((b) => b.nickname === "The Briefing Bottle");
+          bottle.nickname = "The Briefing Bottle That Nobody Could Ever Name Briefly";
+          r.render();
+        });
+        const after = await identity.evaluate((el) => {
+          const lines = Array.from(el.children).map((node) => Math.round(node.getBoundingClientRect().height));
+          const card = el.closest(".inventory-card");
+          return { lines, cardOverflows: card.scrollWidth > card.clientWidth + 1 };
+        });
+        assert.equal(after.lines.length, 2, "still exactly two lines");
+        assert.equal(after.cardOverflows, false, "and the card does not overflow");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+  {
+    name: "A crew member who owes money reads in light red, not caution yellow",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        // Casey drinks Alex's bourbon, so Casey owes and Alex is owed.
+        await quickLog(session, "Casey", "The Briefing Bottle", "Logged 1.5 oz of The Briefing Bottle for Casey · $2.07 at cost.");
+        await page.click('.tab-button[data-tab="ledger"]');
+
+        const colours = await page.evaluate(() => {
+          const read = (who) => {
+            const row = Array.from(document.querySelectorAll("#balanceList .balance-row"))
+              .find((entry) => entry.dataset.balancePerson === who);
+            if (!row) return null;
+            return {
+              classes: row.className,
+              amount: getComputedStyle(row.querySelector("[data-balance-amount]")).color,
+              border: getComputedStyle(row).borderLeftColor
+            };
+          };
+          return { owes: read("Casey"), owed: read("Alex") };
+        });
+
+        const YELLOW = "rgb(250, 204, 21)";
+        const LIGHT_RED = "rgb(252, 165, 165)";
+        assert.ok(colours.owes.classes.includes("is-owes"), `Casey owes: ${colours.owes.classes}`);
+        assert.equal(colours.owes.amount, LIGHT_RED, "the amount owed is light red");
+        assert.equal(colours.owes.border, LIGHT_RED, "and so is the row's edge");
+        assert.notEqual(colours.owes.amount, YELLOW, "not the caution yellow it used to be");
+
+        // Being owed is unchanged, so the two states stay distinguishable.
+        assert.ok(colours.owed.classes.includes("is-owed"), `Alex is owed: ${colours.owed.classes}`);
+        assert.equal(colours.owed.amount, "rgb(34, 197, 94)", "being owed stays green");
         session.assertClean();
       } finally {
         await session.close();

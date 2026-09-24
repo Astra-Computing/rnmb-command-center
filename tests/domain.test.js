@@ -737,9 +737,10 @@ test("with host mode unavailable, type, night and settings rows contain exactly 
   assert.deepEqual(D.typeRow(type, false), { id: "t1", name: "Lager", category: "Beer", abv: 5 });
   const night = { id: "n1", name: "Party", date: "2026-09-16", kind: "host", endedAt: null, pours: [] };
   assert.deepEqual(D.nightRow(night, false), { id: "n1", name: "Party", date: "2026-09-16" });
-  const settings = { activeNightId: "n1", responsibleMode: false, markupPercent: 50, roundingIncrementCents: 50 };
-  assert.deepEqual(D.settingsRow(settings, false), { id: true, active_night_id: "n1", responsible_mode: false });
-  assert.deepEqual(D.settingsRow({}, false), { id: true, active_night_id: null, responsible_mode: true });
+  const settings = { activeNightId: "n1", markupPercent: 50, roundingIncrementCents: 50 };
+  // Hydration reminders are gone, so responsible_mode is never written any more.
+  assert.deepEqual(D.settingsRow(settings, false), { id: true, active_night_id: "n1" });
+  assert.deepEqual(D.settingsRow({}, false), { id: true, active_night_id: null });
 });
 
 test("with host mode available, rows include measure, unit volume, kind, ended time, markup and increment", () => {
@@ -756,10 +757,10 @@ test("with host mode available, rows include measure, unit volume, kind, ended t
     id: "n2", name: "Crew", date: "2026-09-16", kind: "crew", ended_at: null
   });
   assert.deepEqual(D.settingsRow({ activeNightId: "", markupPercent: 50, roundingIncrementCents: 50 }, true), {
-    id: true, active_night_id: null, responsible_mode: true, markup_percent: 50, rounding_increment_cents: 50
+    id: true, active_night_id: null, markup_percent: 50, rounding_increment_cents: 50
   });
   assert.deepEqual(D.settingsRow({}, true), {
-    id: true, active_night_id: null, responsible_mode: true,
+    id: true, active_night_id: null,
     markup_percent: D.DEFAULT_MARKUP_PERCENT, rounding_increment_cents: D.DEFAULT_ROUNDING_INCREMENT_CENTS
   });
   assert.equal(D.DEFAULT_MARKUP_PERCENT, 0);
@@ -810,7 +811,6 @@ test("normalizeState maps a legacy archive's sizeOz/remainingOz onto size/remain
     bottles: [{ id: "b1", typeId: "t1", nickname: "Old", sizeOz: 25.36, remainingOz: 19.2, price: 34.99, buyerId: "p1", date: "2026-09-01" }],
     nights: [{ id: "n1", name: "Friday", date: "2026-09-01", pours: [] }],
     activeNightId: "n1",
-    responsibleMode: true
   };
   const state = D.normalizeState(legacy);
   assert.equal(state.bottles[0].size, 25.36);
@@ -835,7 +835,6 @@ test("normalizeState on an archive with no host-mode collections yields empty co
   assert.equal(state.markupPercent, 0);
   assert.equal(state.roundingIncrementCents, 25);
   assert.equal(state.activeNightId, "n1");
-  assert.equal(state.responsibleMode, true);
   assert.deepEqual(state.nights[0], { id: "n1", name: "Friday", date: "2026-09-01", kind: "crew", endedAt: null, pours: [] });
 });
 
@@ -844,7 +843,7 @@ test("normalizeState on nothing at all is an empty state", () => {
   assert.deepEqual(state, {
     people: [], types: [], bottles: [], nights: [],
     menuItems: [], guestTabs: [], ringUps: [], stockAdjustments: [], payments: [],
-    activeNightId: "", responsibleMode: true, markupPercent: 0, roundingIncrementCents: 25
+    activeNightId: "", markupPercent: 0, roundingIncrementCents: 25
   });
 });
 
@@ -856,7 +855,6 @@ test("normalizeState keeps host nights, the browser-only local mark only when li
       { id: "c1", name: "Crew", date: "2026-09-01", kind: "weird", endedAt: "2026-09-02T03:00:00Z" }
     ],
     activeNightId: "h1",
-    responsibleMode: false,
     markupPercent: "50",
     roundingIncrementCents: 50
   });
@@ -864,7 +862,6 @@ test("normalizeState keeps host nights, the browser-only local mark only when li
   assert.deepEqual(state.nights[1], { id: "h2", name: "Old party", date: "2026-09-01", kind: "host", endedAt: "2026-09-02T03:00:00Z", pours: [] });
   // KTD7: a crew night (an unknown kind reads as crew) keeps its ended time.
   assert.deepEqual(state.nights[2], { id: "c1", name: "Crew", date: "2026-09-01", kind: "crew", endedAt: "2026-09-02T03:00:00Z", pours: [] });
-  assert.equal(state.responsibleMode, false);
   assert.equal(state.markupPercent, 50);
   assert.equal(state.roundingIncrementCents, 50);
 
@@ -1670,4 +1667,136 @@ test("nightRecap keeps a drinker who has left the roster, after everyone still o
     ]
   };
   assert.deepEqual(D.nightRecap(state, "n1").map((entry) => [entry.name, entry.personId]), [["Sam", "p-sam"], ["Ada", null], ["Zoe", null]], "the roster first, then anyone removed since, by name");
+});
+
+test("crewDrinksOnNight flattens a host night's crew drinks, newest first, each with its drinker (0.4.3)", () => {
+  const state = {
+    people: [{ id: "p-sam", name: "Sam" }, { id: "p-alex", name: "Alex" }],
+    types,
+    bottles: [{ id: "b-tequila", typeId: "t-tequila", size: 25.36, remaining: 20, price: 60, buyerId: "p-sam" }],
+    nights: [{
+      id: "h1",
+      kind: "host",
+      endedAt: "2026-09-20T04:00:00Z",
+      pours: [
+        { id: "po1", personId: "p-alex", bottleId: "b-tequila", ounces: 1.5, abv: 40, timestamp: "2026-09-20T01:00:00Z", costCents: 355, buyerId: "p-sam", buyerName: "Sam" }
+      ]
+    }],
+    ringUps: [
+      // A guest drink on the same night: it belongs to a tab, never to a crew member.
+      { id: "rg", nightId: "h1", kind: "guest", tabId: "tab1", personId: null, personName: null, menuItemName: "Margarita", priceCents: 900, rungAt: "2026-09-20T02:00:00Z", voidedAt: null, lines: [{ typeId: "t-tequila", amount: 1.5, abv: 40, costCents: 355, shareCents: 900, buyerId: "p-sam", buyerName: "Sam" }] },
+      { id: "rc", nightId: "h1", kind: "crew", personId: "p-alex", personName: "Alex", menuItemName: "Paloma", rungAt: "2026-09-20T03:00:00Z", voidedAt: null, lines: [{ typeId: "t-tequila", amount: 1.5, abv: 40, costCents: 355, buyerId: "p-sam", buyerName: "Sam" }] },
+      { id: "rv", nightId: "h1", kind: "crew", personId: "p-alex", personName: "Alex", menuItemName: "Voided one", rungAt: "2026-09-20T03:30:00Z", voidedAt: "2026-09-20T03:31:00Z", lines: [{ typeId: "t-tequila", amount: 1.5, abv: 40, costCents: 355, buyerId: "p-sam", buyerName: "Sam" }] }
+    ]
+  };
+
+  const drinks = D.crewDrinksOnNight(state, "h1");
+  assert.deepEqual(drinks.map((drink) => [drink.kind, drink.id]), [["ringUp", "rc"], ["pour", "po1"]], "newest first; the guest drink and the voided one are not crew drinks");
+  assert.equal(drinks[0].personName, "Alex");
+  assert.equal(drinks[0].personId, "p-alex");
+  assert.equal(drinks[0].costCents, 355, "charged at cost to the drinker, credited to Sam");
+  assert.equal(drinks[1].kind, "pour");
+  assert.equal(drinks[1].bottleId, "b-tequila");
+
+  assert.deepEqual(D.crewDrinksOnNight(state, "missing"), []);
+  assert.deepEqual(D.crewDrinksOnNight({}, "h1"), []);
+  assert.deepEqual(D.crewDrinksOnNight(), []);
+});
+
+test("crewDrinksOnNight keeps a drink whose drinker has left the roster (0.4.3, 0.5.7)", () => {
+  const state = {
+    people: [{ id: "p-sam", name: "Sam" }],
+    types,
+    bottles: [],
+    nights: [{ id: "h1", kind: "host", endedAt: "2026-09-20T04:00:00Z", pours: [] }],
+    ringUps: [
+      { id: "r1", nightId: "h1", kind: "crew", personId: null, personName: "Zoe", menuItemName: "Shot", rungAt: "2026-09-20T02:00:00Z", voidedAt: null, lines: [{ typeId: "t-tequila", amount: 1.5, abv: 40, costCents: 100, buyerId: "p-sam", buyerName: "Sam" }] }
+    ]
+  };
+  const drinks = D.crewDrinksOnNight(state, "h1");
+  assert.deepEqual(drinks.map((drink) => [drink.personName, drink.personId, drink.costCents]), [["Zoe", null, 100]], "the name snapshot still names who owes it");
+});
+
+test("parseVolumeOunces takes ounces or millilitres, and refuses anything that is not a volume", () => {
+  // A bare number is already ounces, so nothing typed before this existed changes meaning.
+  assert.equal(D.parseVolumeOunces("1.5"), 1.5);
+  assert.equal(D.parseVolumeOunces("25.36"), 25.36);
+  assert.equal(D.parseVolumeOunces(12), 12);
+  assert.equal(D.parseVolumeOunces("0"), 0);
+
+  // The two the bar actually has to read: a bottle labelled in ml, a recipe in oz.
+  assert.equal(D.parseVolumeOunces("750 ml"), 25.36, "a 750 ml bottle is the stock form's default");
+  assert.equal(D.parseVolumeOunces("355ml"), 12, "a 355 ml can is 12 oz");
+  assert.equal(D.parseVolumeOunces("1.5 fl oz"), 1.5);
+  assert.equal(D.parseVolumeOunces("1.5fl.oz."), 1.5, "punctuation and spacing in the unit are ignored");
+  assert.equal(D.parseVolumeOunces(" 44 ml "), 1.49);
+
+  // Spelled out, and the other metric sizes a bottle is sold in.
+  assert.equal(D.parseVolumeOunces("750 millilitres"), 25.36);
+  assert.equal(D.parseVolumeOunces("3cl"), 1.01);
+  assert.equal(D.parseVolumeOunces("1 L"), 33.81);
+  assert.equal(D.parseVolumeOunces("1 litre"), 33.81);
+  assert.equal(D.parseVolumeOunces("12 ounces"), 12);
+
+  // Null, never 0, so a caller can tell "typed nothing" from "typed something wrong".
+  assert.equal(D.parseVolumeOunces(""), null);
+  assert.equal(D.parseVolumeOunces("   "), null);
+  assert.equal(D.parseVolumeOunces("abc"), null);
+  assert.equal(D.parseVolumeOunces("-2"), null, "a negative volume is not a volume");
+  assert.equal(D.parseVolumeOunces("-2 ml"), null);
+  assert.equal(D.parseVolumeOunces("5 gallons"), null, "an unknown unit is refused rather than guessed at");
+  assert.equal(D.parseVolumeOunces("750 ml of gin"), null);
+  assert.equal(D.parseVolumeOunces(null), null);
+  assert.equal(D.parseVolumeOunces(undefined), null);
+  assert.equal(D.parseVolumeOunces({}), null);
+  assert.equal(D.parseVolumeOunces(NaN), null);
+  assert.equal(D.parseVolumeOunces(Infinity), null);
+});
+
+test("contrastInk picks the ink a person's colour can actually be read against", () => {
+  // The four demo colours all take the dark ink, which is what the app shipped with.
+  assert.equal(D.contrastInk("#f97316"), "#111111", "orange");
+  assert.equal(D.contrastInk("#22c55e"), "#111111", "green");
+  assert.equal(D.contrastInk("#38bdf8"), "#111111", "light blue");
+  assert.equal(D.contrastInk("#facc15"), "#111111", "yellow");
+
+  // A dark pick is the case a fixed dark ink got wrong.
+  assert.equal(D.contrastInk("#1e3a8a"), "#ffffff", "navy");
+  assert.equal(D.contrastInk("#000000"), "#ffffff", "black");
+  assert.equal(D.contrastInk("#7f1d1d"), "#ffffff", "dark red");
+  assert.equal(D.contrastInk("#ffffff"), "#111111", "white");
+
+  // Shorthand and alpha are accepted; anything else falls back to the dark ink.
+  assert.equal(D.contrastInk("#fff"), "#111111");
+  assert.equal(D.contrastInk("#000"), "#ffffff");
+  assert.equal(D.contrastInk("#1e3a8aff"), "#ffffff", "alpha is ignored, not parsed as colour");
+  assert.equal(D.contrastInk("rebeccapurple"), "#111111");
+  assert.equal(D.contrastInk(""), "#111111");
+  assert.equal(D.contrastInk(null), "#111111");
+  assert.equal(D.contrastInk(), "#111111");
+});
+
+test("parseVolumeOunces reads a bare number in the unit picked beside the box", () => {
+  // The dropdown supplies the unit, so the box holds only a number.
+  assert.equal(D.parseVolumeOunces("750", "ml"), 25.36);
+  assert.equal(D.parseVolumeOunces("1.5", "oz"), 1.5);
+  assert.equal(D.parseVolumeOunces("3", "cl"), 1.01);
+  assert.equal(D.parseVolumeOunces("1", "l"), 33.81);
+  assert.equal(D.parseVolumeOunces(750, "ml"), 25.36, "a number, not a string");
+
+  // A unit typed into the box wins, so a pasted "750 ml" survives a dropdown on oz.
+  assert.equal(D.parseVolumeOunces("750 ml", "oz"), 25.36);
+  assert.equal(D.parseVolumeOunces("1.5 oz", "ml"), 1.5);
+
+  // No unit anywhere still means ounces, so nothing typed before this existed changed.
+  assert.equal(D.parseVolumeOunces("1.5"), 1.5);
+  assert.equal(D.parseVolumeOunces("1.5", undefined), 1.5);
+  assert.equal(D.parseVolumeOunces("1.5", ""), 1.5);
+  assert.equal(D.parseVolumeOunces("1.5", "furlongs"), 1.5, "an unknown dropdown value is ignored, not guessed at");
+
+  // Still refuses what is not a volume.
+  assert.equal(D.parseVolumeOunces("", "ml"), null);
+  assert.equal(D.parseVolumeOunces("abc", "ml"), null);
+  assert.equal(D.parseVolumeOunces("-2", "ml"), null);
+  assert.equal(D.parseVolumeOunces("5 gallons", "ml"), null);
 });

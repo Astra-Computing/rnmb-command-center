@@ -1,0 +1,204 @@
+// Tests for quotebook.js — the quotebook text parser behind the crew quote card.
+// Run inside the dev-env container:
+//   node --test /workspace/projects/rnmb-command-center/tests/
+//
+// Every fixture here is SYNTHETIC. No real crew quote is committed to this repo,
+// and no automated check is ever driven with the crew's real book.
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const Q = require("../quotebook.js");
+
+// ---------- fixtures ----------------------------------------------------------
+
+const fixture = (name) =>
+  fs.readFileSync(path.join(__dirname, "fixtures", "parser", name), "utf8");
+
+// The answer key lists one entry per expected quote as `<text> — <author>`, using
+// an em dash as the separator. Only the author half is asserted: the text half is
+// the raw source line, which the parser deliberately reshapes (quote marks are
+// stripped, multi-speaker turns are split onto their own lines).
+const keyAuthors = (keyText) =>
+  keyText
+    .split(/\r\n|\r|\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((line) => {
+      const idx = line.lastIndexOf(" — ");
+      assert.ok(idx > 0, "every key line carries an em dash attribution: " + line);
+      return line.slice(idx + 3).trim();
+    });
+
+const authorsOf = (quotes) => quotes.map((quote) => quote.author);
+
+// ---------- the stress corpus against its answer key --------------------------
+
+test("the stress corpus parses to exactly the key's length and every author matches", () => {
+  const quotes = Q.parseQuotebook(fixture("StressTest.txt"));
+  const expected = keyAuthors(fixture("StressTestKey.txt"));
+
+  assert.equal(quotes.length, expected.length, "one quote per non-blank source line");
+  assert.deepEqual(authorsOf(quotes), expected);
+});
+
+test("no speaker name is left inside any quote's text", () => {
+  const quotes = Q.parseQuotebook(fixture("StressTest.txt"));
+
+  for (const quote of quotes) {
+    for (const name of quote.author.split(", ")) {
+      assert.ok(
+        quote.text.indexOf(name + ":") === -1,
+        "author \"" + name + "\" leaked into the text: " + JSON.stringify(quote.text)
+      );
+    }
+  }
+});
+
+// ---------- hyphens: attribution versus punctuation ---------------------------
+
+test("a hyphen after the closing quote is the author; hyphens inside the quote are not", () => {
+  const quotes = Q.parseQuotebook(
+    '"Well-made drinks - and good ones - take their time" - Ines'
+  );
+
+  assert.equal(quotes.length, 1);
+  assert.equal(quotes[0].author, "Ines");
+  assert.equal(quotes[0].text, "Well-made drinks - and good ones - take their time");
+});
+
+// ---------- every separator form resolves to the author -----------------------
+
+test("em dash, en dash, no-space hyphen and a bare name each resolve to the author", () => {
+  assert.equal(Q.parseQuotebook('"The keg is a mood." — Ines')[0].author, "Ines");
+  assert.equal(Q.parseQuotebook('"The keg is a mood." – Ines')[0].author, "Ines");
+  assert.equal(Q.parseQuotebook('"The keg is a mood."-Ines')[0].author, "Ines");
+  assert.equal(Q.parseQuotebook('"The keg is a mood." Ines')[0].author, "Ines");
+  assert.equal(Q.parseQuotebook('"The keg is a mood." Mary Anne Vole')[0].author, "Mary Anne Vole");
+
+  // Unquoted lines reach the same answer through the dash branches.
+  assert.equal(Q.parseQuotebook("The keg is a mood. — Ines")[0].author, "Ines");
+  assert.equal(Q.parseQuotebook("The keg is a mood. - Ines")[0].author, "Ines");
+
+  // In every case the separator and the name are off the text.
+  assert.equal(Q.parseQuotebook('"The keg is a mood." — Ines')[0].text, "The keg is a mood.");
+  assert.equal(Q.parseQuotebook("The keg is a mood. - Ines")[0].text, "The keg is a mood.");
+});
+
+test("a narration tail such as a trailing \"he said\" is not attributed as a name", () => {
+  const quotes = Q.parseQuotebook('"Get the ice" he said');
+
+  assert.equal(quotes.length, 1);
+  assert.equal(quotes[0].author, "Unknown");
+  assert.ok(quotes[0].text.indexOf("he said") !== -1, "the narration stays with the text");
+});
+
+// ---------- colons: a speaker prefix versus a sentence colon ------------------
+
+test("a colon inside a sentence is not a speaker, but a one-to-three capitalised-word prefix is", () => {
+  // Four words before the colon: this is a sentence, not an attribution.
+  const sentence = Q.parseQuotebook("I have one rule: never lie to the till");
+  assert.equal(sentence[0].author, "Unknown");
+  assert.equal(sentence[0].text, "I have one rule: never lie to the till");
+
+  // One, two and three capitalised words are all read as the speaker.
+  assert.equal(Q.parseQuotebook("Ines: the walk-in is a rumour")[0].author, "Ines");
+  assert.equal(Q.parseQuotebook("Mary Vole: the walk-in is a rumour")[0].author, "Mary Vole");
+
+  const three = Q.parseQuotebook("Mary Anne Vole: the walk-in is a rumour");
+  assert.equal(three[0].author, "Mary Anne Vole");
+  assert.equal(three[0].text, "the walk-in is a rumour");
+});
+
+// ---------- multi-speaker exchanges -------------------------------------------
+
+test("a multi-speaker line groups under all its speakers and joins the turns with newlines", () => {
+  const quotes = Q.parseQuotebook(
+    'Wendell: "I have a theory."   Ottoline: "I have heard your theories."   Wendell: "This one has a diagram."'
+  );
+
+  assert.equal(quotes.length, 1);
+  // Repeat speakers are named once, in the order they first spoke.
+  assert.equal(quotes[0].author, "Wendell, Ottoline");
+  assert.equal(
+    quotes[0].text,
+    '"I have a theory."\n"I have heard your theories."\n"This one has a diagram."'
+  );
+});
+
+// ---------- normalisation: BOM, CRLF and curly quotes -------------------------
+
+test("BOM, CRLF and curly-quote input parse identically to the clean equivalent", () => {
+  const clean = '"The keg is a mood." - Ines\n"The lime is a personality." - Bram';
+  const expected = Q.parseQuotebook(clean);
+
+  assert.equal(expected.length, 2);
+
+  const crlf = clean.replace(/\n/g, "\r\n");
+  const cr = clean.replace(/\n/g, "\r");
+  const bom = "﻿" + crlf;
+  const curly = clean.replace(/"/g, (match, offset, whole) => {
+    // Opening marks land on an even count of quote characters seen so far.
+    const before = whole.slice(0, offset).split('"').length - 1;
+    return before % 2 === 0 ? "“" : "”";
+  });
+
+  assert.deepEqual(Q.parseQuotebook(crlf), expected, "CRLF");
+  assert.deepEqual(Q.parseQuotebook(cr), expected, "bare CR");
+  assert.deepEqual(Q.parseQuotebook(bom), expected, "BOM + CRLF");
+  assert.deepEqual(Q.parseQuotebook(curly), expected, "curly double quotes");
+
+  // Curly marks around a speaker's turn resolve the same way as straight ones.
+  assert.deepEqual(
+    Q.parseQuotebook("Ines: “Open the second register.”"),
+    Q.parseQuotebook('Ines: "Open the second register."')
+  );
+});
+
+test("an apostrophe-bearing line keeps the same attribution as its straight-quote equivalent", () => {
+  const straight = Q.parseQuotebook("\"I don't know what happened\" - Ines");
+  const curlyApostrophe = Q.parseQuotebook("\"I don’t know what happened\" - Ines");
+
+  assert.equal(straight[0].author, "Ines");
+  assert.equal(curlyApostrophe[0].author, "Ines", "U+2019 is left alone and does not steal the attribution");
+  assert.equal(
+    curlyApostrophe[0].text.replace(/’/g, "'"),
+    straight[0].text,
+    "only the apostrophe character differs"
+  );
+});
+
+// ---------- blank and empty input ---------------------------------------------
+
+test("blank lines are skipped and an empty string parses to no quotes", () => {
+  assert.deepEqual(Q.parseQuotebook(""), []);
+  assert.deepEqual(Q.parseQuotebook("\n\n   \n\t\n"), []);
+  assert.deepEqual(Q.parseQuotebook("﻿\r\n\r\n"), []);
+
+  const withBlanks = Q.parseQuotebook('\n\n"The keg is a mood." - Ines\n\n   \n"Short one." - Bram\n\n');
+  assert.equal(withBlanks.length, 2);
+  assert.deepEqual(authorsOf(withBlanks), ["Ines", "Bram"]);
+});
+
+// ---------- the long-quote fixture (input for the later layout audit) ---------
+
+test("the long-quote fixture parses, carries an oversized quote and a multi-speaker exchange", () => {
+  const quotes = Q.parseQuotebook(fixture("LongQuotes.txt"));
+
+  assert.ok(quotes.length >= 8, "the fixture holds a spread of entries");
+  assert.ok(
+    quotes.every((quote) => quote.text.length > 0 && quote.author.length > 0),
+    "every entry carries both text and an author"
+  );
+
+  const longest = quotes.reduce((a, b) => (b.text.length > a.text.length ? b : a));
+  assert.ok(
+    longest.text.length > 240,
+    "the fixture stretches a small card: longest is " + longest.text.length + " characters"
+  );
+
+  assert.ok(
+    quotes.some((quote) => quote.author.indexOf(", ") !== -1 && quote.text.indexOf("\n") !== -1),
+    "the fixture includes a multi-speaker exchange"
+  );
+});

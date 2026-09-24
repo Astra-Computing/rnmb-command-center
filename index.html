@@ -34,14 +34,6 @@
         </div>
 
         <div class="sidebar-panel compact">
-          <span class="eyebrow">Mode</span>
-          <label class="toggle-row">
-            <input id="responsibleMode" type="checkbox" checked>
-            <span>Hydration reminders</span>
-          </label>
-        </div>
-
-        <div class="sidebar-panel compact">
           <span class="eyebrow">Data Source</span>
           <strong id="syncStatus">Checking...</strong>
           <small id="syncMeta"></small>
@@ -79,11 +71,6 @@
               <span class="metric-label">Inventory</span>
               <strong id="metricInventory">0</strong>
               <small id="metricInventoryMeta">bottles ready for duty</small>
-            </article>
-            <article class="metric-card alert-card">
-              <span class="metric-label">Responsible Check</span>
-              <strong id="metricCheck">Green</strong>
-              <small id="metricCheckMeta">No active alerts.</small>
             </article>
           </div>
 
@@ -142,6 +129,7 @@
                 <div>
                   <span class="eyebrow">Night Log</span>
                   <h3 id="tonight-title">Create or Select</h3>
+                  <p class="step-note">Start here. A crew night charges everyone at cost; a host night opens the bar register for guests.</p>
                 </div>
               </div>
               <form id="nightForm" class="form-grid">
@@ -184,13 +172,13 @@
                   Person
                   <select name="personId" required></select>
                 </label>
-                <label>
+                <label class="span-2">
                   Bottle
                   <select name="bottleId" required></select>
                 </label>
                 <label>
                   <span id="pourAmountLabel">Ounces consumed</span>
-                  <input name="ounces" type="number" min="0.1" step="0.1" value="1.5" data-measure="oz" required>
+                  <span class="amount-field"><input name="ounces" type="text" inputmode="decimal" autocomplete="off" value="1.5" data-measure="oz" required><select class="unit-select" name="ouncesUnit" data-unit-for="ounces" aria-label="Unit"><option value="oz" selected>oz</option><option value="ml">ml</option><option value="cl">cl</option><option value="l">L</option></select></span>
                 </label>
                 <button type="submit">Log Pour</button>
               </form>
@@ -238,7 +226,7 @@
               <div class="panel-heading">
                 <div>
                   <span class="eyebrow">Beverage Type</span>
-                  <h3 id="inventory-title">Add Type</h3>
+                  <h3 id="inventory-title">1. Add Type</h3>
                 </div>
               </div>
               <form id="typeForm" class="form-grid">
@@ -274,7 +262,7 @@
                 </label>
                 <label id="typeUnitOzField" hidden>
                   Unit volume oz
-                  <input name="unitOz" type="number" min="0.1" step="0.1" value="12" disabled>
+                  <span class="amount-field"><input name="unitOz" type="text" inputmode="decimal" autocomplete="off" value="12" disabled><select class="unit-select" name="unitOzUnit" data-unit-for="unitOz" aria-label="Unit"><option value="oz" selected>oz</option><option value="ml">ml</option><option value="cl">cl</option><option value="l">L</option></select></span>
                 </label>
                 <button type="submit">Add Type</button>
               </form>
@@ -284,7 +272,7 @@
               <div class="panel-heading">
                 <div>
                   <span class="eyebrow">Bottle Purchase</span>
-                  <h3>Add Stock</h3>
+                  <h3>2. Add Stock</h3>
                 </div>
               </div>
               <form id="bottleForm" class="form-grid">
@@ -298,7 +286,7 @@
                 </label>
                 <label>
                   <span id="bottleSizeLabel">Size oz</span>
-                  <input name="sizeOz" type="number" min="1" step="0.01" value="25.36" data-measure="oz" required>
+                  <span class="amount-field"><input name="sizeOz" type="text" inputmode="decimal" autocomplete="off" value="25.36" data-measure="oz" required><select class="unit-select" name="sizeOzUnit" data-unit-for="sizeOz" aria-label="Unit"><option value="oz" selected>oz</option><option value="ml">ml</option><option value="cl">cl</option><option value="l">L</option></select></span>
                 </label>
                 <label>
                   Price
@@ -346,6 +334,7 @@
                 <div>
                   <span class="eyebrow">Menu Item</span>
                   <h3 id="menu-title">Add Menu Item</h3>
+                  <p class="step-note">Built from beverage types, so add those in Inventory first. Priced from what its ingredients cost.</p>
                 </div>
               </div>
               <form id="menuItemForm" class="form-grid" novalidate>
@@ -377,6 +366,7 @@
                 <div>
                   <span class="eyebrow">Pricing</span>
                   <h3>Markup and Rounding</h3>
+                  <p class="step-note">Applies to guest prices only. Crew drinks are always charged at cost.</p>
                 </div>
               </div>
               <form id="pricingForm" class="form-grid" novalidate>
@@ -424,6 +414,7 @@
                   <h3 id="balancesTitle">Crew Balances</h3>
                 </div>
               </div>
+              <p class="step-note">Who is owed and who owes, from drinks, tabs and payments. Always adds up to zero.</p>
               <p id="balanceNotice" class="notice" role="status" hidden></p>
               <p id="balanceSummary" class="form-note balance-summary"></p>
               <div id="balanceList" class="balance-list"></div>
@@ -436,6 +427,7 @@
                 <div>
                   <span class="eyebrow">Venmo Log</span>
                   <h3 id="paymentsTitle">Record a Payment</h3>
+                  <p class="step-note">Log it after the money has actually moved. A wrong one is voided, never deleted.</p>
                 </div>
               </div>
               <form id="paymentForm" class="form-grid" novalidate>
@@ -548,11 +540,13 @@
       <div id="registerWork" class="register-grid" hidden>
         <section class="panel register-panel register-menu-panel" aria-labelledby="registerMenuTitle">
           <h3 id="registerMenuTitle">1. Drink</h3>
+          <p class="step-note">Pick what is being made. Greyed-out items are short of stock.</p>
           <div id="registerMenu" class="register-menu-grid"></div>
         </section>
 
         <section class="panel register-panel register-target-panel" aria-labelledby="registerTargetTitle">
           <h3 id="registerTargetTitle">2. For</h3>
+          <p class="step-note">Whose it is. A guest tab is billed at menu price; a crew member is charged at cost.</p>
           <span class="field-label">Guest tabs</span>
           <div id="registerTabs" class="register-choice-grid"></div>
           <form id="registerTabForm" class="register-tab-form" novalidate>
@@ -568,6 +562,7 @@
 
         <section class="panel register-panel register-pour-panel" aria-labelledby="registerPourTitle">
           <h3 id="registerPourTitle">3. Pour from</h3>
+          <p class="step-note">Check the bottle each ingredient comes out of, then ring it up. The price is fixed at that moment.</p>
           <div id="registerIngredients" class="register-ingredients"></div>
           <p id="registerHint" class="form-note" role="status"></p>
           <div class="register-actions">
@@ -581,6 +576,7 @@
             <h3 id="registerOpenTabsTitle">Open tabs</h3>
             <button id="registerEndNight" class="register-secondary" type="button">End night</button>
           </div>
+          <p class="step-note">Settle these whenever you like. Every tab must be closed before the night can end.</p>
           <div id="registerTabList" class="register-tab-list"></div>
           <h3 id="registerCrewDrinksTitle">Crew drinks</h3>
           <div id="registerCrewDrinkList" class="register-tab-list"></div>
@@ -590,6 +586,7 @@
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script src="domain.js"></script>
+    <script src="quotebook.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

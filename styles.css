@@ -10,9 +10,26 @@
   --accent-2: #22c55e;
   --blue: #38bdf8;
   --red: #ef4444;
+  /* Owing money reads as a light red, not a caution yellow. */
+  --red-soft: #fca5a5;
   --yellow: #facc15;
   --shadow: 0 20px 60px rgba(0, 0, 0, 0.28);
 }
+
+/*
+ * Button colour carries meaning, so read this before adding one.
+ *
+ *   --accent (orange, #111 text)  the action that moves things on: the next step
+ *                                 in a flow, and opening or closing a night.
+ *                                 Start night, Open register, Ring up, Paid,
+ *                                 End night.
+ *   --surface-2 (grey)            everything you might pick instead: options,
+ *                                 selections, navigation, undo. Start over,
+ *                                 Open tab, Exit register, Void, Remove, Set level.
+ *
+ * A grey control may turn orange on hover; an orange one stays orange, so the
+ * colour never reads as a state change.
+ */
 
 * {
   box-sizing: border-box;
@@ -209,7 +226,9 @@ small,
 
 .metric-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  /* auto-fit, not a fixed 4: at 1024 four fixed columns were narrower than the
+     numbers inside them, so "3 purchases logged" spilled out of its card. */
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
   gap: 14px;
 }
 
@@ -275,7 +294,9 @@ small,
 
 .form-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  /* auto-fit with a floor: two fixed columns became 116px each at 1024, too
+     narrow for a date input, a stock dropdown or most option text. */
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
   gap: 12px;
 }
 
@@ -286,6 +307,18 @@ small,
   color: var(--muted);
   font-size: 0.82rem;
   font-weight: 700;
+}
+
+/* A short number reads better in a short box; a name or a dropdown still fills
+   the column. Without this, ABV, price, markup and rounding were ~300px wide
+   for two characters. 9rem still clears a comfortable tap target. */
+.form-grid input[type="number"],
+.form-grid input[inputmode="decimal"] {
+  max-width: 9rem;
+}
+
+.form-grid .amount-field {
+  max-width: 15rem;
 }
 
 .form-grid input,
@@ -393,6 +426,40 @@ small,
   padding: 14px;
 }
 
+/* Grid and flex items default to min-width:auto, so a long stock name sized the
+   track wider than the card and every row spilled a few px past its edge. */
+.inventory-card > *,
+.inventory-card header > *,
+.inventory-card .person-copy {
+  min-width: 0;
+}
+
+/* The type name on the first line, the bottle's nickname on the second, each
+   kept to one line. They were inline in an unstyled div, so they ran together
+   and wrapped wherever the card happened to end. */
+.stock-identity {
+  display: grid;
+  gap: 2px;
+  /* Takes the room the ABV pill leaves and truncates inside it; without an
+     explicit basis it kept a slice of its own content width and pushed the
+     pill past the header's edge. */
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.inventory-card header > .pill {
+  flex: 0 0 auto;
+}
+
+.stock-identity strong,
+.stock-identity small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .inventory-card header,
 .ledger-item,
 .timeline-item,
@@ -411,6 +478,7 @@ small,
 /* Set level on an inventory card: one compact row, input then button. */
 .level-form {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   align-items: end;
 }
@@ -419,7 +487,9 @@ small,
   display: grid;
   flex: 1 1 auto;
   gap: 4px;
-  min-width: 0;
+  /* A floor, not 0: below this the amount box and its unit spilled out of the
+     label rather than shrinking with it. */
+  min-width: 8rem;
   color: var(--muted);
   font-size: 0.76rem;
   font-weight: 700;
@@ -493,10 +563,28 @@ small,
 }
 
 .ingredient-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 7.5rem) auto;
+  /* Flex, not fixed tracks: the amount column holds a number AND its unit
+     dropdown now, and fixed tracks either overflowed the row or crushed the
+     type dropdown to 23px depending on how wide the panel happened to be.
+     Wrapping lets the pair drop to its own line when the panel is narrow. */
+  display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   align-items: end;
+}
+
+.ingredient-row > label:first-child {
+  flex: 1 1 10rem;
+  min-width: 0;
+}
+
+.ingredient-row > label:nth-child(2) {
+  flex: 0 1 12rem;
+  min-width: 8rem;
+}
+
+.ingredient-row > .remove-button {
+  flex: 0 0 auto;
 }
 
 .ingredient-row input[readonly] {
@@ -625,6 +713,14 @@ body.is-register .app-shell {
   color: #111;
 }
 
+/* Open register is the next step out of Tonight; #exitRegister and #registerBack
+   are navigation back, so they keep the grey. */
+#openRegisterLink {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #111;
+}
+
 .register-banner {
   padding: 12px 16px;
   border: 2px solid var(--red);
@@ -648,11 +744,79 @@ body.is-register .app-shell {
   border-color: var(--red);
 }
 
+/*
+ * The register reads top to bottom on the left and sideways on the right: steps
+ * 1, 2 and 3 depend on each other and are stacked in order, while open tabs and
+ * crew drinks can be dealt with at any point and sit in their own column.
+ */
 .register-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+  grid-template-areas:
+    "menu   tabs"
+    "target tabs"
+    "pour   tabs";
   gap: 16px;
   align-items: start;
+}
+
+.register-menu-panel { grid-area: menu; }
+.register-target-panel { grid-area: target; }
+.register-pour-panel { grid-area: pour; }
+.register-tabs-panel { grid-area: tabs; }
+
+/* A short line under a numbered heading saying what the step is for. */
+.step-note {
+  margin: -4px 0 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+/* An amount box and the unit it is read in, side by side. */
+.amount-field {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.amount-field {
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* Floors so the pair can shrink with its label instead of spilling out of it,
+   and a cap so a box holding "40" is not 196px wide. */
+.amount-field input,
+.form-grid .amount-field input {
+  min-width: 3rem;
+  max-width: 9rem;
+}
+
+.amount-field .unit-select,
+.form-grid .amount-field .unit-select,
+.register .amount-field .unit-select {
+  min-width: 4rem;
+}
+
+/* These beat `.form-grid input, .form-grid select { width: 100% }`, which made
+   the input claim the whole row and shoved the unit dropdown outside it. */
+.amount-field input,
+.form-grid .amount-field input {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+}
+
+.amount-field .unit-select,
+.form-grid .amount-field .unit-select,
+.register .amount-field .unit-select {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 72px;
+}
+
+.unit-select[hidden] {
+  display: none;
 }
 
 .register-panel {
@@ -743,6 +907,14 @@ body.is-register .app-shell {
   color: var(--text);
 }
 
+/* Ending a night is the one action on either screen that closes the night, so
+   both End night buttons carry the accent, like .register-primary. The id beats
+   .register-secondary and #nightRecapPanel .secondary-button on specificity. */
+#registerEndNight {
+  background: var(--accent);
+  color: #111;
+}
+
 .register button:disabled {
   cursor: not-allowed;
   opacity: 0.45;
@@ -778,6 +950,25 @@ body.is-register .app-shell {
   grid-template-columns: minmax(0, 1fr) minmax(0, 6.5rem) auto;
   gap: 8px;
   align-items: end;
+}
+
+/* The bottle name, its buyer and what is left is the longest option text in the
+   app; on a narrow register it never fit beside the amount, so it takes the row
+   and the amount sits under it. */
+@media (max-width: 1200px) {
+  .register-source {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .register-source > label:first-child {
+    grid-column: 1 / -1;
+  }
+}
+
+/* An amount is a few characters; without this it stretched to 412px once the
+   bottle dropdown above it took the full row. */
+.register-source input[name="sourceAmount"] {
+  max-width: 9rem;
 }
 
 .register-source-detail {
@@ -951,7 +1142,7 @@ body.is-register .app-shell {
 }
 
 .balance-row.is-owes {
-  border-left-color: var(--yellow);
+  border-left-color: var(--red-soft);
 }
 
 .balance-row .person-copy strong,
@@ -977,7 +1168,7 @@ body.is-register .app-shell {
 }
 
 .is-owes .balance-amount {
-  color: var(--yellow);
+  color: var(--red-soft);
 }
 
 .is-square .balance-amount {
@@ -1101,6 +1292,38 @@ body.is-register .app-shell {
   color: var(--text);
 }
 
+/* Crew drinks on a host night: the same indented list as the buyers, with room
+   for the Void button. It wraps to its own line on a phone rather than squeezing
+   the drink's name. */
+.host-night-crew-drinks {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0 0 0 12px;
+  border-left: 2px solid var(--line);
+  list-style: none;
+}
+
+.host-night-crew-drinks li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.host-night-crew-drinks li > span:first-child {
+  flex: 1 1 60%;
+}
+
+.host-night-crew-drinks li > span + span {
+  color: var(--muted);
+}
+
+.host-night-crew-drinks button {
+  flex: 0 0 auto;
+}
+
 .progress {
   overflow: hidden;
   height: 12px;
@@ -1164,7 +1387,8 @@ body.is-register .app-shell {
   flex: 0 0 auto;
   border-radius: 8px;
   background: var(--person-color, var(--accent));
-  color: #111;
+  /* Black or white, whichever reads on the picked colour (RNMBDomain.contrastInk). */
+  color: var(--person-ink, #111);
   font-weight: 900;
 }
 
@@ -1325,6 +1549,17 @@ body.is-register .app-shell {
   opacity: 0.45;
 }
 
+#nightRecapPanel #endCrewNight {
+  background: var(--accent);
+  color: #111;
+}
+
+/* The panel's generic hover turns a button accent; this one already is, so it
+   stays put rather than flashing to the same colour it started at. */
+#nightRecapPanel #endCrewNight:hover:not(:disabled) {
+  background: var(--accent);
+}
+
 .recap-add {
   justify-self: start;
 }
@@ -1361,6 +1596,16 @@ body.is-register .app-shell {
 
   .register-grid {
     grid-template-columns: 1fr;
+    /* One column: drop the areas so the panels flow in source order, which is
+       already 1, 2, 3, then the anytime column. */
+    grid-template-areas: none;
+  }
+
+  .register-menu-panel,
+  .register-target-panel,
+  .register-pour-panel,
+  .register-tabs-panel {
+    grid-area: auto;
   }
 }
 
