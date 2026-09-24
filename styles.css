@@ -396,7 +396,8 @@ small,
 }
 
 .form-grid button,
-.archive-actions button {
+.archive-actions button,
+.quotebook-upload {
   min-height: 42px;
   align-self: end;
   border-radius: 8px;
@@ -1501,17 +1502,13 @@ body.is-register .app-shell {
   gap: 10px;
 }
 
+/* A label styled as a button: the colours and height come from the accent-button rule above. */
 .quotebook-upload {
   position: relative;
   display: grid;
   flex: 1 1 220px;
-  min-height: 42px;
   place-items: center;
   padding: 10px 14px;
-  border-radius: 8px;
-  background: var(--accent);
-  color: #111;
-  font-weight: 900;
   text-align: center;
   cursor: pointer;
 }

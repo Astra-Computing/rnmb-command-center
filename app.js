@@ -3697,11 +3697,13 @@ function renderCrew() {
   });
 }
 
+const quoteCount = (count) => `${count} ${count === 1 ? "quote" : "quotes"}`;
+
 /** The Crew tab's quotebook panel: never a blank status line, always where the book lives. */
 function renderQuotebookWidget() {
   const status = document.querySelector("#quotebookStatus");
   status.textContent = quotebook
-    ? `${quotebook.fileName}: ${quotebook.count} ${quotebook.count === 1 ? "quote" : "quotes"} loaded in this browser.`
+    ? `${quotebook.fileName}: ${quoteCount(quotebook.count)} loaded in this browser.`
     : "No quotebook is loaded in this browser.";
   document.querySelector("#quotebookClear").hidden = !quotebook;
 }
@@ -4469,9 +4471,10 @@ document.querySelector("#quotebookFile").addEventListener("change", async (event
       return;
     }
     const prepared = RNMBQuotebook.prepareBook(await file.text(), file.name);
-    const saved = prepared.ok ? quotebookStore.save(prepared.book) : prepared;
-    if (!saved.ok) {
-      showToast(QUOTEBOOK_REFUSALS[saved.reason]);
+    // A refused parse and a refused write both carry a reason; either leaves the book as it was.
+    const outcome = prepared.ok ? quotebookStore.save(prepared.book) : prepared;
+    if (!outcome.ok) {
+      showToast(QUOTEBOOK_REFUSALS[outcome.reason]);
       return;
     }
     quotebook = prepared.book;
@@ -4479,7 +4482,7 @@ document.querySelector("#quotebookFile").addEventListener("change", async (event
     heldQuote = null;
     paintQuoteCard();
     renderQuotebookWidget();
-    showToast(`Quotebook loaded: ${quotebook.count} ${quotebook.count === 1 ? "quote" : "quotes"} from ${quotebook.fileName}.`);
+    showToast(`Quotebook loaded: ${quoteCount(quotebook.count)} from ${quotebook.fileName}.`);
   } catch (error) {
     console.error(error);
     showToast("That file could not be read as a quotebook.");

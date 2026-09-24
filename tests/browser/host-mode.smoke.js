@@ -4132,7 +4132,9 @@ const scenarios = [
 // Every book below is a committed SYNTHETIC fixture or an inline line made up for
 // the test (KTD14). No check here is ever driven with the crew's real quotebook.
 
-const QUOTEBOOK_KEY = "rnmb-quotebook-v1";
+const RNMBQuotebook = require("../../quotebook.js");
+const QUOTEBOOK_KEY = RNMBQuotebook.STORAGE_KEY;
+const APP_STATE_KEY = "rnmb-command-center-v1";
 const quotebookFixture = (name) => fs.readFileSync(`${__dirname}/../fixtures/parser/${name}`, "utf8");
 
 /** Run an action, then wait for a toast shown after it (a repeat of an earlier toast still counts). */
@@ -4159,7 +4161,7 @@ async function uploadQuotebook(session, name, contents, toast) {
 
 /** A stored book, seeded before the page's own scripts run (the widget is tested separately). */
 function seedQuotebook(text, fileName = "seeded.txt") {
-  const { book } = require("../../quotebook.js").prepareBook(text, fileName);
+  const { book } = RNMBQuotebook.prepareBook(text, fileName);
   return async (page) => {
     await page.addInitScript(({ key, value }) => {
       // Only on the first load of this context, so a reload after clearing stays cleared.
@@ -4194,11 +4196,37 @@ const quoteCard = (page) => page.evaluate(() => {
   };
 });
 
-const quotebookWidget = (page) => page.evaluate(() => ({
+const quotebookWidget = (page) => page.evaluate((key) => ({
   status: document.querySelector("#quotebookStatus").textContent,
   clearHidden: document.querySelector("#quotebookClear").hidden,
-  stored: localStorage.getItem("rnmb-quotebook-v1")
-}));
+  stored: localStorage.getItem(key)
+}), QUOTEBOOK_KEY);
+
+/** The shared-database stub, with one rum bottle to pour from and host mode's crew-pour function. */
+function quoteStubWithBottle() {
+  const { ids, seed } = hostModeSeed();
+  const bottleId = "99999999-0000-4000-8000-000000000001";
+  seed.rnmb_bottles = [{ id: bottleId, type_id: ids.rum, nickname: "Rum bottle", size_oz: 25, remaining_oz: 25, price: 40, buyer_id: ids.sam, purchase_date: "2026-09-16" }];
+  const stub = hostModeStub(seed);
+  // Host mode logs a crew pour through one function that also takes it off the level.
+  stub.rpc.rnmb_add_crew_pour = (payload) => {
+    stub.store.rnmb_pours.push({ id: payload.id, night_id: payload.night_id, person_id: payload.person_id, bottle_id: payload.bottle_id, ounces: payload.ounces, poured_at: payload.poured_at });
+    stub.store.rnmb_bottles.find((row) => row.id === payload.bottle_id).remaining_oz -= payload.ounces;
+    return payload.id;
+  };
+  return { stub, ids, bottleId };
+}
+
+/** Log a pour without leaving the current tab: the pour form submits in place and the dashboard redraws. */
+async function logPourInPlace(session, { personId, bottleId }) {
+  await actionForToast(session, () => session.page.evaluate(({ personId, bottleId }) => {
+    const form = document.querySelector("#pourForm");
+    form.querySelector("[name='personId']").value = personId;
+    form.querySelector("[name='bottleId']").value = bottleId;
+    form.querySelector("[name='ounces']").value = "1.5";
+    form.requestSubmit();
+  }, { personId, bottleId }), "Pour logged.");
+}
 
 scenarios.push(
   {
@@ -4220,7 +4248,7 @@ scenarios.push(
         assert.equal(JSON.parse(widget.stored).count, 10);
 
         // A second upload replaces the first; the stated count changes with it.
-        const longCount = (await page.evaluate((text) => window.RNMBQuotebook.parseQuotebook(text).length, quotebookFixture("LongQuotes.txt")));
+        const longCount = RNMBQuotebook.parseQuotebook(quotebookFixture("LongQuotes.txt")).length;
         await uploadQuotebook(session, "LongQuotes.txt", quotebookFixture("LongQuotes.txt"), `Quotebook loaded: ${longCount} quotes from LongQuotes.txt.`);
         widget = await quotebookWidget(page);
         assert.equal(widget.status, `LongQuotes.txt: ${longCount} quotes loaded in this browser.`);
@@ -4249,15 +4277,15 @@ scenarios.push(
         assert.equal((await quotebookWidget(page)).status, `LongQuotes.txt: ${longCount} quotes loaded in this browser.`);
 
         // Clearing is local and quiet: no confirm, no backup download, app state untouched.
-        const appStateBefore = await page.evaluate(() => localStorage.getItem("rnmb-command-center-v1"));
+        const appStateBefore = await page.evaluate((key) => localStorage.getItem(key), APP_STATE_KEY);
         let downloaded = false;
         page.on("download", () => { downloaded = true; });
-        await actionForToast(session, () => page.click("#quotebookClear"), "Quotebook cleared from this browser.");
+        await clickForToast(session, "#quotebookClear", "Quotebook cleared from this browser.");
         widget = await quotebookWidget(page);
         assert.equal(widget.status, "No quotebook is loaded in this browser.");
         assert.equal(widget.clearHidden, true);
         assert.equal(widget.stored, null);
-        assert.equal(await page.evaluate(() => localStorage.getItem("rnmb-command-center-v1")), appStateBefore);
+        assert.equal(await page.evaluate((key) => localStorage.getItem(key), APP_STATE_KEY), appStateBefore);
         assert.equal(downloaded, false, "clearing the quotebook takes no backup");
         session.assertClean();
       } finally {
@@ -4308,7 +4336,7 @@ scenarios.push(
         assert.equal(leftmost, "quoteCard", "6.9.4: leftmost in the metric grid");
 
         await page.click('.tab-button[data-tab="crew"]');
-        await actionForToast(session, () => page.click("#quotebookClear"), "Quotebook cleared from this browser.");
+        await clickForToast(session, "#quotebookClear", "Quotebook cleared from this browser.");
         assert.equal((await quoteCard(page)).hidden, true, "hidden at once, before the Overview is shown again");
         await page.click('.tab-button[data-tab="overview"]');
         card = await quoteCard(page);
@@ -4418,17 +4446,7 @@ scenarios.push(
   {
     name: "Quote card holds its quote through a save and a differing poll (AE4), and re-picks when the Overview shows again",
     async run({ browser }) {
-      const { ids, seed } = hostModeSeed();
-      const bottleId = "99999999-0000-4000-8000-000000000001";
-      seed.rnmb_bottles = [{ id: bottleId, type_id: ids.rum, nickname: "Rum bottle", size_oz: 25, remaining_oz: 25, price: 40, buyer_id: ids.sam, purchase_date: "2026-09-16" }];
-      const stub = hostModeStub(seed);
-      // Host mode logs a crew pour through one function that also takes it off the level.
-      stub.rpc.rnmb_add_crew_pour = (payload) => {
-        stub.store.rnmb_pours.push({ id: payload.id, night_id: payload.night_id, person_id: payload.person_id, bottle_id: payload.bottle_id, ounces: payload.ounces, poured_at: payload.poured_at });
-        const bottle = stub.store.rnmb_bottles.find((row) => row.id === payload.bottle_id);
-        bottle.remaining_oz -= payload.ounces;
-        return payload.id;
-      };
+      const { stub, ids, bottleId } = quoteStubWithBottle();
       const session = await openPage(browser, {
         routes: async (page) => {
           await stub.routes(page);
@@ -4441,14 +4459,8 @@ scenarios.push(
         const showing = (await quoteCard(page)).text;
         assert.ok(showing);
 
-        // A pour saved from the Overview: the form submits in place, the dashboard redraws.
-        await actionForToast(session, () => page.evaluate(({ personId, bottleId }) => {
-          const form = document.querySelector("#pourForm");
-          form.querySelector("[name='personId']").value = personId;
-          form.querySelector("[name='bottleId']").value = bottleId;
-          form.querySelector("[name='ounces']").value = "1.5";
-          form.requestSubmit();
-        }, { personId: ids.sam, bottleId }), "Pour logged.");
+        // A pour saved while the Overview is showing.
+        await logPourInPlace(session, { personId: ids.sam, bottleId });
         assert.ok(stub.log.some((entry) => entry.path === "rpc/rnmb_add_crew_pour"), "the pour reached the shared database");
         assert.equal((await quoteCard(page)).text, showing, "a save keeps the quote");
 
@@ -4491,11 +4503,7 @@ scenarios.push(
     // U6, AE3: the only automated guard on the plan's privacy requirement (5.11.3).
     name: "Quotebook containment: no quote reaches stored app state, any request, or an exported archive (AE3)",
     async run({ browser }) {
-      const { ids, seed } = hostModeSeed();
-      const bottleId = "99999999-0000-4000-8000-000000000001";
-      seed.rnmb_bottles = [{ id: bottleId, type_id: ids.rum, nickname: "Rum bottle", size_oz: 25, remaining_oz: 25, price: 40, buyer_id: ids.sam, purchase_date: "2026-09-16" }];
-      const stub = hostModeStub(seed);
-      stub.rpc.rnmb_add_crew_pour = (payload) => payload.id;
+      const { stub, ids, bottleId } = quoteStubWithBottle();
       const session = await openPage(browser, { routes: stub.routes });
       const { page } = session;
 
@@ -4504,7 +4512,7 @@ scenarios.push(
       page.on("request", (request) => sent.push(`${request.method()} ${request.url()}\n${request.postData() || ""}`));
 
       const book = quotebookFixture("LongQuotes.txt");
-      const quotes = require("../../quotebook.js").parseQuotebook(book);
+      const quotes = RNMBQuotebook.parseQuotebook(book);
       // A quote can sit in a haystack raw (an archive, a URL) or JSON-escaped (a body, stored state).
       const leaked = (haystack) => quotes
         .filter((quote) => haystack.includes(quote.text) || haystack.includes(JSON.stringify(quote.text).slice(1, -1)))
@@ -4520,26 +4528,20 @@ scenarios.push(
         assert.ok(quotes.some((quote) => quote.text === showing), "the book is loaded and a quote from it is on screen");
 
         // Writes of every shape: a crew pour, a new crew member, and a whole-state replace.
-        await actionForToast(session, () => page.evaluate(({ personId, bottleId }) => {
-          const form = document.querySelector("#pourForm");
-          form.querySelector("[name='personId']").value = personId;
-          form.querySelector("[name='bottleId']").value = bottleId;
-          form.querySelector("[name='ounces']").value = "1.5";
-          form.requestSubmit();
-        }, { personId: ids.sam, bottleId }), "Pour logged.");
+        await logPourInPlace(session, { personId: ids.sam, bottleId });
         await page.click('.tab-button[data-tab="crew"]');
         await page.fill("#personForm [name='name']", "Riley");
-        await actionForToast(session, () => page.click("#personForm button[type='submit']"), "Person added to the roster.");
+        await clickForToast(session, "#personForm button[type='submit']", "Person added to the roster.");
 
         const backupPromise = page.waitForEvent("download");
-        await actionForToast(session, () => page.click("#seedData"), "Demo data reloaded.");
+        await clickForToast(session, "#seedData", "Demo data reloaded.");
         const backup = await readDownload(await backupPromise);
 
         const exportPromise = page.waitForEvent("download");
         await page.click("#exportData");
         const exported = await readDownload(await exportPromise);
 
-        const stored = await page.evaluate(() => localStorage.getItem("rnmb-command-center-v1"));
+        const stored = await page.evaluate((key) => localStorage.getItem(key), APP_STATE_KEY);
         const bodies = stub.log.map((entry) => JSON.stringify(entry));
 
         assert.ok(stub.log.some((entry) => entry.path === "rpc/rnmb_add_crew_pour"), "the pour was sent");
