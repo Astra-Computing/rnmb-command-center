@@ -4128,6 +4128,128 @@ const scenarios = [
   }
 ];
 
+// ---------- quotebook (unit 11) --------------------------------------------------
+// Every book below is a committed SYNTHETIC fixture or an inline line made up for
+// the test (KTD14). No check here is ever driven with the crew's real quotebook.
+
+const QUOTEBOOK_KEY = "rnmb-quotebook-v1";
+const quotebookFixture = (name) => fs.readFileSync(`${__dirname}/../fixtures/parser/${name}`, "utf8");
+
+/** Run an action, then wait for a toast shown after it (a repeat of an earlier toast still counts). */
+async function actionForToast(session, action, text) {
+  const count = (await session.toasts()).length;
+  await action();
+  await session.page.waitForFunction(
+    ({ count, text }) => window.__toasts.slice(count).includes(text),
+    { count, text },
+    { timeout: 10000 }
+  );
+}
+
+/** Upload a book through the Crew tab's widget and wait for the given toast. */
+async function uploadQuotebook(session, name, contents, toast) {
+  const { page } = session;
+  await page.click('.tab-button[data-tab="crew"]');
+  await actionForToast(session, () => page.setInputFiles("#quotebookFile", {
+    name,
+    mimeType: "text/plain",
+    buffer: Buffer.from(contents, "utf8")
+  }), toast);
+}
+
+const quotebookWidget = (page) => page.evaluate(() => ({
+  status: document.querySelector("#quotebookStatus").textContent,
+  clearHidden: document.querySelector("#quotebookClear").hidden,
+  stored: localStorage.getItem("rnmb-quotebook-v1")
+}));
+
+scenarios.push(
+  {
+    name: "Quotebook widget loads, replaces, refuses an empty file without losing the book, and clears",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await page.click('.tab-button[data-tab="crew"]');
+        let widget = await quotebookWidget(page);
+        assert.equal(widget.status, "No quotebook is loaded in this browser.", "never a blank status line");
+        assert.equal(widget.clearHidden, true, "nothing to clear");
+        assert.equal(widget.stored, null);
+
+        await uploadQuotebook(session, "StressTest.txt", quotebookFixture("StressTest.txt"), "Quotebook loaded: 10 quotes from StressTest.txt.");
+        widget = await quotebookWidget(page);
+        assert.equal(widget.status, "StressTest.txt: 10 quotes loaded in this browser.");
+        assert.equal(widget.clearHidden, false);
+        assert.equal(JSON.parse(widget.stored).count, 10);
+
+        // A second upload replaces the first; the stated count changes with it.
+        const longCount = (await page.evaluate((text) => window.RNMBQuotebook.parseQuotebook(text).length, quotebookFixture("LongQuotes.txt")));
+        await uploadQuotebook(session, "LongQuotes.txt", quotebookFixture("LongQuotes.txt"), `Quotebook loaded: ${longCount} quotes from LongQuotes.txt.`);
+        widget = await quotebookWidget(page);
+        assert.equal(widget.status, `LongQuotes.txt: ${longCount} quotes loaded in this browser.`);
+        assert.equal(JSON.parse(widget.stored).fileName, "LongQuotes.txt", "the second book replaced the first");
+
+        // Both fixtures happen to hold 10, so prove the stated count follows the book.
+        await uploadQuotebook(session, "three.txt", '"One." - Ines\n"Two." - Bram\n"Three." - Ines', "Quotebook loaded: 3 quotes from three.txt.");
+        assert.equal((await quotebookWidget(page)).status, "three.txt: 3 quotes loaded in this browser.");
+        await uploadQuotebook(session, "LongQuotes.txt", quotebookFixture("LongQuotes.txt"), `Quotebook loaded: ${longCount} quotes from LongQuotes.txt.`);
+        widget = await quotebookWidget(page);
+
+        // A file with no quotes is a failed upload, not an empty book: the loaded one survives.
+        const refused = "No quotes were found in that file, so the quotebook was not changed. Put one quote per line.";
+        await uploadQuotebook(session, "blank.txt", "\r\n   \r\n\t\r\n", refused);
+        const afterRefusal = await quotebookWidget(page);
+        assert.equal(afterRefusal.status, widget.status, "the stated book is unchanged");
+        assert.equal(afterRefusal.stored, widget.stored, "the stored book is unchanged");
+
+        // Picking the same filename again still fires the handler (the input was reset).
+        await uploadQuotebook(session, "blank.txt", "\r\n   \r\n\t\r\n", refused);
+
+        // The book persists across a reload, in this browser only.
+        await page.reload({ waitUntil: "domcontentloaded" });
+        await page.waitForFunction(() => window.__rnmb && window.__toasts && window.__toasts.length > 0);
+        await page.click('.tab-button[data-tab="crew"]');
+        assert.equal((await quotebookWidget(page)).status, `LongQuotes.txt: ${longCount} quotes loaded in this browser.`);
+
+        // Clearing is local and quiet: no confirm, no backup download, app state untouched.
+        const appStateBefore = await page.evaluate(() => localStorage.getItem("rnmb-command-center-v1"));
+        let downloaded = false;
+        page.on("download", () => { downloaded = true; });
+        await actionForToast(session, () => page.click("#quotebookClear"), "Quotebook cleared from this browser.");
+        widget = await quotebookWidget(page);
+        assert.equal(widget.status, "No quotebook is loaded in this browser.");
+        assert.equal(widget.clearHidden, true);
+        assert.equal(widget.stored, null);
+        assert.equal(await page.evaluate(() => localStorage.getItem("rnmb-command-center-v1")), appStateBefore);
+        assert.equal(downloaded, false, "clearing the quotebook takes no backup");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Quotebook widget refuses a book over the size cap and keeps the one loaded",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        await uploadQuotebook(session, "small.txt", '"The keg is a mood." - Ines', "Quotebook loaded: 1 quote from small.txt.");
+        const before = await quotebookWidget(page);
+
+        const line = `"${"x".repeat(200)}" - Bram\n`;
+        const huge = line.repeat(Math.ceil((256 * 1024 * 1.2) / line.length));
+        await uploadQuotebook(session, "huge.txt", huge, "That quotebook is too large to keep in this browser (the limit is 256 KB), so it was not loaded.");
+        assert.deepEqual(await quotebookWidget(page), before);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  }
+);
+
 // ---------- runner ---------------------------------------------------------------
 
 async function main() {

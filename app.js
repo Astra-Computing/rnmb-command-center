@@ -119,6 +119,12 @@ let recapPending = false;
 const quickLogDraftIds = new Map();
 const paymentDraftIds = new Map();
 
+// The quotebook (unit 11) lives under its own browser key and never on `state`
+// (KTD2), so no save, poll, import or export can carry a quote anywhere. The
+// store's logic is in quotebook.js; only the storage calls and DOM wiring are here.
+const quotebookStore = RNMBQuotebook.createStore();
+let quotebook = quotebookStore.load();
+
 function draftId(drafts, key) {
   if (!drafts.has(key)) drafts.set(key, uid());
   return drafts.get(key);
@@ -1651,6 +1657,7 @@ function render() {
   renderLedger();
   renderHostNights();
   renderCrew();
+  renderQuotebookWidget();
   renderRegister();
 }
 
@@ -3563,6 +3570,15 @@ function renderCrew() {
   });
 }
 
+/** The Crew tab's quotebook panel: never a blank status line, always where the book lives. */
+function renderQuotebookWidget() {
+  const status = document.querySelector("#quotebookStatus");
+  status.textContent = quotebook
+    ? `${quotebook.fileName}: ${quotebook.count} ${quotebook.count === 1 ? "quote" : "quotes"} loaded in this browser.`
+    : "No quotebook is loaded in this browser.";
+  document.querySelector("#quotebookClear").hidden = !quotebook;
+}
+
 function activateTab(tabId) {
   document.querySelectorAll(".tab-button").forEach((button) => {
     button.classList.toggle("is-active", button.dataset.tab === tabId);
@@ -4301,6 +4317,55 @@ document.querySelector("#clearData").addEventListener("click", async () => {
   downloadArchive("backup-before-clear");
   state = emptyState();
   await saveState("Dashboard cleared.");
+});
+
+const QUOTEBOOK_REFUSALS = {
+  empty: "No quotes were found in that file, so the quotebook was not changed. Put one quote per line.",
+  "too-large": "That quotebook is too large to keep in this browser (the limit is 256 KB), so it was not loaded.",
+  storage: "This browser would not store the quotebook, so it was not loaded."
+};
+
+// Validate fully, then commit, like the archive import: nothing replaces the
+// loaded book until a parse has produced quotes and the write has succeeded.
+document.querySelector("#quotebookFile").addEventListener("change", async (event) => {
+  const file = event.target.files[0];
+  if (!file) return;
+  try {
+    // Every stored character is at least a byte on disk, and a file this many
+    // times the cap cannot shrink under it, so refuse it without reading it in.
+    if (file.size > RNMBQuotebook.MAX_STORED_CHARS * 8) {
+      showToast(QUOTEBOOK_REFUSALS["too-large"]);
+      return;
+    }
+    const prepared = RNMBQuotebook.prepareBook(await file.text(), file.name);
+    const saved = prepared.ok ? quotebookStore.save(prepared.book) : prepared;
+    if (!saved.ok) {
+      showToast(QUOTEBOOK_REFUSALS[saved.reason]);
+      return;
+    }
+    quotebook = prepared.book;
+    renderQuotebookWidget();
+    showToast(`Quotebook loaded: ${quotebook.count} ${quotebook.count === 1 ? "quote" : "quotes"} from ${quotebook.fileName}.`);
+  } catch (error) {
+    console.error(error);
+    showToast("That file could not be read as a quotebook.");
+  } finally {
+    // Reset, so picking the same file again (say, after fixing it) fires change.
+    event.target.value = "";
+  }
+});
+
+// KTD10: not confirmDestructive and not .danger. Nothing shared is touched and
+// no backup is taken, so borrowing that confirm's grammar would cheapen the one
+// that really does wipe everyone's data.
+document.querySelector("#quotebookClear").addEventListener("click", () => {
+  if (!quotebookStore.clear()) {
+    showToast("This browser would not clear the quotebook.");
+    return;
+  }
+  quotebook = null;
+  renderQuotebookWidget();
+  showToast("Quotebook cleared from this browser.");
 });
 
 // Read-mostly handle for the browser smoke tests (tests/browser/host-mode.smoke.js)

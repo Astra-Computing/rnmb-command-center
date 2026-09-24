@@ -1421,6 +1421,63 @@ body.is-register .app-shell {
   color: #fff;
 }
 
+/* Quotebook panel (unit 11). Loading is the action that moves things on, so it
+   carries the accent; clearing is the alternative, so it is grey. */
+.quotebook-status {
+  font-weight: 800;
+}
+
+.quotebook-note {
+  max-width: 70ch;
+  margin: 8px 0 14px;
+  color: var(--muted);
+}
+
+.quotebook-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.quotebook-upload {
+  position: relative;
+  display: grid;
+  flex: 1 1 220px;
+  min-height: 42px;
+  place-items: center;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #111;
+  font-weight: 900;
+  text-align: center;
+  cursor: pointer;
+}
+
+/* The real input is visually hidden but still focusable; show focus on its label. */
+.quotebook-upload:focus-within {
+  outline: 2px solid var(--text);
+  outline-offset: 2px;
+}
+
+.quotebook-actions .secondary-button {
+  min-height: 42px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: 800;
+}
+
+.quotebook-actions .secondary-button:hover {
+  background: var(--accent);
+  color: #111;
+}
+
+.quotebook-actions [hidden] {
+  display: none;
+}
+
 .remove-button {
   min-width: 32px;
   min-height: 32px;

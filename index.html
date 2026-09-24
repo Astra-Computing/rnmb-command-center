@@ -508,6 +508,25 @@
             </div>
             <div id="personList" class="person-list empty-state">No people added yet.</div>
           </section>
+
+          <!-- The quotebook (unit 11): kept in this browser only, never shared. -->
+          <section class="panel quotebook-panel" aria-labelledby="quotebook-title">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">Quotebook</span>
+                <h3 id="quotebook-title">Crew Quotes</h3>
+              </div>
+            </div>
+            <p id="quotebookStatus" class="quotebook-status">No quotebook is loaded in this browser.</p>
+            <p class="quotebook-note">The book stays in this browser. It is never sent to the shared database or put in an export, and clearing or importing the dashboard leaves it alone, so load it again on each device. Once loaded, a quote shows on the Overview.</p>
+            <div class="quotebook-actions">
+              <label class="quotebook-upload file-button">
+                Load quotebook (.txt)
+                <input id="quotebookFile" type="file" accept=".txt,text/plain">
+              </label>
+              <button id="quotebookClear" class="secondary-button" type="button" hidden>Clear quotebook</button>
+            </div>
+          </section>
         </section>
       </main>
     </div>
