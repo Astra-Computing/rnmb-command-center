@@ -202,3 +202,131 @@ test("the long-quote fixture parses, carries an oversized quote and a multi-spea
     "the fixture includes a multi-speaker exchange"
   );
 });
+
+// ---------- the local store (U2) ----------------------------------------------
+// The store runs against an injected fake, so none of this needs a browser.
+
+const APP_STATE_KEY = "rnmb-command-center-v1";
+
+const fakeStorage = (initial = {}) => {
+  const data = new Map(Object.entries(initial));
+  return {
+    data,
+    getItem: (key) => (data.has(key) ? data.get(key) : null),
+    setItem: (key, value) => {
+      data.set(key, String(value));
+    },
+    removeItem: (key) => {
+      data.delete(key);
+    }
+  };
+};
+
+test("the store key is its own, never the app-state or passphrase key", () => {
+  assert.equal(typeof Q.STORAGE_KEY, "string");
+  assert.notEqual(Q.STORAGE_KEY, APP_STATE_KEY);
+  assert.notEqual(Q.STORAGE_KEY, "rnmb-access-key");
+});
+
+test("a parsed book round-trips through the store and reads back identical", () => {
+  const storage = fakeStorage();
+  const store = Q.createStore(storage);
+  const prepared = Q.prepareBook(fixture("StressTest.txt"), "StressTest.txt");
+
+  assert.equal(prepared.ok, true);
+  assert.equal(prepared.book.fileName, "StressTest.txt");
+  assert.equal(prepared.book.count, prepared.book.quotes.length);
+  assert.ok(prepared.book.count > 0);
+
+  assert.deepEqual(store.save(prepared.book), { ok: true });
+  assert.deepEqual(store.load(), prepared.book);
+});
+
+test("an upload with no usable quotes is refused and never reaches storage", () => {
+  const storage = fakeStorage();
+  const store = Q.createStore(storage);
+  const kept = Q.prepareBook('"Keep me." - Ines', "keep.txt").book;
+  store.save(kept);
+
+  for (const text of ["", "\n \r\n\t", "﻿", null, undefined, 42]) {
+    const prepared = Q.prepareBook(text, "empty.txt");
+    assert.equal(prepared.ok, false);
+    assert.equal(prepared.reason, "empty");
+  }
+  assert.deepEqual(store.load(), kept, "the previously loaded book is untouched");
+});
+
+test("a book over the size cap is rejected and the stored book is unchanged", () => {
+  const storage = fakeStorage();
+  const store = Q.createStore(storage);
+  const kept = Q.prepareBook('"Keep me." - Ines', "keep.txt").book;
+  store.save(kept);
+  const before = storage.getItem(Q.STORAGE_KEY);
+
+  const line = '"' + "x".repeat(200) + '" - Bram\n';
+  const huge = line.repeat(Math.ceil((Q.MAX_STORED_CHARS * 1.2) / line.length));
+  const prepared = Q.prepareBook(huge, "huge.txt");
+
+  assert.equal(prepared.ok, false, "refused at upload time, before any write");
+  assert.equal(prepared.reason, "too-large");
+  assert.equal(storage.getItem(Q.STORAGE_KEY), before);
+
+  // save() enforces the same cap on its own, whatever it is handed.
+  const oversized = { fileName: "huge.txt", count: 1, quotes: [{ text: "y".repeat(Q.MAX_STORED_CHARS), author: "Bram" }] };
+  assert.deepEqual(store.save(oversized), { ok: false, reason: "too-large" });
+  assert.equal(storage.getItem(Q.STORAGE_KEY), before);
+});
+
+test("a storage write that throws is caught, reported, and leaves the previous book intact", () => {
+  const storage = fakeStorage();
+  const store = Q.createStore(storage);
+  const kept = Q.prepareBook('"Keep me." - Ines', "keep.txt").book;
+  store.save(kept);
+
+  storage.setItem = () => {
+    throw new Error("QuotaExceededError");
+  };
+  const next = Q.prepareBook('"Replace me." - Bram', "next.txt").book;
+
+  assert.deepEqual(store.save(next), { ok: false, reason: "storage" });
+  assert.deepEqual(store.load(), kept);
+});
+
+test("a corrupt, absent or unreadable stored value reads as no book without throwing", () => {
+  assert.equal(Q.createStore(fakeStorage()).load(), null, "absent");
+
+  for (const raw of ["{not json", "null", "42", '"a string"', "[]", '{"quotes":"nope"}', '{"quotes":[]}', '{"quotes":[{"text":1,"author":2}]}']) {
+    const storage = fakeStorage({ [Q.STORAGE_KEY]: raw });
+    assert.equal(Q.createStore(storage).load(), null, "corrupt: " + raw);
+  }
+
+  const throwing = fakeStorage();
+  throwing.getItem = () => {
+    throw new Error("SecurityError");
+  };
+  assert.equal(Q.createStore(throwing).load(), null, "a getItem that throws");
+  assert.equal(Q.createStore(null).load(), null, "no storage at all");
+});
+
+test("a stored book with some malformed entries keeps only the well-formed ones", () => {
+  const raw = JSON.stringify({
+    fileName: "mixed.txt",
+    count: 3,
+    quotes: [{ text: "Good.", author: "Ines" }, { text: 5, author: "Bram" }, null, { text: "Also good.", author: "Bram" }]
+  });
+  const book = Q.createStore(fakeStorage({ [Q.STORAGE_KEY]: raw })).load();
+
+  assert.equal(book.count, 2, "the count is recomputed, never trusted");
+  assert.deepEqual(book.quotes, [{ text: "Good.", author: "Ines" }, { text: "Also good.", author: "Bram" }]);
+});
+
+test("clearing removes the quotebook key and leaves the app-state key untouched", () => {
+  const storage = fakeStorage({ [APP_STATE_KEY]: '{"people":[]}' });
+  const store = Q.createStore(storage);
+  store.save(Q.prepareBook('"Keep me." - Ines', "keep.txt").book);
+
+  assert.equal(store.clear(), true);
+  assert.equal(storage.getItem(Q.STORAGE_KEY), null);
+  assert.equal(storage.getItem(APP_STATE_KEY), '{"people":[]}');
+  assert.equal(store.load(), null);
+});

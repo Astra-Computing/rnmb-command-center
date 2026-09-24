@@ -48,10 +48,25 @@
  *  No attribution
  *    "Quote text"   /   Quote text        → author = "Unknown"
  *
+ * ── The local store (U2) ─────────────────────────────────────────────────────
+ * The crew's quotes are the most private thing the group has, so the parsed book
+ * lives under its OWN browser storage key (KTD2) and nowhere else: never on the
+ * app `state` object (normalizeState would drop it, and archiveData() would ship
+ * it in every export first), never in Supabase. The store takes its storage as a
+ * parameter so node --test can drive it with a fake; app.js passes localStorage.
+ *
  * Exported API:
  *   normalizeText(rawText) -> string     BOM stripped, newlines folded, curly
  *                                        double quote marks folded to ASCII "
  *   parseQuotebook(rawText) -> [{ text, author }]
+ *   prepareBook(rawText, fileName) -> { ok: true, book } | { ok: false, reason }
+ *                                        reason: "empty" | "too-large"
+ *   createStore(storage) -> { load() -> book | null,
+ *                             save(book) -> { ok: true } | { ok: false, reason },
+ *                             clear() -> boolean }
+ *                                        reason: "too-large" | "storage"
+ *   STORAGE_KEY, MAX_STORED_CHARS
+ * A book is { fileName, count, quotes: [{ text, author }] }.
  */
 
 var RNMBQuotebook = (function () {
@@ -270,9 +285,116 @@ var RNMBQuotebook = (function () {
     return seen;
   }
 
+  // ── The local store ────────────────────────────────────────────────────────
+
+  var STORAGE_KEY = "rnmb-quotebook-v1";
+
+  // KTD11: 256 KB, for quota headroom rather than parse cost. localStorage is one
+  // ~5 MB budget per origin shared with the app-state key, and commitSave writes
+  // app state AFTER the Supabase write has succeeded, so a book that ate the
+  // quota would make a later pour report a failure that did not happen. Measured
+  // in UTF-16 code units, which is how browsers count against that quota.
+  var MAX_STORED_CHARS = 256 * 1024;
+
+  function isQuote(value) {
+    return Boolean(value) && typeof value.text === "string" && typeof value.author === "string" && value.text.length > 0;
+  }
+
+  function makeBook(fileName, quotes) {
+    return {
+      fileName: typeof fileName === "string" && fileName ? fileName : "quotebook.txt",
+      count: quotes.length,
+      quotes: quotes
+    };
+  }
+
+  /**
+   * Parse an upload into a storable book, or say why it cannot be one. Nothing is
+   * written here: the caller saves only an ok result, so a failed upload can never
+   * replace the book already loaded (6.11.5, 6.11.7).
+   */
+  function prepareBook(rawText, fileName) {
+    var quotes = parseQuotebook(rawText);
+    if (!quotes.length) return { ok: false, reason: "empty" };
+    var book = makeBook(fileName, quotes);
+    if (JSON.stringify(book).length > MAX_STORED_CHARS) return { ok: false, reason: "too-large" };
+    return { ok: true, book: book };
+  }
+
+  /** A stored value back into a book; anything unusable reads as no book. */
+  function parseStored(raw) {
+    if (typeof raw !== "string" || !raw) return null;
+    var value;
+    try {
+      value = JSON.parse(raw);
+    } catch (error) {
+      return null;
+    }
+    if (!value || typeof value !== "object" || !Array.isArray(value.quotes)) return null;
+    var quotes = [];
+    for (var i = 0; i < value.quotes.length; i++) {
+      var quote = value.quotes[i];
+      if (isQuote(quote)) quotes.push({ text: quote.text, author: quote.author });
+    }
+    return quotes.length ? makeBook(value.fileName, quotes) : null;
+  }
+
+  function defaultStorage() {
+    try {
+      return typeof localStorage !== "undefined" ? localStorage : null;
+    } catch (error) {
+      return null; // Some privacy modes throw on the mere property access.
+    }
+  }
+
+  /**
+   * Every storage call is wrapped: a quotebook failure must never surface as the
+   * failure of an unrelated action (6.11.7), and a broken key must never stop the
+   * dashboard booting.
+   */
+  function createStore(storage) {
+    var target = storage === undefined ? defaultStorage() : storage;
+
+    return Object.freeze({
+      load: function () {
+        if (!target) return null;
+        try {
+          return parseStored(target.getItem(STORAGE_KEY));
+        } catch (error) {
+          return null;
+        }
+      },
+      save: function (book) {
+        var serialised = JSON.stringify(book);
+        if (serialised.length > MAX_STORED_CHARS) return { ok: false, reason: "too-large" };
+        if (!target) return { ok: false, reason: "storage" };
+        try {
+          target.setItem(STORAGE_KEY, serialised);
+          return { ok: true };
+        } catch (error) {
+          // A refused setItem leaves the previous value in place.
+          return { ok: false, reason: "storage" };
+        }
+      },
+      clear: function () {
+        if (!target) return false;
+        try {
+          target.removeItem(STORAGE_KEY);
+          return true;
+        } catch (error) {
+          return false;
+        }
+      }
+    });
+  }
+
   return Object.freeze({
+    STORAGE_KEY: STORAGE_KEY,
+    MAX_STORED_CHARS: MAX_STORED_CHARS,
     normalizeText: normalizeText,
-    parseQuotebook: parseQuotebook
+    parseQuotebook: parseQuotebook,
+    prepareBook: prepareBook,
+    createStore: createStore
   });
 })();
 
