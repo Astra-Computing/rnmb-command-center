@@ -65,6 +65,8 @@
  *                             save(book) -> { ok: true } | { ok: false, reason },
  *                             clear() -> boolean }
  *                                        reason: "too-large" | "storage"
+ *   matchAuthor(author, roster) -> person | null   (KTD9)
+ *   pickOrder(count, showingIndex, random) -> [index]
  *   STORAGE_KEY, MAX_STORED_CHARS
  * A book is { fileName, count, quotes: [{ text, author }] }.
  */
@@ -388,13 +390,60 @@ var RNMBQuotebook = (function () {
     });
   }
 
+  // ── Choosing and tinting the Overview quote (U5) ───────────────────────────
+
+  function nameKey(value) {
+    return typeof value === "string" ? value.trim().toLowerCase() : "";
+  }
+
+  /**
+   * KTD9: the crew member a quote is attributed to, or null. Trimmed and
+   * case-insensitive, first roster match wins, and `Unknown` never matches -- it
+   * is the parser's word for "no attribution", not a person. A multi-speaker
+   * author ("Jon, Ines") matches nobody, and a departed member matches nobody
+   * because the quotebook carries no name snapshot, so both take the default
+   * colour. Money matching (partyKey) is exact on purpose; this is not money.
+   */
+  function matchAuthor(author, roster) {
+    var key = nameKey(author);
+    if (!key || key === nameKey(UNKNOWN_AUTHOR) || !Array.isArray(roster)) return null;
+    for (var i = 0; i < roster.length; i++) {
+      var person = roster[i];
+      if (person && nameKey(person.name) === key) return person;
+    }
+    return null;
+  }
+
+  /**
+   * The order to try quotes in: every index once, from a random start, with the
+   * quote that is showing moved to the end so a re-pick shows a different one
+   * whenever the book has another to show. `random` is injectable for tests.
+   */
+  function pickOrder(count, showingIndex, random) {
+    var total = Math.max(0, Math.floor(count) || 0);
+    var draw = typeof random === "function" ? random : Math.random;
+    var showing = typeof showingIndex === "number" && showingIndex % 1 === 0 && showingIndex >= 0 && showingIndex < total
+      ? showingIndex
+      : -1;
+    var others = [];
+    for (var i = 0; i < total; i++) {
+      if (i !== showing) others.push(i);
+    }
+    var start = Math.min(others.length - 1, Math.floor(draw() * others.length));
+    var order = others.slice(start).concat(others.slice(0, start));
+    if (showing !== -1) order.push(showing);
+    return order;
+  }
+
   return Object.freeze({
     STORAGE_KEY: STORAGE_KEY,
     MAX_STORED_CHARS: MAX_STORED_CHARS,
     normalizeText: normalizeText,
     parseQuotebook: parseQuotebook,
     prepareBook: prepareBook,
-    createStore: createStore
+    createStore: createStore,
+    matchAuthor: matchAuthor,
+    pickOrder: pickOrder
   });
 })();
 

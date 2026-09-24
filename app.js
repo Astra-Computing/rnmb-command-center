@@ -124,6 +124,10 @@ const paymentDraftIds = new Map();
 // store's logic is in quotebook.js; only the storage calls and DOM wiring are here.
 const quotebookStore = RNMBQuotebook.createStore();
 let quotebook = quotebookStore.load();
+// The quote on the Overview card (KTD4): { index, size } into quotebook.quotes,
+// or null. Only pickQuote() chooses it; render() paints it and never chooses, so
+// a save, a void or a 15-second poll cannot swap the quote someone is reading.
+let heldQuote = null;
 
 function draftId(drafts, key) {
   if (!drafts.has(key)) drafts.set(key, uid());
@@ -1371,6 +1375,8 @@ async function init() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     lastSyncedAt = new Date();
     render();
+    // After state loads, so the first quote's tint has a roster to match against.
+    pickQuote();
     startAutoRefresh();
     showToast(syncMode === "supabase" ? "Connected to Supabase." : "Using local browser storage.");
   } catch (error) {
@@ -1381,6 +1387,7 @@ async function init() {
     crewBalanceAvailable = true;
     state = await repository.load();
     render();
+    pickQuote();
     showToast("Supabase load failed. Using local browser storage.");
   }
 }
@@ -1487,7 +1494,10 @@ function startAutoRefresh() {
 // A tab left open all evening is the normal case here, so catch up the moment
 // it comes back to the front rather than waiting out the interval.
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) refreshFromServer();
+  if (document.hidden) return;
+  // A phone left open all evening wakes with the Overview already showing.
+  if (overviewShowing()) pickQuote();
+  refreshFromServer();
 });
 
 function showToast(message) {
@@ -1799,9 +1809,126 @@ function renderOverview() {
   document.querySelector("#metricConsumed").textContent = oneDecimal(totals.allDrinks);
   document.querySelector("#metricInventory").textContent = state.bottles.length;
   document.querySelector("#metricInventoryMeta").textContent = `${oneDecimal(totalRemainingStandardDrinks())} standard drinks remaining`;
+  paintQuoteCard();
   renderSpendBars();
   renderLowSupply();
   renderRecentNights();
+}
+
+// KTD6: a quote starts at a size picked by its length, then steps down to the
+// floor while it still overflows. Provisional values, tuned against the synthetic
+// LongQuotes.txt fixture; the real book's lengths may tune them further.
+const QUOTE_SIZE_FLOOR = 0.72;
+const QUOTE_SIZE_STEP = 0.06;
+
+function quoteStartSize(quote) {
+  const length = quote.text.length;
+  if (length <= 50) return 1.35;
+  if (length <= 110) return 1.1;
+  if (length <= 180) return 0.95;
+  return 0.85;
+}
+
+/**
+ * Write one quote into the card as text, never markup (KTD13), at a size in rem,
+ * tinted with the quoted crew member's roster colour when there is one (KTD9).
+ */
+function paintQuote(quote, size) {
+  const card = document.querySelector("#quoteCard");
+  document.querySelector("#quoteText").textContent = quote.text;
+  document.querySelector("#quoteAuthor").textContent = quote.author;
+  card.style.setProperty("--quote-size", `${size ?? quoteStartSize(quote)}rem`);
+  const person = RNMBQuotebook.matchAuthor(quote.author, state.people);
+  if (person) {
+    const color = safeColor(person.color);
+    card.style.setProperty("--person-color", color);
+    card.style.setProperty("--person-ink", RNMBDomain.contrastInk(color));
+  } else {
+    card.style.removeProperty("--person-color");
+    card.style.removeProperty("--person-ink");
+  }
+}
+
+/** Paint the held quote, or hide the card entirely when there is none (6.9.5). */
+function paintQuoteCard() {
+  const card = document.querySelector("#quoteCard");
+  const quote = quotebook && heldQuote ? quotebook.quotes[heldQuote.index] : null;
+  card.hidden = !quote;
+  if (quote) paintQuote(quote, heldQuote.size);
+}
+
+function quoteFits() {
+  const text = document.querySelector("#quoteText");
+  return text.scrollHeight <= text.clientHeight + 1 && text.scrollWidth <= text.clientWidth + 1;
+}
+
+/**
+ * The largest size, from the length bucket down to the floor, at which the quote
+ * fits the card; null when it does not fit even at the floor. Measuring is only
+ * meaningful while the Overview is laid out, which every caller guarantees.
+ */
+function fitQuote(quote) {
+  paintQuote(quote, QUOTE_SIZE_FLOOR);
+  if (!quoteFits()) return null;
+  for (let size = quoteStartSize(quote); size > QUOTE_SIZE_FLOOR; size = Math.round((size - QUOTE_SIZE_STEP) * 100) / 100) {
+    paintQuote(quote, size);
+    if (quoteFits()) return size;
+  }
+  return QUOTE_SIZE_FLOOR;
+}
+
+function overviewShowing() {
+  return !isRegisterRoute() && !document.hidden && document.querySelector("#overview").classList.contains("is-active");
+}
+
+/**
+ * Choose the quote to show. One pass over the book at most: the first quote in a
+ * random order that fits wins, and if none fits even at the floor the shortest is
+ * shown at floor size, so a loaded book always paints something (KTD6). The quote
+ * already showing is tried last, so a re-pick changes it whenever it can.
+ *
+ * Called only when the Overview becomes visible (KTD5) -- a tab click, leaving the
+ * register, the browser tab coming back to the front, boot -- and when the card
+ * itself is activated. Never from render().
+ */
+function pickQuote() {
+  const card = document.querySelector("#quoteCard");
+  if (!quotebook) {
+    heldQuote = null;
+    paintQuoteCard();
+    return;
+  }
+  const quotes = quotebook.quotes;
+  const order = RNMBQuotebook.pickOrder(quotes.length, heldQuote ? heldQuote.index : null);
+  card.hidden = false;
+  if (!overviewShowing() || !card.clientHeight) {
+    // Nothing to measure against. The next time the Overview shows, it re-picks.
+    heldQuote = { index: order[0], size: null };
+    paintQuoteCard();
+    return;
+  }
+  for (const index of order) {
+    const size = fitQuote(quotes[index]);
+    if (size !== null) {
+      heldQuote = { index, size };
+      paintQuoteCard();
+      return;
+    }
+  }
+  const shortest = quotes.reduce((best, quote, index) => (quote.text.length < quotes[best].text.length ? index : best), 0);
+  heldQuote = { index: shortest, size: QUOTE_SIZE_FLOOR };
+  paintQuoteCard();
+}
+
+/** Keep the same quote across a resize, re-fitted; pick another only if it no longer fits at all. */
+function refitHeldQuote() {
+  if (!quotebook || !heldQuote || !overviewShowing()) return;
+  const size = fitQuote(quotebook.quotes[heldQuote.index]);
+  if (size === null) pickQuote();
+  else {
+    heldQuote = { ...heldQuote, size };
+    paintQuoteCard();
+  }
 }
 
 function renderSpendBars() {
@@ -3587,6 +3714,8 @@ function activateTab(tabId) {
     panel.classList.toggle("is-active", panel.id === tabId);
   });
   document.querySelector("#pageTitle").textContent = document.querySelector(`[data-tab="${tabId}"]`).textContent;
+  // The panel is laid out by now (the class is set synchronously), so the quote can be measured.
+  if (tabId === "overview") pickQuote();
 }
 
 function initials(name) {
@@ -4039,6 +4168,8 @@ window.addEventListener("hashchange", () => {
   if (!isRegisterRoute() && !registerPending) registerDraft = null;
   renderRegister();
   window.scrollTo(0, 0);
+  // A whole host night can end with the Overview revealed and no tab click at all.
+  if (overviewShowing()) pickQuote();
 });
 
 document.querySelector("#register").addEventListener("click", async (event) => {
@@ -4344,6 +4475,9 @@ document.querySelector("#quotebookFile").addEventListener("change", async (event
       return;
     }
     quotebook = prepared.book;
+    // The held index pointed into the old book. The Overview picks afresh when it next shows.
+    heldQuote = null;
+    paintQuoteCard();
     renderQuotebookWidget();
     showToast(`Quotebook loaded: ${quotebook.count} ${quotebook.count === 1 ? "quote" : "quotes"} from ${quotebook.fileName}.`);
   } catch (error) {
@@ -4364,8 +4498,20 @@ document.querySelector("#quotebookClear").addEventListener("click", () => {
     return;
   }
   quotebook = null;
+  heldQuote = null;
+  paintQuoteCard();
   renderQuotebookWidget();
   showToast("Quotebook cleared from this browser.");
+});
+
+// A tap (or Enter / Space: it is a real button, KTD8) shows another quote.
+document.querySelector("#quoteCard").addEventListener("click", pickQuote);
+
+// Rotating a phone changes the card's room; keep the same quote, re-fitted.
+let quoteResizeFrame = 0;
+window.addEventListener("resize", () => {
+  window.cancelAnimationFrame(quoteResizeFrame);
+  quoteResizeFrame = window.requestAnimationFrame(refitHeldQuote);
 });
 
 // Read-mostly handle for the browser smoke tests (tests/browser/host-mode.smoke.js)

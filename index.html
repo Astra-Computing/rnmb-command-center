@@ -57,6 +57,14 @@
 
         <section class="tab-panel is-active" id="overview" aria-labelledby="overview-title">
           <div class="metric-grid">
+            <!-- The crew quote (unit 11): absent until a quotebook is loaded in this browser. -->
+            <button id="quoteCard" class="metric-card quote-card" type="button" title="Show another quote" hidden>
+              <span class="quote-head">
+                <span class="metric-label">Crew Quote</span>
+                <span id="quoteAuthor" class="quote-author"></span>
+              </span>
+              <span id="quoteText" class="quote-text"></span>
+            </button>
             <article class="metric-card">
               <span class="metric-label">Total Spend</span>
               <strong id="metricSpend">$0</strong>

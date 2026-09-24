@@ -320,6 +320,68 @@ test("a stored book with some malformed entries keeps only the well-formed ones"
   assert.deepEqual(book.quotes, [{ text: "Good.", author: "Ines" }, { text: "Also good.", author: "Bram" }]);
 });
 
+// ---------- matching an author to the roster (U5, KTD9) -----------------------
+
+const roster = [
+  { id: "p-jon", name: "Jon", color: "#f97316" },
+  { id: "p-ines", name: "  Ines ", color: "#22c55e" },
+  { id: "p-unknown", name: "Unknown", color: "#38bdf8" },
+  { id: "p-sam-1", name: "Sam", color: "#facc15" },
+  { id: "p-sam-2", name: "sam", color: "#ef4444" }
+];
+
+test("an author matching a roster name with different case or whitespace resolves to that person", () => {
+  assert.equal(Q.matchAuthor("jon", roster).id, "p-jon");
+  assert.equal(Q.matchAuthor("  JON\t", roster).id, "p-jon");
+  assert.equal(Q.matchAuthor("ines", roster).id, "p-ines", "the roster side is trimmed too");
+});
+
+test("an author of Unknown never matches, even when a crew member is named Unknown", () => {
+  assert.equal(Q.matchAuthor("Unknown", roster), null);
+  assert.equal(Q.matchAuthor(" unknown ", roster), null);
+});
+
+test("a departed crew member, a multi-speaker author and junk all fall back to no match", () => {
+  assert.equal(Q.matchAuthor("Marguerite", roster), null, "not on the roster");
+  assert.equal(Q.matchAuthor("Jon, Ines", roster), null, "a multi-speaker exchange belongs to nobody");
+  assert.equal(Q.matchAuthor("", roster), null);
+  assert.equal(Q.matchAuthor(undefined, roster), null);
+  assert.equal(Q.matchAuthor("Jon", undefined), null);
+  assert.equal(Q.matchAuthor("Jon", [null, { name: 5 }, { id: "p-jon", name: "Jon" }]).id, "p-jon", "bad roster entries are skipped");
+});
+
+test("two crew members sharing a name resolve to the first in roster order, deterministically", () => {
+  assert.equal(Q.matchAuthor("Sam", roster).id, "p-sam-1");
+  assert.equal(Q.matchAuthor("SAM", roster).id, "p-sam-1");
+});
+
+// ---------- the order quotes are tried in (U5) --------------------------------
+
+const fixedRandom = (value) => () => value;
+
+test("the pick order visits every quote once, starting from a random one", () => {
+  const order = Q.pickOrder(5, null, fixedRandom(0.5));
+  assert.deepEqual(order.slice().sort(), [0, 1, 2, 3, 4]);
+  assert.equal(order[0], 2, "starts where the random number lands");
+  assert.deepEqual(Q.pickOrder(1, null, fixedRandom(0.99)), [0]);
+  assert.deepEqual(Q.pickOrder(0, null, fixedRandom(0.5)), []);
+});
+
+test("the quote that is showing is tried last, so a re-pick shows a different one", () => {
+  for (let showing = 0; showing < 4; showing += 1) {
+    for (const r of [0, 0.3, 0.6, 0.99]) {
+      const order = Q.pickOrder(4, showing, fixedRandom(r));
+      assert.notEqual(order[0], showing, `showing ${showing}, random ${r}`);
+      assert.equal(order[order.length - 1], showing);
+      assert.deepEqual(order.slice().sort(), [0, 1, 2, 3]);
+    }
+  }
+  // A book of one quote can only show that quote.
+  assert.deepEqual(Q.pickOrder(1, 0, fixedRandom(0.5)), [0]);
+  // A stale index from a replaced book is ignored.
+  assert.deepEqual(Q.pickOrder(3, 7, fixedRandom(0)).slice().sort(), [0, 1, 2]);
+});
+
 test("clearing removes the quotebook key and leaves the app-state key untouched", () => {
   const storage = fakeStorage({ [APP_STATE_KEY]: '{"people":[]}' });
   const store = Q.createStore(storage);

@@ -10,10 +10,22 @@
 // Exit code is 0 unless the page itself failed to drive; findings are the output.
 "use strict";
 
+const fs = require("node:fs");
+const path = require("node:path");
 const { chromium } = require("/workspace/tools/playwright/node_modules/playwright");
+const RNMBQuotebook = require("../../quotebook.js");
 
 const baseUrl = (process.argv[2] || process.env.RNMB_BASE_URL || "http://localhost:3000").replace(/\/$/, "");
 const ONLY = process.env.RNMB_AUDIT_ONLY || "";
+
+// Every page is seeded with the SYNTHETIC long-quote fixture, never the crew's
+// real book (KTD14): this script prints the text of anything it flags, so a real
+// quote would end up in the terminal and from there in notes.
+const QUOTEBOOK_KEY = RNMBQuotebook.STORAGE_KEY;
+const auditBook = JSON.stringify(RNMBQuotebook.prepareBook(
+  fs.readFileSync(path.join(__dirname, "..", "fixtures", "parser", "LongQuotes.txt"), "utf8"),
+  "LongQuotes.txt"
+).book);
 
 // ---------- the in-page audit ---------------------------------------------------
 
@@ -178,6 +190,8 @@ async function openPage(browser, viewport) {
   const page = await context.newPage();
   const errors = [];
   page.on("pageerror", (e) => errors.push(String(e.message)));
+  // Each width opens a fresh context with empty storage, so seed the book every time.
+  await page.addInitScript(({ key, book }) => localStorage.setItem(key, book), { key: QUOTEBOOK_KEY, book: auditBook });
   await page.goto(`${baseUrl}/`, { waitUntil: "domcontentloaded" });
   await page.waitForSelector("#personList", { state: "attached" });
   await page.waitForTimeout(150);
@@ -202,6 +216,13 @@ async function seedHostNight(page) {
 
 const screens = [
   { name: "Overview", go: async (page) => { await tab(page, "overview"); } },
+  {
+    // One pick proves little: tap through the book and audit every quote the card lands on.
+    name: "Overview / quote card cycled",
+    go: async (page) => { await tab(page, "overview"); },
+    repeat: 12,
+    again: async (page) => { await page.click("#quoteCard"); }
+  },
   { name: "Tonight", go: async (page) => { await tab(page, "tonight"); } },
   {
     name: "Tonight / quick log picked",
@@ -251,10 +272,15 @@ const screens = [
 
 // Desktop, the awkward middle, tablet, and the phone sizes people actually hold.
 // 320 is the narrowest screen still in use and the one everything breaks on first.
+// 1200, 980 and 620 sit on the stylesheet's breakpoints, where the metric grid
+// changes shape under the quote card.
 const widths = [
   { label: "1440", viewport: { width: 1440, height: 1000 } },
+  { label: "1200", viewport: { width: 1200, height: 900 } },
   { label: "1024", viewport: { width: 1024, height: 900 } },
+  { label: "980", viewport: { width: 980, height: 900 } },
   { label: "768", viewport: { width: 768, height: 1024 } },
+  { label: "620", viewport: { width: 620, height: 900 } },
   { label: "430", viewport: { width: 430, height: 932 } },
   { label: "390", viewport: { width: 390, height: 844 } },
   { label: "360", viewport: { width: 360, height: 800 } },
@@ -271,9 +297,12 @@ async function main() {
         const { page, context, errors } = await openPage(browser, width.viewport);
         try {
           await screen.go(page);
-          await page.waitForTimeout(120);
-          const findings = await page.evaluate(auditInPage);
-          findings.forEach((f) => all.push({ ...f, screen: screen.name, width: width.label }));
+          for (let pass = 0; pass < (screen.repeat || 1); pass += 1) {
+            if (pass > 0) await screen.again(page);
+            await page.waitForTimeout(120);
+            const findings = await page.evaluate(auditInPage);
+            findings.forEach((f) => all.push({ ...f, screen: screen.name, width: width.label }));
+          }
           errors.forEach((e) => all.push({ kind: "page-error", where: "page", text: "", detail: e, screen: screen.name, width: width.label }));
         } catch (error) {
           all.push({ kind: "audit-failed", where: "driver", text: "", detail: String(error.message).split("\n")[0], screen: screen.name, width: width.label });

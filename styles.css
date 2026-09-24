@@ -252,6 +252,68 @@ small,
   line-height: 1;
 }
 
+/* KTD7: .metric-card is display:grid, which outranks the UA rule for [hidden] --
+   the same trap as .form-grid, .register and .recap-grid. Without this the quote
+   card paints as an empty box on every device that has no quotebook. */
+.metric-card[hidden] {
+  display: none;
+}
+
+/* The crew quote card (unit 11). It takes the metric row's height and never sets
+   it -- size containment makes it count as empty when the row is measured -- so
+   the row is the same height whatever quote is showing, and the quote shrinks to
+   fit instead (KTD6). */
+.quote-card {
+  contain: size layout;
+  grid-template-rows: auto minmax(0, 1fr);
+  border-left: 6px solid var(--person-color, var(--line));
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.quote-card:hover {
+  border-color: var(--person-color, var(--muted));
+}
+
+.quote-card:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 2px;
+}
+
+.quote-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.quote-author {
+  min-width: 0;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--person-color, var(--surface-2));
+  color: var(--person-ink, var(--text));
+  font-size: 0.75rem;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+/* pre-wrap keeps a multi-speaker exchange one turn per line (6.9.8). The size is
+   set per quote by app.js; overflow is hidden only so a quote that somehow does
+   not fit is reported by tests/browser/ui-audit.js rather than painted over. */
+.quote-text {
+  min-height: 0;
+  overflow: hidden;
+  font-size: var(--quote-size, 1rem);
+  font-weight: 700;
+  line-height: 1.3;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .alert-card.is-caution {
   border-color: rgba(250, 204, 21, 0.7);
 }
@@ -1686,6 +1748,12 @@ body.is-register .app-shell {
 
   .metric-card {
     min-height: 112px;
+  }
+
+  /* Stacked, the quote card is alone in its row, so a fixed taller box changes
+     nothing between quotes and gives a phone five lines instead of three. */
+  .metric-card.quote-card {
+    min-height: 150px;
   }
 
   .register {

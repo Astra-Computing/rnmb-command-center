@@ -4157,6 +4157,43 @@ async function uploadQuotebook(session, name, contents, toast) {
   }), toast);
 }
 
+/** A stored book, seeded before the page's own scripts run (the widget is tested separately). */
+function seedQuotebook(text, fileName = "seeded.txt") {
+  const { book } = require("../../quotebook.js").prepareBook(text, fileName);
+  return async (page) => {
+    await page.addInitScript(({ key, value }) => {
+      // Only on the first load of this context, so a reload after clearing stays cleared.
+      if (!sessionStorage.getItem("quotebook-seeded")) {
+        localStorage.setItem(key, value);
+        sessionStorage.setItem("quotebook-seeded", "1");
+      }
+    }, { key: QUOTEBOOK_KEY, value: JSON.stringify(book) });
+  };
+}
+
+// Five short, distinct, synthetic quotes -- every one fits the card at any width.
+const SHORT_BOOK = [
+  '"The keg is a mood." - Alex',
+  '"The lime is a personality." - jordan',
+  '"Ice is a love language." - Unknown',
+  '"Garnish or perish." - Marguerite',
+  'Sam: "Bring the good cups."   Casey: "There are no good cups."'
+].join("\n");
+
+const quoteCard = (page) => page.evaluate(() => {
+  const card = document.querySelector("#quoteCard");
+  const text = document.querySelector("#quoteText");
+  return {
+    hidden: card.hidden,
+    display: getComputedStyle(card).display,
+    text: text.textContent,
+    author: document.querySelector("#quoteAuthor").textContent,
+    tint: card.style.getPropertyValue("--person-color"),
+    overflows: text.scrollHeight > text.clientHeight + 1,
+    cards: Array.from(document.querySelectorAll(".metric-grid > .metric-card")).filter((el) => getComputedStyle(el).display !== "none").length
+  };
+});
+
 const quotebookWidget = (page) => page.evaluate(() => ({
   status: document.querySelector("#quotebookStatus").textContent,
   clearHidden: document.querySelector("#quotebookClear").hidden,
@@ -4242,6 +4279,226 @@ scenarios.push(
         const huge = line.repeat(Math.ceil((256 * 1024 * 1.2) / line.length));
         await uploadQuotebook(session, "huge.txt", huge, "That quotebook is too large to keep in this browser (the limit is 256 KB), so it was not loaded.");
         assert.deepEqual(await quotebookWidget(page), before);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Quote card: no book, no card (AE5); a loaded book shows one; clearing removes it without a reload",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      try {
+        let card = await quoteCard(page);
+        assert.equal(card.hidden, true);
+        assert.equal(card.display, "none", "KTD7: the hidden card is not painted as an empty box");
+        assert.equal(card.cards, 3, "exactly three cards without a book");
+
+        await uploadQuotebook(session, "short.txt", SHORT_BOOK, "Quotebook loaded: 5 quotes from short.txt.");
+        await page.click('.tab-button[data-tab="overview"]');
+        card = await quoteCard(page);
+        assert.equal(card.hidden, false);
+        assert.equal(card.cards, 4);
+        assert.ok(card.text.length > 0 && card.author.length > 0, "a quote and its author are showing");
+        assert.equal(card.overflows, false);
+        const leftmost = await page.evaluate(() => document.querySelector(".metric-grid").firstElementChild.id);
+        assert.equal(leftmost, "quoteCard", "6.9.4: leftmost in the metric grid");
+
+        await page.click('.tab-button[data-tab="crew"]');
+        await actionForToast(session, () => page.click("#quotebookClear"), "Quotebook cleared from this browser.");
+        assert.equal((await quoteCard(page)).hidden, true, "hidden at once, before the Overview is shown again");
+        await page.click('.tab-button[data-tab="overview"]');
+        card = await quoteCard(page);
+        assert.equal(card.display, "none");
+        assert.equal(card.cards, 3);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Quote card renders a boobytrapped quote as literal text and runs nothing (AE6)",
+    async run({ browser }) {
+      const trap = '"<img src=x onerror="window.__pwned=1"><script>window.__pwned=2</script>" - <b onmouseover="window.__pwned=3">Alex</b>';
+      const session = await openPage(browser, { allowConsole: apiConfig404, routes: seedQuotebook(trap) });
+      const { page } = session;
+      try {
+        const result = await page.evaluate(() => ({
+          text: document.querySelector("#quoteText").textContent,
+          author: document.querySelector("#quoteAuthor").textContent,
+          elements: document.querySelectorAll("#quoteCard img, #quoteCard script, #quoteCard b").length,
+          pwned: window.__pwned
+        }));
+        assert.ok(result.text.includes("<img src=x"), `the tag shows as characters: ${result.text}`);
+        assert.ok(result.text.includes("<script>"));
+        assert.ok(result.author.includes("<b"), `the author is text too: ${result.author}`);
+        assert.equal(result.elements, 0, "no element was created from the quote");
+        await page.hover("#quoteCard");
+        await page.waitForTimeout(200);
+        assert.equal(await page.evaluate(() => window.__pwned), undefined, "no handler ran");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Quote card is a keyboard control that shows another quote on Enter, Space and tap, tinted by the roster",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404, routes: seedQuotebook(SHORT_BOOK) });
+      const { page } = session;
+      try {
+        const first = (await quoteCard(page)).text;
+        assert.ok(first, "boot picks a quote once state has loaded");
+
+        await page.focus("#quoteCard");
+        assert.equal(await page.evaluate(() => document.activeElement.id), "quoteCard", "the card takes focus");
+        await page.keyboard.press("Enter");
+        const second = (await quoteCard(page)).text;
+        assert.notEqual(second, first, "Enter shows another quote");
+        await page.keyboard.press("Space");
+        const third = (await quoteCard(page)).text;
+        assert.notEqual(third, second, "Space shows another quote");
+        await page.click("#quoteCard");
+        assert.notEqual((await quoteCard(page)).text, third, "a tap shows another quote");
+
+        // KTD9: tap through the book and record each author's tint.
+        const tints = new Map();
+        for (let i = 0; i < 40 && tints.size < 5; i += 1) {
+          const card = await quoteCard(page);
+          tints.set(card.author, card.tint);
+          await page.click("#quoteCard");
+        }
+        const roster = await page.evaluate(() => Object.fromEntries(window.__rnmb.state.people.map((person) => [person.name, person.color])));
+        assert.equal(tints.get("Alex"), roster.Alex, "a roster match takes that member's colour");
+        assert.equal(tints.get("jordan"), roster.Jordan, "matching ignores case");
+        assert.equal(tints.get("Unknown"), "", "Unknown never matches");
+        assert.equal(tints.get("Marguerite"), "", "someone not on the roster falls back to the default");
+        assert.equal(tints.get("Sam, Casey"), "", "a multi-speaker exchange falls back to the default");
+
+        // 6.9.8: the exchange renders one turn per line.
+        for (let i = 0; i < 40 && (await quoteCard(page)).author !== "Sam, Casey"; i += 1) await page.click("#quoteCard");
+        // A long turn may wrap; what matters is that each turn starts a line of its own.
+        const exchange = await page.evaluate(() => {
+          const text = document.querySelector("#quoteText");
+          const node = text.firstChild;
+          const top = (offset) => {
+            const range = document.createRange();
+            range.setStart(node, offset);
+            range.setEnd(node, offset + 1);
+            return range.getBoundingClientRect().top;
+          };
+          const lastOfFirstTurn = node.textContent.indexOf("\n") - 1;
+          return {
+            text: text.textContent,
+            whiteSpace: getComputedStyle(text).whiteSpace,
+            secondTurnStartsBelow: top(lastOfFirstTurn + 2) > top(lastOfFirstTurn),
+            secondTurnStartsAtLeft: Math.abs(
+              (() => { const r = document.createRange(); r.setStart(node, lastOfFirstTurn + 2); r.setEnd(node, lastOfFirstTurn + 3); return r.getBoundingClientRect().left; })() -
+              (() => { const r = document.createRange(); r.setStart(node, 0); r.setEnd(node, 1); return r.getBoundingClientRect().left; })()
+            ) < 1
+          };
+        });
+        assert.equal(exchange.text, '"Bring the good cups."\n"There are no good cups."');
+        assert.equal(exchange.whiteSpace, "pre-wrap");
+        assert.ok(exchange.secondTurnStartsBelow && exchange.secondTurnStartsAtLeft, "the second turn starts its own line");
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Quote card holds its quote through a save and a differing poll (AE4), and re-picks when the Overview shows again",
+    async run({ browser }) {
+      const { ids, seed } = hostModeSeed();
+      const bottleId = "99999999-0000-4000-8000-000000000001";
+      seed.rnmb_bottles = [{ id: bottleId, type_id: ids.rum, nickname: "Rum bottle", size_oz: 25, remaining_oz: 25, price: 40, buyer_id: ids.sam, purchase_date: "2026-09-16" }];
+      const stub = hostModeStub(seed);
+      // Host mode logs a crew pour through one function that also takes it off the level.
+      stub.rpc.rnmb_add_crew_pour = (payload) => {
+        stub.store.rnmb_pours.push({ id: payload.id, night_id: payload.night_id, person_id: payload.person_id, bottle_id: payload.bottle_id, ounces: payload.ounces, poured_at: payload.poured_at });
+        const bottle = stub.store.rnmb_bottles.find((row) => row.id === payload.bottle_id);
+        bottle.remaining_oz -= payload.ounces;
+        return payload.id;
+      };
+      const session = await openPage(browser, {
+        routes: async (page) => {
+          await stub.routes(page);
+          await seedQuotebook(SHORT_BOOK)(page);
+        }
+      });
+      const { page } = session;
+      try {
+        await session.waitForToast("Connected to Supabase.");
+        const showing = (await quoteCard(page)).text;
+        assert.ok(showing);
+
+        // A pour saved from the Overview: the form submits in place, the dashboard redraws.
+        await actionForToast(session, () => page.evaluate(({ personId, bottleId }) => {
+          const form = document.querySelector("#pourForm");
+          form.querySelector("[name='personId']").value = personId;
+          form.querySelector("[name='bottleId']").value = bottleId;
+          form.querySelector("[name='ounces']").value = "1.5";
+          form.requestSubmit();
+        }, { personId: ids.sam, bottleId }), "Pour logged.");
+        assert.ok(stub.log.some((entry) => entry.path === "rpc/rnmb_add_crew_pour"), "the pour reached the shared database");
+        assert.equal((await quoteCard(page)).text, showing, "a save keeps the quote");
+
+        // Another device changes something; the next poll differs and redraws everything.
+        stub.store.rnmb_people.push({ id: "99999999-0000-4000-8000-000000000002", name: "Riley", color: "#38bdf8" });
+        await actionForToast(session, () => page.evaluate(() => refreshFromServer()), "Updated from the shared dashboard.");
+        assert.equal(await page.evaluate(() => window.__rnmb.state.people.length), 2, "the poll really redrew");
+        assert.equal((await quoteCard(page)).text, showing, "a differing poll keeps the quote");
+
+        // KTD5: each way the Overview becomes visible picks again.
+        await page.click('.tab-button[data-tab="tonight"]');
+        await page.click('.tab-button[data-tab="overview"]');
+        const afterTab = (await quoteCard(page)).text;
+        assert.notEqual(afterTab, showing, "coming back from another tab");
+
+        await page.evaluate(() => { location.hash = "#register"; });
+        await page.waitForFunction(() => document.body.classList.contains("is-register"));
+        await page.evaluate(() => { location.hash = ""; });
+        await page.waitForFunction(() => !document.body.classList.contains("is-register"));
+        const afterRegister = (await quoteCard(page)).text;
+        assert.notEqual(afterRegister, afterTab, "leaving the register");
+
+        await page.evaluate(() => {
+          const setHidden = (value) => Object.defineProperty(document, "hidden", { value, configurable: true });
+          setHidden(true);
+          document.dispatchEvent(new Event("visibilitychange"));
+          setHidden(false);
+          document.dispatchEvent(new Event("visibilitychange"));
+        });
+        assert.notEqual((await quoteCard(page)).text, afterRegister, "the browser tab coming back to the front");
+        assert.deepEqual(stub.unexpected, []);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Quote card shows the shortest quote at the floor size when no quote fits",
+    async run({ browser }) {
+      const huge = (n) => `"${"word ".repeat(n).trim()}" - Alex`;
+      const book = [huge(400), huge(300), huge(350)].join("\n");
+      const session = await openPage(browser, { allowConsole: apiConfig404, routes: seedQuotebook(book) });
+      const { page } = session;
+      try {
+        const card = await quoteCard(page);
+        assert.equal(card.hidden, false, "a loaded book always paints something");
+        assert.equal(card.text.split(" ").length, 300, "the shortest of the three");
+        assert.equal(await page.evaluate(() => document.querySelector("#quoteCard").style.getPropertyValue("--quote-size")), "0.72rem");
         session.assertClean();
       } finally {
         await session.close();
