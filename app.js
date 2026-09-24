@@ -4453,6 +4453,7 @@ document.querySelector("#clearData").addEventListener("click", async () => {
 });
 
 const QUOTEBOOK_REFUSALS = {
+  "not-text": "That file is not plain text, so the quotebook was not changed. Save it as a .txt file and try again.",
   empty: "No quotes were found in that file, so the quotebook was not changed. Put one quote per line.",
   "too-large": "That quotebook is too large to keep in this browser (the limit is 256 KB), so it was not loaded.",
   storage: "This browser would not store the quotebook, so it was not loaded."
@@ -4470,7 +4471,9 @@ document.querySelector("#quotebookFile").addEventListener("change", async (event
       showToast(QUOTEBOOK_REFUSALS["too-large"]);
       return;
     }
-    const prepared = RNMBQuotebook.prepareBook(await file.text(), file.name);
+    // Decoded from the bytes, not file.text(), which assumes UTF-8: Word saves
+    // Windows-1252 and Notepad's "Unicode" is UTF-16.
+    const prepared = RNMBQuotebook.prepareBook(RNMBQuotebook.decodeBook(await file.arrayBuffer()), file.name);
     // A refused parse and a refused write both carry a reason; either leaves the book as it was.
     const outcome = prepared.ok ? quotebookStore.save(prepared.book) : prepared;
     if (!outcome.ok) {

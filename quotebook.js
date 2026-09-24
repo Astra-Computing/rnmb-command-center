@@ -59,8 +59,9 @@
  *   normalizeText(rawText) -> string     BOM stripped, newlines folded, curly
  *                                        double quote marks folded to ASCII "
  *   parseQuotebook(rawText) -> [{ text, author }]
+ *   decodeBook(bytes) -> string          UTF-16 by BOM, else UTF-8, else Windows-1252
  *   prepareBook(rawText, fileName) -> { ok: true, book } | { ok: false, reason }
- *                                        reason: "empty" | "too-large"
+ *                                        reason: "not-text" | "empty" | "too-large"
  *   createStore(storage) -> { load() -> book | null,
  *                             save(book) -> { ok: true } | { ok: false, reason },
  *                             clear() -> boolean }
@@ -287,6 +288,44 @@ var RNMBQuotebook = (function () {
     return seen;
   }
 
+  // ── Decoding an upload ─────────────────────────────────────────────────────
+
+  // Windows-1252 differs from Latin-1 only at 0x80-0x9F, which is exactly where
+  // Word puts its curly quotes, apostrophes and dashes. The table is here rather
+  // than TextDecoder("windows-1252") because Node decodes that label as Latin-1
+  // (0x93 -> U+0093, not U+201C), so the tests would not run the page's code.
+  // Unassigned bytes (0x81, 0x8D, 0x8F, 0x90, 0x9D) map to themselves, as WHATWG does.
+  var CP1252_HIGH = [
+    0x20ac, 0x81, 0x201a, 0x192, 0x201e, 0x2026, 0x2020, 0x2021, 0x2c6, 0x2030, 0x160, 0x2039, 0x152, 0x8d, 0x17d, 0x8f,
+    0x90, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014, 0x2dc, 0x2122, 0x161, 0x203a, 0x153, 0x9d, 0x17e, 0x178
+  ];
+
+  function decodeWindows1252(bytes) {
+    var chars = [];
+    for (var i = 0; i < bytes.length; i++) {
+      var byte = bytes[i];
+      chars.push(String.fromCharCode(byte >= 0x80 && byte <= 0x9f ? CP1252_HIGH[byte - 0x80] : byte));
+    }
+    return chars.join("");
+  }
+
+  /**
+   * Review #1: the bytes of an uploaded file as text. A UTF-16 byte-order mark
+   * (Notepad's "Unicode") picks UTF-16; otherwise strict UTF-8, and anything that
+   * is not valid UTF-8 is read as Windows-1252 (Word's Plain Text default). The
+   * decoders drop a byte-order mark themselves.
+   */
+  function decodeBook(bytes) {
+    var view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    if (view[0] === 0xff && view[1] === 0xfe) return new TextDecoder("utf-16le").decode(view);
+    if (view[0] === 0xfe && view[1] === 0xff) return new TextDecoder("utf-16be").decode(view);
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(view);
+    } catch (error) {
+      return decodeWindows1252(view);
+    }
+  }
+
   // ── The local store ────────────────────────────────────────────────────────
 
   var STORAGE_KEY = "rnmb-quotebook-v1";
@@ -316,6 +355,10 @@ var RNMBQuotebook = (function () {
    * replace the book already loaded (6.11.5, 6.11.7).
    */
   function prepareBook(rawText, fileName) {
+    // No quotebook holds a NUL. One that does was decoded wrongly (UTF-16 with no
+    // byte-order mark reads as valid UTF-8) or is not text at all, and would
+    // otherwise "load" as junk quotes over the book already there.
+    if (typeof rawText === "string" && rawText.indexOf("\u0000") !== -1) return { ok: false, reason: "not-text" };
     var quotes = parseQuotebook(rawText);
     if (!quotes.length) return { ok: false, reason: "empty" };
     var book = makeBook(fileName, quotes);
@@ -442,6 +485,7 @@ var RNMBQuotebook = (function () {
     parseQuotebook: parseQuotebook,
     prepareBook: prepareBook,
     createStore: createStore,
+    decodeBook: decodeBook,
     matchAuthor: matchAuthor,
     pickOrder: pickOrder
   });

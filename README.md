@@ -131,7 +131,7 @@ Ines: "Open up."   Bram: "It is open."
 
 The last is an exchange: separate the speakers with a tab or two spaces and each turn gets its own line on the card. A line with no name is filed under *Unknown*. A file saved from Notepad, Word or a chat app is fine as it is.
 
-Loading a new file replaces the old one. A file with no quotes in it, or one over 256 KB, is refused and the book already loaded stays. **Clear quotebook** removes it from this browser only; clearing, importing or reloading the dashboard's data leaves the quotebook alone.
+Loading a new file replaces the old one. A file with no quotes in it, one over 256 KB, or one that is not plain text is refused, and the book already loaded stays. **Clear quotebook** removes it from this browser only; clearing, importing or reloading the dashboard's data leaves the quotebook alone.
 
 **On the Overview** the quote is the first card. It is not there at all until a book is loaded. It shows a new quote each time the Overview comes into view and whenever it is tapped (or focused and Enter or Space pressed), and it keeps the same one while the dashboard updates underneath it. A long quote gets smaller type rather than being cut off; a quote too long to fit the card at its smallest type is skipped. When the quote is attributed to someone on the roster, the card takes their colour.
 

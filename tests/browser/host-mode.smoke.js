@@ -4148,14 +4148,14 @@ async function actionForToast(session, action, text) {
   );
 }
 
-/** Upload a book through the Crew tab's widget and wait for the given toast. */
+/** Upload a book (a UTF-8 string, or raw bytes) through the Crew tab's widget and wait for the given toast. */
 async function uploadQuotebook(session, name, contents, toast) {
   const { page } = session;
   await page.click('.tab-button[data-tab="crew"]');
   await actionForToast(session, () => page.setInputFiles("#quotebookFile", {
     name,
     mimeType: "text/plain",
-    buffer: Buffer.from(contents, "utf8")
+    buffer: Buffer.isBuffer(contents) ? contents : Buffer.from(contents, "utf8")
   }), toast);
 }
 
@@ -4306,6 +4306,35 @@ scenarios.push(
         const line = `"${"x".repeat(200)}" - Bram\n`;
         const huge = line.repeat(Math.ceil((256 * 1024 * 1.2) / line.length));
         await uploadQuotebook(session, "huge.txt", huge, "That quotebook is too large to keep in this browser (the limit is 256 KB), so it was not loaded.");
+        assert.deepEqual(await quotebookWidget(page), before);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Quotebook widget reads Word's Windows-1252 and Notepad's UTF-16, and refuses UTF-16 with no byte-order mark",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404 });
+      const { page } = session;
+      const storedQuotes = async () => JSON.parse((await quotebookWidget(page)).stored).quotes;
+      try {
+        // “I’m fine.” — Ines, as Word's Plain Text export writes it.
+        const cp1252 = Buffer.from([0x93, 0x49, 0x92, ...Buffer.from("m fine."), 0x94, 0x20, 0x97, ...Buffer.from(" Ines\r\n")]);
+        await uploadQuotebook(session, "word.txt", cp1252, "Quotebook loaded: 1 quote from word.txt.");
+        assert.deepEqual(await storedQuotes(), [{ text: "I’m fine.", author: "Ines" }]);
+
+        const clean = '"The keg is a mood." - Bram\r\n"Garnish or perish." - Alex';
+        const utf16 = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(clean, "utf16le")]);
+        await uploadQuotebook(session, "notepad.txt", utf16, "Quotebook loaded: 2 quotes from notepad.txt.");
+        assert.deepEqual(await storedQuotes(), [{ text: "The keg is a mood.", author: "Bram" }, { text: "Garnish or perish.", author: "Alex" }]);
+
+        // Without a byte-order mark the bytes read as UTF-8 full of NULs: refused, and the book stays.
+        const before = await quotebookWidget(page);
+        await uploadQuotebook(session, "bomless.txt", Buffer.from(clean, "utf16le"),
+          "That file is not plain text, so the quotebook was not changed. Save it as a .txt file and try again.");
         assert.deepEqual(await quotebookWidget(page), before);
         session.assertClean();
       } finally {

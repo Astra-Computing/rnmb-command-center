@@ -203,6 +203,45 @@ test("the long-quote fixture parses, carries an oversized quote and a multi-spea
   );
 });
 
+// ---------- decoding the uploaded bytes (review #1) ---------------------------
+// file.text() assumes UTF-8. Word's Plain Text export defaults to Windows-1252 and
+// Notepad's "Unicode" is UTF-16, so the bytes are decoded here instead.
+
+const clean = '"I’m fine." — Ines\n"The keg is a mood." - Bram';
+
+test("UTF-8, with or without a byte-order mark, decodes unchanged", () => {
+  const utf8 = Buffer.from(clean, "utf8");
+  assert.equal(Q.decodeBook(utf8), clean);
+  assert.deepEqual(Q.parseQuotebook(Q.decodeBook(Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), utf8]))), Q.parseQuotebook(clean));
+});
+
+test("a Windows-1252 file from Word decodes its curly quotes, apostrophes and dashes", () => {
+  // “I’m fine.” — Ines / "The keg is a mood." - Bram, as Word saves it.
+  const cp1252 = Buffer.from([
+    0x93, ...Buffer.from("I"), 0x92, ...Buffer.from("m fine."), 0x94, 0x20, 0x97, ...Buffer.from(" Ines\r\n"),
+    ...Buffer.from('"The keg is a mood." - Bram')
+  ]);
+  const quotes = Q.parseQuotebook(Q.decodeBook(cp1252));
+  assert.deepEqual(quotes, Q.parseQuotebook(clean));
+  assert.equal(quotes[0].text, "I’m fine.");
+  assert.equal(quotes[0].author, "Ines");
+});
+
+test("a UTF-16 file from Notepad decodes in either byte order", () => {
+  const le = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(clean.replace(/\n/g, "\r\n"), "utf16le")]);
+  const be = Buffer.from(le);
+  be.swap16();
+  assert.deepEqual(Q.parseQuotebook(Q.decodeBook(le)), Q.parseQuotebook(clean));
+  assert.deepEqual(Q.parseQuotebook(Q.decodeBook(be)), Q.parseQuotebook(clean));
+});
+
+test("text holding a NUL character is refused as not plain text, so it never replaces a book", () => {
+  // UTF-16 with no byte-order mark decodes as valid UTF-8 full of NULs.
+  const bomless = Buffer.from('"The keg is a mood." - Ines', "utf16le");
+  assert.deepEqual(Q.prepareBook(Q.decodeBook(bomless), "bomless.txt"), { ok: false, reason: "not-text" });
+  assert.deepEqual(Q.prepareBook("a\u0000b - Ines", "nul.txt"), { ok: false, reason: "not-text" });
+});
+
 // ---------- the local store (U2) ----------------------------------------------
 // The store runs against an injected fake, so none of this needs a browser.
 
