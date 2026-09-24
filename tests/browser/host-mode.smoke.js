@@ -4488,6 +4488,85 @@ scenarios.push(
   },
 
   {
+    // U6, AE3: the only automated guard on the plan's privacy requirement (5.11.3).
+    name: "Quotebook containment: no quote reaches stored app state, any request, or an exported archive (AE3)",
+    async run({ browser }) {
+      const { ids, seed } = hostModeSeed();
+      const bottleId = "99999999-0000-4000-8000-000000000001";
+      seed.rnmb_bottles = [{ id: bottleId, type_id: ids.rum, nickname: "Rum bottle", size_oz: 25, remaining_oz: 25, price: 40, buyer_id: ids.sam, purchase_date: "2026-09-16" }];
+      const stub = hostModeStub(seed);
+      stub.rpc.rnmb_add_crew_pour = (payload) => payload.id;
+      const session = await openPage(browser, { routes: stub.routes });
+      const { page } = session;
+
+      // Every request the page makes, to any host, with its URL and body.
+      const sent = [];
+      page.on("request", (request) => sent.push(`${request.method()} ${request.url()}\n${request.postData() || ""}`));
+
+      const book = quotebookFixture("LongQuotes.txt");
+      const quotes = require("../../quotebook.js").parseQuotebook(book);
+      // A quote can sit in a haystack raw (an archive, a URL) or JSON-escaped (a body, stored state).
+      const leaked = (haystack) => quotes
+        .filter((quote) => haystack.includes(quote.text) || haystack.includes(JSON.stringify(quote.text).slice(1, -1)))
+        .map((quote) => quote.text.slice(0, 30));
+
+      const readDownload = async (download) => fs.readFileSync(await download.path(), "utf8");
+
+      try {
+        await session.waitForToast("Connected to Supabase.");
+        await uploadQuotebook(session, "LongQuotes.txt", book, `Quotebook loaded: ${quotes.length} quotes from LongQuotes.txt.`);
+        await page.click('.tab-button[data-tab="overview"]');
+        const showing = (await quoteCard(page)).text;
+        assert.ok(quotes.some((quote) => quote.text === showing), "the book is loaded and a quote from it is on screen");
+
+        // Writes of every shape: a crew pour, a new crew member, and a whole-state replace.
+        await actionForToast(session, () => page.evaluate(({ personId, bottleId }) => {
+          const form = document.querySelector("#pourForm");
+          form.querySelector("[name='personId']").value = personId;
+          form.querySelector("[name='bottleId']").value = bottleId;
+          form.querySelector("[name='ounces']").value = "1.5";
+          form.requestSubmit();
+        }, { personId: ids.sam, bottleId }), "Pour logged.");
+        await page.click('.tab-button[data-tab="crew"]');
+        await page.fill("#personForm [name='name']", "Riley");
+        await actionForToast(session, () => page.click("#personForm button[type='submit']"), "Person added to the roster.");
+
+        const backupPromise = page.waitForEvent("download");
+        await actionForToast(session, () => page.click("#seedData"), "Demo data reloaded.");
+        const backup = await readDownload(await backupPromise);
+
+        const exportPromise = page.waitForEvent("download");
+        await page.click("#exportData");
+        const exported = await readDownload(await exportPromise);
+
+        const stored = await page.evaluate(() => localStorage.getItem("rnmb-command-center-v1"));
+        const bodies = stub.log.map((entry) => JSON.stringify(entry));
+
+        assert.ok(stub.log.some((entry) => entry.path === "rpc/rnmb_add_crew_pour"), "the pour was sent");
+        assert.ok(stub.log.some((entry) => entry.path === "rnmb_people" && entry.method === "POST"), "the new person was sent");
+        assert.ok(stub.log.some((entry) => entry.method === "DELETE"), "the whole-state replace was sent");
+        assert.ok(sent.length > 0);
+
+        assert.deepEqual(leaked(stored), [], "stored app state holds no quote");
+        assert.deepEqual(leaked(bodies.join("\n")), [], "no Supabase request body holds a quote");
+        assert.deepEqual(leaked(sent.join("\n")), [], "no request of any kind carries a quote");
+        for (const [name, archive] of [["the export", exported], ["the backup before Reload demo", backup]]) {
+          assert.deepEqual(leaked(archive), [], `${name} holds no quote`);
+          const keys = Object.keys(JSON.parse(archive));
+          assert.ok(!keys.some((key) => /quote/i.test(key)), `${name} has no quotebook key: ${keys.join(", ")}`);
+        }
+
+        // And the book is still there, untouched by the replace.
+        assert.equal(JSON.parse(await page.evaluate((key) => localStorage.getItem(key), QUOTEBOOK_KEY)).count, quotes.length);
+        assert.deepEqual(stub.unexpected, []);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
     name: "Quote card shows the shortest quote at the floor size when no quote fits",
     async run({ browser }) {
       const huge = (n) => `"${"word ".repeat(n).trim()}" - Alex`;
