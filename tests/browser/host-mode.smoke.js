@@ -4598,6 +4598,37 @@ scenarios.push(
   },
 
   {
+    name: "Quote card keeps its quote across a resize, re-fitted, and never overflows the narrower card",
+    async run({ browser }) {
+      const session = await openPage(browser, { allowConsole: apiConfig404, viewport: { width: 1440, height: 900 }, routes: seedQuotebook(quotebookFixture("LongQuotes.txt")) });
+      const { page } = session;
+      const held = () => page.evaluate(() => ({ ...heldQuote }));
+      try {
+        // Settle on a quote that fits the wide card at more than the floor size, so shrinking has somewhere to go.
+        for (let i = 0; i < 20 && (await held()).size <= 0.72; i += 1) await page.click("#quoteCard");
+        const wide = await held();
+        assert.ok(wide.size > 0.72, `found a quote above the floor size to shrink from: ${JSON.stringify(wide)}`);
+        const text = (await quoteCard(page)).text;
+
+        await page.setViewportSize({ width: 1024, height: 900 });
+        await page.waitForTimeout(200);
+        const narrow = await held();
+        const card = await quoteCard(page);
+        assert.equal(card.overflows, false, "the quote fits the narrower card");
+        if (narrow.index === wide.index) {
+          assert.equal(card.text, text, "the same quote, only re-fitted");
+          assert.ok(narrow.size <= wide.size, `re-fitted from ${wide.size} to ${narrow.size}`);
+        } else {
+          assert.notEqual(card.text, text, "picked another only because the first no longer fits");
+        }
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
     name: "Quote card shows the shortest quote at the floor size when no quote fits",
     async run({ browser }) {
       const huge = (n) => `"${"word ".repeat(n).trim()}" - Alex`;
