@@ -12,6 +12,7 @@ A dependency-free dashboard for tracking group beverage inventory, spending, nig
 - Inventory depletion tracking when pours are logged
 - JSON export/import for backup or migration
 - Host mode: a bar register for nights with guests, with a menu, recipes, guest tabs and cost-plus-markup prices
+- Quotebook: load the crew's quotes from a `.txt` and the Overview shows one at random; the book never leaves the browser it was loaded in
 
 ## Supabase Setup
 
@@ -115,19 +116,43 @@ A red *This browser only* banner on the register means nothing is being saved to
 
 The app still works if the SQL has not been run yet: the Menu tab and register say which file to run, and ordinary saves send exactly what they sent before.
 
+## Quotebook
+
+**The quotebook does not sync.** It is kept in the one browser it was loaded in and nowhere else: it is never sent to the shared database, never put in an export or a backup, and it does not come back with an import. Every phone and laptop that should show quotes needs the book loaded on it separately.
+
+**Loading it:** **Crew → Crew Quotes → Load quotebook (.txt)**. Pick a plain text file with one quote per line. Lines like these all work:
+
+```text
+"The keg is a mood." - Ines
+"The keg is a mood." — Ines
+Ines: The keg is a mood.
+Ines: "Open up."   Bram: "It is open."
+```
+
+The last is an exchange: separate the speakers with a tab or two spaces and each turn gets its own line on the card. A line with no name is filed under *Unknown*. A file saved from Notepad, Word or a chat app is fine as it is.
+
+Loading a new file replaces the old one. A file with no quotes in it, or one over 256 KB, is refused and the book already loaded stays. **Clear quotebook** removes it from this browser only; clearing, importing or reloading the dashboard's data leaves the quotebook alone.
+
+**On the Overview** the quote is the first card. It is not there at all until a book is loaded. It shows a new quote each time the Overview comes into view and whenever it is tapped (or focused and Enter or Space pressed), and it keeps the same one while the dashboard updates underneath it. A long quote gets smaller type rather than being cut off; a quote too long to fit the card at its smallest type is skipped. When the quote is attributed to someone on the roster, the card takes their colour.
+
 ## Tests
 
 No dependencies are needed. From the workspace, run them inside the `dev-env` container:
 
 ```bash
-# balances, settlement, pricing, stock and summaries
+# balances, settlement, pricing, stock, summaries, and the quotebook parser and store
 docker exec dev-env node --test /workspace/projects/rnmb-command-center/tests/
 
 # end-to-end browser checks (serve the app on port 3000 first)
 docker exec -e PLAYWRIGHT_BROWSERS_PATH=/workspace/tools/playwright/browsers dev-env node /workspace/projects/rnmb-command-center/tests/browser/host-mode.smoke.js
+
+# layout audit: text that does not fit its box, at ten widths (a report, not pass/fail)
+docker exec -e PLAYWRIGHT_BROWSERS_PATH=/workspace/tools/playwright/browsers dev-env node /workspace/projects/rnmb-command-center/tests/browser/ui-audit.js
 ```
 
 From Git Bash, prefix `docker exec` with `MSYS_NO_PATHCONV=1`.
+
+Every quotebook used by the tests is made up (`tests/fixtures/parser/`). Never test with the crew's real book: the layout audit prints the text of anything it flags. A real book saved in this folder as `quotebook*.txt` is ignored by git, and `.vercelignore` keeps it out of a deploy.
 
 ## Deploy on Vercel
 

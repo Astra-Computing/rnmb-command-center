@@ -65,3 +65,11 @@ A Night with guests, where a bar register is open and guest Drinks go onto Guest
 
 ### Guest Tab
 A running total for one named guest across a Host Night, closed either as paid — naming the Crew Member who collected the money — or as written off, naming the Crew Member who absorbs what its Drinks cost. Either way the closing Crew Member is recorded by Name Snapshot, so the Tab outlives them.
+
+## Quotebook
+
+### Quotebook
+The crew's own collection of things people have said, loaded from a text file into one browser. It is the only part of the dashboard that is deliberately not shared: it lives under its own storage key in the browser that loaded it, and never reaches the shared database, the dashboard's state or an exported archive. Each device loads its own copy; loading another replaces it.
+
+### Quote
+One line of the Quotebook, parsed into its text and the name it is attributed to — several names for an exchange, or *Unknown* for none. The name is matched to a Crew Member only to colour the Overview card, loosely and never for money; a Quote carries no Name Snapshot, so one from someone who has left simply takes the default colour.
