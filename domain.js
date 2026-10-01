@@ -1397,6 +1397,12 @@ var RNMBDomain = (function () {
     return Number.isFinite(number) ? number : 0;
   }
 
+  /** A safe-saves version: a whole number of 1 or more, else null (no version known). */
+  function versionOrNull(value) {
+    var number = numberOrNull(value);
+    return number !== null && Number.isInteger(number) && number >= 1 ? number : null;
+  }
+
   /** A crew pour keeps its fields and gains costCents (whole cents or null), buyerId and buyerName (null when absent). */
   function normalizePour(pour) {
     var copy = Object.assign({}, pour);
@@ -1433,7 +1439,9 @@ var RNMBDomain = (function () {
       kind: MENU_KINDS.indexOf(source.kind) >= 0 ? source.kind : "cocktail",
       ingredients: listOf(source.ingredients).map(function (ingredient) {
         return { id: orNull(ingredient.id), typeId: ingredient.typeId, amount: numberOrZero(ingredient.amount) };
-      })
+      }),
+      // The version this copy was read at (supabase/safe-saves.sql); null before that file runs.
+      version: versionOrNull(source.version)
     };
   }
 
@@ -1533,7 +1541,8 @@ var RNMBDomain = (function () {
         source.markupPercent !== undefined && source.markupPercent !== null && Number.isFinite(markup) && markup >= 0
           ? markup
           : DEFAULT_MARKUP_PERCENT,
-      roundingIncrementCents: Number.isInteger(increment) && increment > 0 ? increment : DEFAULT_ROUNDING_INCREMENT_CENTS
+      roundingIncrementCents: Number.isInteger(increment) && increment > 0 ? increment : DEFAULT_ROUNDING_INCREMENT_CENTS,
+      pricingVersion: versionOrNull(source.pricingVersion)
     };
   }
 

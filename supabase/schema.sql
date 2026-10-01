@@ -2,9 +2,9 @@ create extension if not exists pgcrypto;
 
 -- Fresh projects only: this file creates every table at its current shape. A
 -- database created from an older copy of this file is brought up to date by
--- supabase/rls-passphrase.sql, supabase/host-mode.sql and
--- supabase/crew-balance.sql (run in that order) instead, and those three files
--- must end at the same result as this one.
+-- supabase/rls-passphrase.sql, supabase/host-mode.sql,
+-- supabase/crew-balance.sql and supabase/safe-saves.sql (run in that order)
+-- instead, and those four files must end at the same result as this one.
 
 create table if not exists public.rnmb_people (
   id uuid primary key default gen_random_uuid(),
@@ -76,6 +76,7 @@ create table if not exists public.rnmb_settings (
   updated_at timestamptz not null default now(),
   markup_percent numeric(6, 2) not null default 0,
   rounding_increment_cents integer not null default 25,
+  pricing_version integer not null default 1,
   constraint rnmb_settings_singleton check (id),
   constraint rnmb_settings_markup_percent check (markup_percent >= 0),
   constraint rnmb_settings_rounding_increment_cents check (rounding_increment_cents > 0)
@@ -114,7 +115,8 @@ create table if not exists public.rnmb_menu_items (
   id uuid primary key default gen_random_uuid(),
   name text not null check (char_length(trim(name)) > 0),
   kind text not null check (kind in ('cocktail', 'straight', 'counted')),
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  version integer not null default 1
 );
 
 create table if not exists public.rnmb_recipe_ingredients (
@@ -1245,6 +1247,212 @@ $$;
 
 -- Same grants as rnmb_authorized(): nobody by default, then the two roles the
 -- publishable key can act as.
+-- Safe saves (supabase/safe-saves.sql). Replace every table in one transaction.
+-- payload: { "tables": { "<table>": [rows...], ... }, "settings": { settings row } }
+--   Every row in one table's list carries the same keys, as a PostgREST bulk
+--   insert needs; the keys of the first row are the columns written. A table
+--   that is missing from "tables" ends up empty.
+-- Menu item versions and the pricing version go UP, never back to 1, so an edit
+-- form that was open before the replace is refused rather than matching a reset
+-- version by chance.
+-- Every DELETE and UPDATE has a WHERE clause: through the Supabase API, Postgres
+-- refuses one without (the safeupdate extension), even inside a function.
+create or replace function public.rnmb_replace_all(payload jsonb)
+returns void
+language plpgsql
+set search_path = public
+as $$
+declare
+  -- Parents before children. Deletes run in the reverse order.
+  v_tables text[] := array[
+    'rnmb_people', 'rnmb_beverage_types', 'rnmb_nights', 'rnmb_bottles', 'rnmb_pours',
+    'rnmb_menu_items', 'rnmb_recipe_ingredients', 'rnmb_guest_tabs', 'rnmb_ring_ups',
+    'rnmb_ring_up_lines', 'rnmb_stock_adjustments', 'rnmb_payments'
+  ];
+  v_rows jsonb;
+  v_table text;
+  v_cols text;
+  v_sets text;
+  v_settings jsonb;
+  v_old_menu jsonb;
+  v_old_pricing integer;
+  v_unknown text;
+  i integer;
+begin
+  if not public.rnmb_authorized() then
+    raise exception 'RNMB: the passphrase is missing or wrong, so nothing was saved.'
+      using errcode = '42501';
+  end if;
+  if jsonb_typeof(payload -> 'tables') is distinct from 'object' then
+    raise exception 'RNMB: the replacement data has no tables, so nothing was replaced.';
+  end if;
+  select k into v_unknown
+    from jsonb_object_keys(payload -> 'tables') k
+   where k <> all (v_tables)
+   limit 1;
+  if v_unknown is not null then
+    raise exception 'RNMB: % is not a table the dashboard can replace, so nothing was replaced.', v_unknown;
+  end if;
+
+  select coalesce(jsonb_object_agg(id::text, version), '{}'::jsonb) into v_old_menu
+    from public.rnmb_menu_items;
+  select pricing_version into v_old_pricing from public.rnmb_settings where id;
+
+  update public.rnmb_settings set active_night_id = null where id;
+  for i in reverse array_length(v_tables, 1) .. 1 loop
+    execute format('delete from public.%I where id is not null', v_tables[i]);
+  end loop;
+
+  foreach v_table in array v_tables loop
+    v_rows := payload -> 'tables' -> v_table;
+    continue when v_rows is null or jsonb_typeof(v_rows) <> 'array' or jsonb_array_length(v_rows) = 0;
+    select string_agg(quote_ident(k), ', ') into v_cols
+      from jsonb_object_keys(v_rows -> 0) k;
+    execute format(
+      'insert into public.%I (%s) select %s from jsonb_populate_recordset(null::public.%I, $1)',
+      v_table, v_cols, v_cols, v_table
+    ) using v_rows;
+  end loop;
+
+  update public.rnmb_menu_items m
+     set version = coalesce((v_old_menu ->> m.id::text)::integer, 0) + 1
+   where m.id is not null;
+
+  -- The settings row: written from the payload, but never its version.
+  v_settings := coalesce(payload -> 'settings', '{}'::jsonb) - 'pricing_version' || '{"id": true}'::jsonb;
+  select string_agg(quote_ident(k), ', '),
+         string_agg(format('%1$I = excluded.%1$I', k), ', ')
+    into v_cols, v_sets
+    from jsonb_object_keys(v_settings) k;
+  execute format(
+    'insert into public.rnmb_settings (%s) select %s from jsonb_populate_record(null::public.rnmb_settings, $1) '
+    'on conflict (id) do update set %s',
+    v_cols, v_cols, v_sets
+  ) using v_settings;
+  update public.rnmb_settings set pricing_version = coalesce(v_old_pricing, 0) + 1 where id;
+end;
+$$;
+
+-- Save a menu item and its whole recipe in one transaction.
+-- payload: id, name, kind, version (the version the edit started from; null for
+--   a new item), ingredients [{ id, type_id, amount, line_no }].
+-- Returns the item's new version.
+create or replace function public.rnmb_save_menu_item(payload jsonb)
+returns integer
+language plpgsql
+set search_path = public
+as $$
+declare
+  v_id uuid := nullif(payload ->> 'id', '')::uuid;
+  v_expected integer := nullif(payload ->> 'version', '')::integer;
+  v_ingredients jsonb := payload -> 'ingredients';
+  v_current integer;
+  v_written integer;
+begin
+  if not public.rnmb_authorized() then
+    raise exception 'RNMB: the passphrase is missing or wrong, so nothing was saved.'
+      using errcode = '42501';
+  end if;
+  if v_id is null then
+    raise exception 'RNMB: a menu item needs an id.';
+  end if;
+  if jsonb_typeof(v_ingredients) is distinct from 'array' or jsonb_array_length(v_ingredients) = 0 then
+    raise exception 'RNMB: a menu item needs at least one ingredient.';
+  end if;
+
+  if v_expected is null then
+    if exists (select 1 from public.rnmb_menu_items where id = v_id) then
+      raise exception 'RNMB: that menu item was already saved, so it was not added twice. The latest menu is loaded.';
+    end if;
+    v_current := 1;
+    insert into public.rnmb_menu_items (id, name, kind, version)
+    values (v_id, payload ->> 'name', payload ->> 'kind', v_current);
+  else
+    select version into v_current from public.rnmb_menu_items where id = v_id for update;
+    if not found then
+      raise exception 'RNMB: someone removed this menu item while you were editing it, so nothing was saved. The latest menu is loaded.';
+    end if;
+    if v_current <> v_expected then
+      raise exception 'RNMB: someone else changed this menu item while you were editing it, so nothing was saved. The latest version is loaded; make your change again.';
+    end if;
+    v_current := v_current + 1;
+    update public.rnmb_menu_items
+       set name = payload ->> 'name', kind = payload ->> 'kind', version = v_current
+     where id = v_id;
+    delete from public.rnmb_recipe_ingredients
+     where menu_item_id = v_id
+       and id not in (
+         select (e ->> 'id')::uuid from jsonb_array_elements(v_ingredients) e
+          where nullif(e ->> 'id', '') is not null
+       );
+  end if;
+
+  insert into public.rnmb_recipe_ingredients (id, menu_item_id, type_id, amount, line_no)
+  select coalesce(nullif(e ->> 'id', '')::uuid, gen_random_uuid()),
+         v_id,
+         nullif(e ->> 'type_id', '')::uuid,
+         (e ->> 'amount')::numeric,
+         coalesce((e ->> 'line_no')::integer, (n - 1)::integer)
+    from jsonb_array_elements(v_ingredients) with ordinality as x(e, n)
+  on conflict (id) do update
+     set type_id = excluded.type_id, amount = excluded.amount, line_no = excluded.line_no
+   where public.rnmb_recipe_ingredients.menu_item_id = excluded.menu_item_id;
+  get diagnostics v_written = row_count;
+  -- A line skipped by the WHERE above belongs to another menu item.
+  if v_written <> jsonb_array_length(v_ingredients) then
+    raise exception 'RNMB: an ingredient of this item already belongs to another menu item, so nothing was saved.';
+  end if;
+
+  return v_current;
+end;
+$$;
+
+-- Save the markup and the rounding against the pricing version.
+-- payload: markup_percent, rounding_increment_cents, version (the version the
+--   edit started from). Returns the new pricing version.
+create or replace function public.rnmb_save_pricing(payload jsonb)
+returns integer
+language plpgsql
+set search_path = public
+as $$
+declare
+  v_markup numeric := (payload ->> 'markup_percent')::numeric;
+  v_increment integer := (payload ->> 'rounding_increment_cents')::integer;
+  v_expected integer := nullif(payload ->> 'version', '')::integer;
+  v_current integer;
+begin
+  if not public.rnmb_authorized() then
+    raise exception 'RNMB: the passphrase is missing or wrong, so nothing was saved.'
+      using errcode = '42501';
+  end if;
+  if v_markup is null or v_markup < 0 or v_markup >= 10000 then
+    raise exception 'RNMB: the markup must be a percentage from 0 up to 9999.99.';
+  end if;
+  if v_markup <> round(v_markup, 2) then
+    raise exception 'RNMB: the markup is kept to two decimal places, and % has more.', v_markup;
+  end if;
+  if v_increment is null or v_increment <= 0 then
+    raise exception 'RNMB: round up to a whole number of cents, 1 or more.';
+  end if;
+
+  select pricing_version into v_current from public.rnmb_settings where id for update;
+  if not found then
+    insert into public.rnmb_settings (id, markup_percent, rounding_increment_cents, pricing_version)
+    values (true, v_markup, v_increment, 1);
+    return 1;
+  end if;
+  if v_expected is null or v_current <> v_expected then
+    raise exception 'RNMB: someone else changed the pricing while you were editing it, so nothing was saved. The latest pricing is loaded; make your change again.';
+  end if;
+
+  v_current := v_current + 1;
+  update public.rnmb_settings
+     set markup_percent = v_markup, rounding_increment_cents = v_increment, pricing_version = v_current
+   where id;
+  return v_current;
+end;
+$$;
+
 revoke all on function public.rnmb_ring_up(jsonb) from public;
 revoke all on function public.rnmb_void_ring_up(jsonb) from public;
 revoke all on function public.rnmb_open_tab(jsonb) from public;
@@ -1258,6 +1466,9 @@ revoke all on function public.rnmb_remove_crew_pour(jsonb) from public;
 revoke all on function public.rnmb_record_payment(jsonb) from public;
 revoke all on function public.rnmb_void_payment(jsonb) from public;
 revoke all on function public.rnmb_remove_person(jsonb) from public;
+revoke all on function public.rnmb_replace_all(jsonb) from public;
+revoke all on function public.rnmb_save_menu_item(jsonb) from public;
+revoke all on function public.rnmb_save_pricing(jsonb) from public;
 
 grant execute on function public.rnmb_ring_up(jsonb) to anon, authenticated;
 grant execute on function public.rnmb_void_ring_up(jsonb) to anon, authenticated;
@@ -1272,6 +1483,9 @@ grant execute on function public.rnmb_remove_crew_pour(jsonb) to anon, authentic
 grant execute on function public.rnmb_record_payment(jsonb) to anon, authenticated;
 grant execute on function public.rnmb_void_payment(jsonb) to anon, authenticated;
 grant execute on function public.rnmb_remove_person(jsonb) to anon, authenticated;
+grant execute on function public.rnmb_replace_all(jsonb) to anon, authenticated;
+grant execute on function public.rnmb_save_menu_item(jsonb) to anon, authenticated;
+grant execute on function public.rnmb_save_pricing(jsonb) to anon, authenticated;
 
 -- Set a real passphrase before anyone uses the dashboard.
 insert into public.rnmb_access (id, passphrase)

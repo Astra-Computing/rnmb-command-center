@@ -843,8 +843,24 @@ test("normalizeState on nothing at all is an empty state", () => {
   assert.deepEqual(state, {
     people: [], types: [], bottles: [], nights: [],
     menuItems: [], guestTabs: [], ringUps: [], stockAdjustments: [], payments: [],
-    activeNightId: "", markupPercent: 0, roundingIncrementCents: 25
+    activeNightId: "", markupPercent: 0, roundingIncrementCents: 25, pricingVersion: null
   });
+});
+
+test("normalizeState keeps safe-saves versions that are whole numbers of 1 or more, and drops the rest", () => {
+  const state = D.normalizeState({
+    menuItems: [
+      { id: "m1", name: "A", kind: "cocktail", ingredients: [], version: 3 },
+      { id: "m2", name: "B", kind: "cocktail", ingredients: [], version: "4" },
+      { id: "m3", name: "C", kind: "cocktail", ingredients: [], version: 0 },
+      { id: "m4", name: "D", kind: "cocktail", ingredients: [], version: 1.5 },
+      { id: "m5", name: "E", kind: "cocktail", ingredients: [] }
+    ],
+    pricingVersion: 7
+  });
+  assert.deepEqual(state.menuItems.map((item) => item.version), [3, 4, null, null, null]);
+  assert.equal(state.pricingVersion, 7);
+  assert.equal(D.normalizeState({ pricingVersion: "x" }).pricingVersion, null);
 });
 
 test("normalizeState keeps host nights, the browser-only local mark only when literally true, and valid settings", () => {
@@ -889,8 +905,8 @@ test("normalizeState normalizes menu items, tabs, ring-ups with their lines, and
     stockAdjustments: [{ id: "a1", bottleId: "b1", previousRemaining: "10", newRemaining: "8.5", adjustedAt: "2026-09-16T23:00:00Z" }]
   });
 
-  assert.deepEqual(state.menuItems[0], { id: "m1", name: "Margarita", kind: "cocktail", ingredients: [{ id: "i1", typeId: "t-tequila", amount: 2 }] });
-  assert.deepEqual(state.menuItems[1], { id: "m2", name: "Odd", kind: "cocktail", ingredients: [] });
+  assert.deepEqual(state.menuItems[0], { id: "m1", name: "Margarita", kind: "cocktail", ingredients: [{ id: "i1", typeId: "t-tequila", amount: 2 }], version: null });
+  assert.deepEqual(state.menuItems[1], { id: "m2", name: "Odd", kind: "cocktail", ingredients: [], version: null });
   assert.deepEqual(state.guestTabs[0], {
     id: "g1", nightId: "h1", guestName: "Riley", status: "open",
     collectorId: null, collectorName: null, amountCents: null, writtenOffBy: null, writtenOffByName: null,

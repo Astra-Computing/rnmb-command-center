@@ -82,6 +82,13 @@ const POURED_BOTTLE_MESSAGE = "Crew drinks have been poured from this stock item
 // has them, so this starts true and is reset on every load, like hostModeAvailable.
 // While false, no payment, pour-cost or write-off-author column is ever sent.
 let crewBalanceAvailable = true;
+// Safe saves: true once the shared database has run supabase/safe-saves.sql
+// (rnmb_menu_items.version and rnmb_settings.pricing_version exist). Then
+// Import / Demo / Clear replace everything in one transaction, and a menu item or
+// pricing save names the version it started from, so it cannot overwrite a newer
+// change from another device. While false, the older save paths run unchanged.
+// Local mode has one device and no transactions to gain, so it stays false there.
+let safeSavesAvailable = false;
 const CREW_BALANCE_SQL_MESSAGE = "Crew balances are not set up on the shared database yet. Run supabase/crew-balance.sql in Supabase, then reload.";
 
 // The bar register (KTD7): the order being built is this one object, never the
@@ -532,7 +539,7 @@ function prepareMenuItem(menuItem) {
     }
     checkAmount(ingredient.amount, type, "Every ingredient");
   });
-  return RNMBDomain.normalizeMenuItem({ id: menuItem.id || uid(), name, kind: menuItem.kind, ingredients });
+  return RNMBDomain.normalizeMenuItem({ id: menuItem.id || uid(), name, kind: menuItem.kind, ingredients, version: menuItem.version });
 }
 
 /** Validate markup and rounding; returns { markupPercent, roundingIncrementCents } or throws a refusal. */
@@ -732,6 +739,18 @@ function createSupabaseRepository(config) {
     }
   }
 
+  /* Whether supabase/safe-saves.sql has run: both version columns exist. Same probe as above. */
+  async function safeSavesColumnsExist() {
+    try {
+      await request("rnmb_menu_items?select=version&id=is.null");
+      await request("rnmb_settings?select=pricing_version&id=is.null");
+      return true;
+    } catch (error) {
+      if ([400, 404].includes(error.status) || ["42703", "PGRST204", "PGRST205", "42P01"].includes(error.code)) return false;
+      throw error;
+    }
+  }
+
   function requireCrewBalance() {
     if (!crewBalanceAvailable) throw refusal(CREW_BALANCE_SQL_MESSAGE);
   }
@@ -891,6 +910,8 @@ function createSupabaseRepository(config) {
       // the payments table exist. Racing it alongside them costs a pre-migration
       // database a 400 on every load (KTD6).
       crewBalanceAvailable = hostModeAvailable && paymentRows !== null && await pourCostColumnsExist();
+      // Sequential for the same reason: safe-saves.sql needs crew-balance.sql first.
+      safeSavesAvailable = crewBalanceAvailable && await safeSavesColumnsExist();
 
       const groupBy = (rows, key) => {
         const groups = new Map();
@@ -958,7 +979,8 @@ function createSupabaseRepository(config) {
             id: ingredient.id,
             typeId: ingredient.type_id,
             amount: ingredient.amount
-          }))
+          })),
+          version: item.version
         })),
         guestTabs: (tabRows || []).map((tab) => ({
           id: tab.id,
@@ -1016,7 +1038,8 @@ function createSupabaseRepository(config) {
         })),
         activeNightId: settings.active_night_id || nights[0]?.id || "",
         markupPercent: settings.markup_percent,
-        roundingIncrementCents: settings.rounding_increment_cents
+        roundingIncrementCents: settings.rounding_increment_cents,
+        pricingVersion: settings.pricing_version
       });
     },
     async saveAll(nextState) {
@@ -1033,38 +1056,46 @@ function createSupabaseRepository(config) {
         throw refusal("This data has a written-off tab with no record of who wrote it off, and the shared database needs one, so nothing was replaced.");
       }
 
-      await request("rnmb_settings?id=eq.true", {
-        method: "PATCH",
-        headers: { Prefer: "return=minimal" },
-        body: JSON.stringify({ active_night_id: null })
-      }).catch(() => undefined);
+      // With safe-saves.sql the rows are collected and replaced in one transaction
+      // (rnmb_replace_all), so a failure part-way changes nothing. Without it, the
+      // tables are emptied and refilled one request at a time, as before; the
+      // backup downloaded before the wipe is then the only answer to a failure.
+      const tables = safeSavesAvailable ? {} : null;
+      const write = tables ? async (table, rows) => { tables[table] = rows; } : insertRows;
+      if (!tables) {
+        await request("rnmb_settings?id=eq.true", {
+          method: "PATCH",
+          headers: { Prefer: "return=minimal" },
+          body: JSON.stringify({ active_night_id: null })
+        }).catch(() => undefined);
 
-      // Children before parents: the host-mode tables reference nights, people,
-      // bottles and types, and bottles and tabs refuse deletes while referenced.
-      if (crewBalanceAvailable) await deleteAll("rnmb_payments");
-      if (hostModeAvailable) {
-        await deleteAll("rnmb_ring_up_lines");
-        await deleteAll("rnmb_ring_ups");
-        await deleteAll("rnmb_guest_tabs");
-        await deleteAll("rnmb_stock_adjustments");
-        await deleteAll("rnmb_recipe_ingredients");
-        await deleteAll("rnmb_menu_items");
+        // Children before parents: the host-mode tables reference nights, people,
+        // bottles and types, and bottles and tabs refuse deletes while referenced.
+        if (crewBalanceAvailable) await deleteAll("rnmb_payments");
+        if (hostModeAvailable) {
+          await deleteAll("rnmb_ring_up_lines");
+          await deleteAll("rnmb_ring_ups");
+          await deleteAll("rnmb_guest_tabs");
+          await deleteAll("rnmb_stock_adjustments");
+          await deleteAll("rnmb_recipe_ingredients");
+          await deleteAll("rnmb_menu_items");
+        }
+        await deleteAll("rnmb_pours");
+        await deleteAll("rnmb_bottles");
+        await deleteAll("rnmb_nights");
+        await deleteAll("rnmb_beverage_types");
+        await deleteAll("rnmb_people");
       }
-      await deleteAll("rnmb_pours");
-      await deleteAll("rnmb_bottles");
-      await deleteAll("rnmb_nights");
-      await deleteAll("rnmb_beverage_types");
-      await deleteAll("rnmb_people");
 
-      await insertRows("rnmb_people", nextState.people.map((person) => ({
+      await write("rnmb_people", nextState.people.map((person) => ({
         id: person.id,
         name: person.name,
         color: person.color
       })));
-      await insertRows("rnmb_beverage_types", nextState.types.map((type) => RNMBDomain.typeRow(type, hostModeAvailable)));
-      await insertRows("rnmb_nights", nextState.nights.map((night) => RNMBDomain.nightRow(night, hostModeAvailable)));
-      await insertRows("rnmb_bottles", nextState.bottles.map((bottle) => RNMBDomain.bottleRow(bottle)));
-      await insertRows("rnmb_pours", nextState.nights.flatMap((night) => (
+      await write("rnmb_beverage_types", nextState.types.map((type) => RNMBDomain.typeRow(type, hostModeAvailable)));
+      await write("rnmb_nights", nextState.nights.map((night) => RNMBDomain.nightRow(night, hostModeAvailable)));
+      await write("rnmb_bottles", nextState.bottles.map((bottle) => RNMBDomain.bottleRow(bottle)));
+      await write("rnmb_pours", nextState.nights.flatMap((night) => (
         (night.pours || []).map((pour) => RNMBDomain.pourRow(
           { ...pour, buyerId: knownId(nextState.people, pour.buyerId) },
           night.id,
@@ -1076,9 +1107,9 @@ function createSupabaseRepository(config) {
         // Every row in one bulk insert must carry the same keys, and person and
         // menu references that no longer exist become null (their names stay).
         const people = nextState.people;
-        await insertRows("rnmb_menu_items", nextState.menuItems.map(menuItemRow));
-        await insertRows("rnmb_recipe_ingredients", nextState.menuItems.flatMap(ingredientRows));
-        await insertRows("rnmb_guest_tabs", nextState.guestTabs.map((tab) => ({
+        await write("rnmb_menu_items", nextState.menuItems.map(menuItemRow));
+        await write("rnmb_recipe_ingredients", nextState.menuItems.flatMap(ingredientRows));
+        await write("rnmb_guest_tabs", nextState.guestTabs.map((tab) => ({
           id: tab.id,
           night_id: tab.nightId,
           guest_name: tab.guestName,
@@ -1092,7 +1123,7 @@ function createSupabaseRepository(config) {
           opened_at: tab.openedAt || nowIso(),
           closed_at: tab.closedAt
         })));
-        await insertRows("rnmb_ring_ups", nextState.ringUps.map((ringUp) => ({
+        await write("rnmb_ring_ups", nextState.ringUps.map((ringUp) => ({
           id: ringUp.id,
           night_id: ringUp.nightId,
           kind: ringUp.kind,
@@ -1105,7 +1136,7 @@ function createSupabaseRepository(config) {
           rung_at: ringUp.rungAt || nowIso(),
           voided_at: ringUp.voidedAt
         })));
-        await insertRows("rnmb_ring_up_lines", nextState.ringUps.flatMap((ringUp) => ringUp.lines.map((line, index) => ({
+        await write("rnmb_ring_up_lines", nextState.ringUps.flatMap((ringUp) => ringUp.lines.map((line, index) => ({
           id: line.id || uid(),
           ring_up_id: ringUp.id,
           line_no: index + 1,
@@ -1118,7 +1149,7 @@ function createSupabaseRepository(config) {
           buyer_name: line.buyerName || null,
           abv_snapshot: line.abv
         }))));
-        await insertRows("rnmb_stock_adjustments", nextState.stockAdjustments.map((adjustment) => ({
+        await write("rnmb_stock_adjustments", nextState.stockAdjustments.map((adjustment) => ({
           id: adjustment.id,
           bottle_id: adjustment.bottleId,
           previous_remaining: adjustment.previousRemaining,
@@ -1127,11 +1158,17 @@ function createSupabaseRepository(config) {
         })));
       }
       if (crewBalanceAvailable) {
-        await insertRows("rnmb_payments", nextState.payments.map((payment) => RNMBDomain.paymentRow({
+        await write("rnmb_payments", nextState.payments.map((payment) => RNMBDomain.paymentRow({
           ...payment,
           fromPersonId: knownId(nextState.people, payment.fromPersonId),
           toPersonId: knownId(nextState.people, payment.toPersonId)
         })));
+      }
+      if (tables) {
+        await rpc("rnmb_replace_all", { tables, settings: RNMBDomain.settingsRow(nextState, true) });
+        // The database moved every version up by one, so this copy is stale now.
+        state = await repositoryApi.load();
+        return;
       }
       await saveSettings(nextState);
     },
@@ -1301,6 +1338,18 @@ function createSupabaseRepository(config) {
       // keeps each surviving ingredient's id, so the upsert below updates it in place.
       const saved = prepareMenuItem(menuItem);
       const rows = ingredientRows(saved);
+      if (safeSavesAvailable) {
+        // One transaction, against the version the edit started from: if another
+        // device saved this item since, the database refuses and nothing changes.
+        const version = await rpc("rnmb_save_menu_item", {
+          id: saved.id,
+          name: saved.name,
+          kind: saved.kind,
+          version: exists ? saved.version : null,
+          ingredients: rows.map(({ menu_item_id: _unused, ...row }) => row)
+        });
+        return mirror("saveMenuItem", { ...saved, version });
+      }
       if (exists) {
         // Write the new recipe over the old one first, then drop only the lines it
         // no longer has, then rename: a failure at any step leaves a whole recipe.
@@ -1327,7 +1376,21 @@ function createSupabaseRepository(config) {
     },
     async updatePricing(pricing) {
       requireHostMode();
-      await saveSettingsColumns({ ...state, ...preparePricing(pricing) }, ["markup_percent", "rounding_increment_cents"]);
+      const prepared = preparePricing(pricing);
+      if (safeSavesAvailable) {
+        // Saved against the version the form was filled from, so a markup another
+        // device set in the meantime is never overwritten unseen.
+        const version = await rpc("rnmb_save_pricing", {
+          markup_percent: prepared.markupPercent,
+          rounding_increment_cents: prepared.roundingIncrementCents,
+          version: pricing.version ?? null
+        });
+        const result = await mirror("updatePricing", pricing);
+        // A mirror that had to reload may already hold a newer version; never go back.
+        if ((state.pricingVersion ?? 0) < version) state.pricingVersion = version;
+        return result;
+      }
+      await saveSettingsColumns({ ...state, ...prepared }, ["markup_percent", "rounding_increment_cents"]);
       return mirror("updatePricing", pricing);
     }
   };
@@ -2679,9 +2742,13 @@ function resetMenuItemForm() {
   document.querySelector("#ingredientRows").innerHTML = "";
   addIngredientRow();
   setMenuItemFormMode(false);
+  delete document.querySelector("#menuItemForm").dataset.version;
 }
 
 function loadMenuItemIntoForm(menuItem) {
+  const form = document.querySelector("#menuItemForm");
+  if (menuItem.version) form.dataset.version = String(menuItem.version);
+  else delete form.dataset.version;
   menuItemFormField("menuItemId").value = menuItem.id;
   menuItemFormField("name").value = menuItem.name;
   menuItemFormField("kind").value = menuItem.kind;
@@ -2718,7 +2785,10 @@ function menuItemDraftFromForm() {
     if (isCounted(type) && !Number.isInteger(amount)) return { error: `${type.name} is counted stock, so use a whole number of units.` };
     ingredients.push({ id: row.dataset.ingredientId || undefined, typeId: type.id, amount });
   }
-  return { menuItem: { id: menuItemFormField("menuItemId").value || undefined, name, kind, ingredients } };
+  // The version the form was filled from (safe saves), so a save can be refused if
+  // another device changed the item since.
+  const version = Number(document.querySelector("#menuItemForm").dataset.version) || null;
+  return { menuItem: { id: menuItemFormField("menuItemId").value || undefined, name, kind, ingredients, version } };
 }
 
 function renderMenu() {
@@ -2737,6 +2807,8 @@ function renderMenu() {
   if (pricing.dataset.dirty !== "true") {
     pricing.querySelector("[name='markupPercent']").value = String(state.markupPercent);
     pricing.querySelector("[name='roundingIncrement']").value = (state.roundingIncrementCents / 100).toFixed(2);
+    // The version these values came from; a save is checked against it (safe saves).
+    pricing.dataset.version = state.pricingVersion ? String(state.pricingVersion) : "";
   }
   ["#menuItemForm", "#pricingForm"].forEach((selector) => {
     Array.from(document.querySelector(selector).elements).forEach((control) => {
@@ -4034,7 +4106,18 @@ document.querySelector("#menuItemForm").addEventListener("submit", async (event)
   }
   const editing = Boolean(draft.menuItem.id);
   const saved = await hostAction(editing ? "Menu item updated." : "Menu item added.", (db) => db.saveMenuItem(draft.menuItem));
-  if (saved) resetMenuItemForm();
+  if (saved) {
+    resetMenuItemForm();
+    return;
+  }
+  // A refused save has already reloaded the shared data. If another device
+  // changed or removed this item, show what is there now: keeping the old copy
+  // in the form would only be refused again.
+  if (editing && draft.menuItem.version) {
+    const latest = state.menuItems.find((entry) => entry.id === draft.menuItem.id);
+    if (!latest) resetMenuItemForm();
+    else if (latest.version !== draft.menuItem.version) loadMenuItemIntoForm(latest);
+  }
 });
 
 document.querySelector("#pricingForm").addEventListener("input", (event) => {
@@ -4063,8 +4146,11 @@ document.querySelector("#pricingForm").addEventListener("submit", async (event) 
     showToast("Round up to a whole number of cents, $0.01 or more (for example 0.25).");
     return;
   }
-  const saved = await hostAction("Pricing saved.", (db) => db.updatePricing({ markupPercent, roundingIncrementCents }));
-  if (saved) {
+  const version = Number(form.dataset.version) || null;
+  const saved = await hostAction("Pricing saved.", (db) => db.updatePricing({ markupPercent, roundingIncrementCents, version }));
+  // Saved, or refused because another device changed the pricing (the refusal
+  // reloaded it): either way, show the pricing that is stored now.
+  if (saved || (version && state.pricingVersion !== version)) {
     delete form.dataset.dirty;
     renderMenu();
   }
@@ -4528,6 +4614,7 @@ window.__rnmb = Object.freeze({
   get syncMode() { return syncMode; },
   get hostModeAvailable() { return hostModeAvailable; },
   get crewBalanceAvailable() { return crewBalanceAvailable; },
+  get safeSavesAvailable() { return safeSavesAvailable; },
   crewBalances: () => RNMBDomain.crewBalances(state),
   preparePour,
   get registerDraft() { return registerDraft; },

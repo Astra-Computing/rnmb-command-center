@@ -37,8 +37,12 @@ async function openPage(browser, options = {}) {
   const problems = [];
   const allowConsole = options.allowConsole || (() => false);
 
+  // A database without supabase/safe-saves.sql answers the version probe with a
+  // 400, and hostModeStub stands in for one by default. That is the detection
+  // working, not a problem; nothing else is excused.
+  const safeSavesProbe = (message) => resourceStatusError(message, 400, (url) => /[?&]select=(pricing_)?version&/.test(url));
   page.on("console", (message) => {
-    if (message.type() === "error" && !allowConsole(message)) {
+    if (message.type() === "error" && !allowConsole(message) && !safeSavesProbe(message)) {
       problems.push(`console error: ${message.text()} (${message.location().url || "no url"})`);
     }
   });
@@ -521,10 +525,16 @@ async function exitRegisterTo(page, tab) {
  * merge-duplicates upserts, return=representation), and every request is kept
  * in `log` in order. Set `stub.fail = (entry) => status | null` to fail a request.
  */
-function hostModeStub(seed = {}, { crewBalance = true, pourCostColumns = crewBalance } = {}) {
+function hostModeStub(seed = {}, { crewBalance = true, pourCostColumns = crewBalance, safeSaves = false } = {}) {
   // crewBalance: false = supabase/crew-balance.sql not run (rnmb_payments answers 404).
   // pourCostColumns: false = rnmb_pours has no cost_cents/buyer_id/buyer_name (a select naming them answers 400).
+  // safeSaves: false (the default) = supabase/safe-saves.sql not run, so a select naming
+  //   rnmb_menu_items.version or rnmb_settings.pricing_version answers 400 and the
+  //   dashboard keeps its older save paths. Every scenario written before that file
+  //   relies on this default.
   // stub.rpc[name] = (payload) => result answers POST rpc/<name>; any other function is unexpected.
+  //   A handler that throws { status, message } answers that status with that message,
+  //   the way a function's "RNMB: ..." refusal arrives from PostgREST.
   const TABLES = [
     "rnmb_people", "rnmb_beverage_types", "rnmb_bottles", "rnmb_nights", "rnmb_pours", "rnmb_settings",
     "rnmb_menu_items", "rnmb_recipe_ingredients", "rnmb_guest_tabs", "rnmb_ring_ups", "rnmb_ring_up_lines", "rnmb_stock_adjustments",
@@ -575,7 +585,17 @@ function hostModeStub(seed = {}, { crewBalance = true, pourCostColumns = crewBal
         return json(200, id);
       }
       const rpcName = path.startsWith("rpc/") ? path.slice(4) : null;
-      if (rpcName && stub.rpc[rpcName]) return json(200, stub.rpc[rpcName](entry.body.payload));
+      if (rpcName && stub.rpc[rpcName]) {
+        try {
+          return json(200, stub.rpc[rpcName](entry.body.payload));
+        } catch (refused) {
+          return json(refused.status || 400, { code: "P0001", message: refused.message });
+        }
+      }
+      if (!safeSaves && method === "GET" && ["rnmb_menu_items", "rnmb_settings"].includes(path) &&
+        /(^|,)(version|pricing_version)(,|$)/.test(url.searchParams.get("select") || "")) {
+        return json(400, { code: "42703", message: `column ${path}.version does not exist` });
+      }
       if (!crewBalance && path === "rnmb_payments") {
         return json(404, { code: "PGRST205", message: "Could not find the table 'public.rnmb_payments' in the schema cache" });
       }
@@ -4669,6 +4689,197 @@ async function main() {
   console.log(`\n${scenarios.length - failures} passed, ${failures} failed`);
   process.exitCode = failures ? 1 : 0;
 }
+
+// ---------- safe saves (supabase/safe-saves.sql) ----------------------------------
+
+/**
+ * A hostModeStub whose database has run safe-saves.sql: version columns, and the
+ * three functions answered by the same rules as the SQL (checked for real against
+ * Postgres by supabase/checks/safe-saves-checks.sql; this only stands in for them).
+ */
+function safeSavesStub() {
+  const { ids, seed } = hostModeSeed();
+  seed.rnmb_menu_items = seed.rnmb_menu_items.map((item) => ({ ...item, version: 1 }));
+  seed.rnmb_settings = seed.rnmb_settings.map((row) => ({ ...row, pricing_version: 1 }));
+  const stub = hostModeStub(seed, { safeSaves: true });
+  const refuse = (message) => { throw { status: 400, message }; };
+  stub.rpc.rnmb_save_menu_item = (payload) => {
+    const items = stub.store.rnmb_menu_items;
+    let item = items.find((entry) => entry.id === payload.id);
+    if (payload.version === null) {
+      if (item) refuse("RNMB: that menu item was already saved, so it was not added twice. The latest menu is loaded.");
+      item = { id: payload.id, name: payload.name, kind: payload.kind, version: 1 };
+      items.push(item);
+    } else {
+      if (!item) refuse("RNMB: someone removed this menu item while you were editing it, so nothing was saved. The latest menu is loaded.");
+      if (item.version !== payload.version) {
+        refuse("RNMB: someone else changed this menu item while you were editing it, so nothing was saved. The latest version is loaded; make your change again.");
+      }
+      Object.assign(item, { name: payload.name, kind: payload.kind, version: item.version + 1 });
+    }
+    stub.store.rnmb_recipe_ingredients = stub.store.rnmb_recipe_ingredients
+      .filter((row) => row.menu_item_id !== payload.id)
+      .concat(payload.ingredients.map((row) => ({ ...row, menu_item_id: payload.id })));
+    return item.version;
+  };
+  stub.rpc.rnmb_save_pricing = (payload) => {
+    const settings = stub.store.rnmb_settings[0];
+    if (payload.version !== settings.pricing_version) {
+      refuse("RNMB: someone else changed the pricing while you were editing it, so nothing was saved. The latest pricing is loaded; make your change again.");
+    }
+    Object.assign(settings, {
+      markup_percent: payload.markup_percent,
+      rounding_increment_cents: payload.rounding_increment_cents,
+      pricing_version: settings.pricing_version + 1
+    });
+    return settings.pricing_version;
+  };
+  stub.rpc.rnmb_replace_all = (payload) => {
+    const oldMenu = new Map(stub.store.rnmb_menu_items.map((item) => [item.id, item.version]));
+    const oldPricing = (stub.store.rnmb_settings[0] && stub.store.rnmb_settings[0].pricing_version) || 0;
+    Object.keys(stub.store).filter((table) => table !== "rnmb_settings").forEach((table) => {
+      stub.store[table] = (payload.tables[table] || []).map((row) => ({ ...row }));
+    });
+    stub.store.rnmb_menu_items.forEach((item) => { item.version = (oldMenu.get(item.id) || 0) + 1; });
+    stub.store.rnmb_settings = [{ ...payload.settings, id: true, pricing_version: oldPricing + 1 }];
+    return null;
+  };
+  return { ids, stub };
+}
+
+const tableWrites = (stub, start = 0) => stub.log.slice(start).filter((entry) => !entry.path.startsWith("rpc/"));
+const waitForToastContaining = (page, text) => page.waitForFunction(
+  (expected) => window.__toasts.some((toast) => toast.includes(expected)), text, { timeout: 10000 }
+);
+
+scenarios.push(
+  {
+    name: "Safe saves: a menu edit is one call naming the version it began from; a stale edit is refused, changes nothing, and the form shows the newer item",
+    async run({ browser }) {
+      const { ids, stub } = safeSavesStub();
+      // The refusal arrives as a 400, which Chrome logs.
+      const session = await openPage(browser, {
+        routes: stub.routes,
+        allowConsole: (message) => resourceStatusError(message, 400, (url) => url.includes("rpc/rnmb_save_menu_item"))
+      });
+      const { page } = session;
+      try {
+        await session.waitForToast("Connected to Supabase.");
+        assert.equal(await page.evaluate(() => window.__rnmb.safeSavesAvailable), true, "the version columns are detected");
+        await page.click('.tab-button[data-tab="menu"]');
+        await menuCard(page, "Rum Punch").locator("[data-edit-menu-item]").click();
+        assert.equal(await page.getAttribute("#menuItemForm", "data-version"), "1");
+
+        // Another device renames the punch after this form was filled.
+        Object.assign(stub.store.rnmb_menu_items[0], { name: "Sam's Punch", version: 2 });
+        const before = stub.log.length;
+        await page.fill("#menuItemForm [name='name']", "Rum Punch Deluxe");
+        await page.click("#menuItemSubmit");
+        await waitForToastContaining(page, "someone else changed this menu item");
+        assert.equal(stub.store.rnmb_menu_items[0].name, "Sam's Punch", "the newer name survives");
+        assert.equal(stub.store.rnmb_menu_items[0].version, 2);
+        assert.deepEqual(tableWrites(stub, before), [], "nothing was written outside the one function call");
+        assert.equal(await page.inputValue("#menuItemForm [name='name']"), "Sam's Punch", "the form now shows the newer item");
+        assert.equal(await page.getAttribute("#menuItemForm", "data-version"), "2");
+
+        // Saving again from the newer copy goes through, as one call.
+        const second = stub.log.length;
+        await page.fill("#menuItemForm [name='name']", "Sam's Punch Deluxe");
+        await clickForToast(session, "#menuItemSubmit", "Menu item updated.");
+        const calls = stub.log.slice(second).filter((entry) => entry.path === "rpc/rnmb_save_menu_item");
+        assert.equal(calls.length, 1);
+        assert.equal(calls[0].body.payload.version, 2);
+        assert.deepEqual(tableWrites(stub, second), []);
+        assert.equal(stub.store.rnmb_menu_items[0].name, "Sam's Punch Deluxe");
+        assert.equal(stub.store.rnmb_menu_items[0].version, 3);
+        const local = await page.evaluate((id) => window.__rnmb.state.menuItems.find((item) => item.id === id), ids.punch);
+        assert.equal(local.version, 3, "this browser holds the version the database returned");
+        assert.equal(await page.getAttribute("#menuItemForm", "data-version"), null, "the form was reset");
+        assert.deepEqual(stub.unexpected, []);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Safe saves: a pricing save names its version; a stale one is refused, changes nothing, and the form shows the stored pricing",
+    async run({ browser }) {
+      const { stub } = safeSavesStub();
+      const session = await openPage(browser, {
+        routes: stub.routes,
+        allowConsole: (message) => resourceStatusError(message, 400, (url) => url.includes("rpc/rnmb_save_pricing"))
+      });
+      const { page } = session;
+      try {
+        await session.waitForToast("Connected to Supabase.");
+        await page.click('.tab-button[data-tab="menu"]');
+        assert.equal(await page.getAttribute("#pricingForm", "data-version"), "1");
+
+        // Another device raises the markup to 30% after this form was filled.
+        Object.assign(stub.store.rnmb_settings[0], { markup_percent: 30, pricing_version: 2 });
+        const before = stub.log.length;
+        await page.fill("#pricingForm [name='markupPercent']", "25");
+        await page.click("#pricingForm button[type='submit']");
+        await waitForToastContaining(page, "someone else changed the pricing");
+        assert.equal(stub.store.rnmb_settings[0].markup_percent, 30, "the newer markup survives");
+        assert.deepEqual(tableWrites(stub, before), [], "no settings PATCH was sent");
+        assert.equal(await page.inputValue("#pricingForm [name='markupPercent']"), "30", "the form shows the stored markup");
+        assert.equal(await page.getAttribute("#pricingForm", "data-version"), "2");
+
+        await page.fill("#pricingForm [name='markupPercent']", "25");
+        await clickForToast(session, "#pricingForm button[type='submit']", "Pricing saved.");
+        assert.equal(stub.store.rnmb_settings[0].markup_percent, 25);
+        assert.equal(stub.store.rnmb_settings[0].pricing_version, 3);
+        assert.equal(await page.getAttribute("#pricingForm", "data-version"), "3");
+        assert.deepEqual(stub.unexpected, []);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Safe saves: Clear replaces the shared database in one call and sends no DELETE; a failed call leaves every table as it was",
+    async run({ browser }) {
+      const { stub } = safeSavesStub();
+      const session = await openPage(browser, { routes: stub.routes, allowConsole: simulatedFailure });
+      const { page } = session;
+      const snapshot = () => JSON.stringify(stub.store);
+      try {
+        await session.waitForToast("Connected to Supabase.");
+        const original = snapshot();
+
+        stub.fail = (entry) => (entry.path === "rpc/rnmb_replace_all" ? 500 : null);
+        const before = stub.log.length;
+        await page.evaluate(() => document.querySelector("#clearData").click());
+        await session.waitForToast("Save failed. Check Supabase settings and policies.");
+        assert.equal(snapshot(), original, "a failed replace changed nothing");
+        assert.deepEqual(tableWrites(stub, before), [], "no table was emptied before the call");
+        assert.equal(await page.evaluate(() => window.__rnmb.state.menuItems.length), 1, "this browser reloaded the intact data");
+
+        stub.fail = null;
+        const second = stub.log.length;
+        await page.evaluate(() => document.querySelector("#clearData").click());
+        await session.waitForToast("Dashboard cleared.");
+        const calls = stub.log.slice(second).filter((entry) => entry.path === "rpc/rnmb_replace_all");
+        assert.equal(calls.length, 1, "one call replaces everything");
+        assert.deepEqual(tableWrites(stub, second), [], "no DELETE or insert went to a table directly");
+        assert.equal(calls[0].body.payload.settings.id, true);
+        assert.deepEqual(stub.store.rnmb_menu_items, []);
+        assert.deepEqual(stub.store.rnmb_people, []);
+        assert.equal(stub.store.rnmb_settings[0].pricing_version, 2, "the pricing version moved up, never back to 1");
+        assert.equal(await page.evaluate(() => window.__rnmb.state.pricingVersion), 2, "this browser reloaded the new versions");
+        assert.deepEqual(stub.unexpected, []);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  }
+);
 
 module.exports = { scenarios, openPage, resourceStatusError, startLocalHostNightWithTab };
 
