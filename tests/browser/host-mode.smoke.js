@@ -4949,6 +4949,13 @@ scenarios.push(
         assert.deepEqual(chart.pressed, ["days30"], "a refresh keeps the chosen window");
         assert.ok(chart.titles.includes("Alex: 2.0"), `the refresh redrew the lines (got ${chart.titles})`);
 
+        // Review #1: in a long window, yesterday and tonight sit a few units apart; their date labels must not overlap.
+        await page.click("#consumptionWindows button[data-window='year']");
+        const labelXs = await page.evaluate(() => Array.from(document.querySelectorAll("#consumptionChart svg text.chart-label[text-anchor='middle']"))
+          .map((label) => Number(label.getAttribute("x"))));
+        labelXs.slice(1).forEach((x, index) => assert.ok(x - labelXs[index] >= 56, `date labels overlap: ${labelXs.join(", ")}`));
+        await page.click("#consumptionWindows button[data-window='days30']");
+
         await page.reload({ waitUntil: "domcontentloaded" });
         await page.waitForFunction(() => window.__toasts && window.__toasts.includes("Connected to Supabase."), null, { timeout: 15000 });
         chart = await chartState(page);

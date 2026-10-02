@@ -1979,11 +1979,18 @@ function consumptionSvg(series) {
     <line class="chart-grid" x1="${left}" x2="${width - right}" y1="${yOf(value)}" y2="${yOf(value)}"></line>
     <text class="chart-label" x="${left - 6}" y="${yOf(value) + 4}" text-anchor="end">${oneDecimal(value)}</text>`).join("");
 
-  // Label the nights that moved a line, thinned so that labels never overlap.
+  // Label the nights that moved a line, skipping any label that would print on
+  // top of the last one kept: in a long window, nights a few days apart sit a
+  // few units apart, and a label is about 40 units wide.
+  const labelGap = 56;
   const dates = [...new Set(series.parties.flatMap((party) => party.steps.map((step) => step.date)))].sort();
-  const every = Math.ceil(dates.length / 6);
+  let lastLabelX = -Infinity;
   const labels = dates
-    .filter((_, index) => index % every === 0)
+    .filter((date) => {
+      if (xOf(date) - lastLabelX < labelGap) return false;
+      lastLabelX = xOf(date);
+      return true;
+    })
     .map((date) => `<text class="chart-label" x="${xOf(date)}" y="${height - 8}" text-anchor="middle">${escapeHtml(shortDate(date))}</text>`)
     .join("");
 
