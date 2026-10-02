@@ -29,7 +29,7 @@ SUPABASE_ANON_KEY=your-anon-public-key
 
 The anon (publishable) key is expected to be public. Every table is gated by row-level security that checks a shared passphrase: set it in [supabase/rls-passphrase.sql](supabase/rls-passphrase.sql) before anyone uses the dashboard. Each browser asks for it once. Add Supabase Auth before sharing the URL broadly.
 
-For a project created before host mode existed, also run [supabase/host-mode.sql](supabase/host-mode.sql) (see Host Mode below), then [supabase/crew-balance.sql](supabase/crew-balance.sql) (see Crew Balances below). Both are safe to run more than once, and they must be run in that order.
+For a project created before host mode existed, also run [supabase/host-mode.sql](supabase/host-mode.sql) (see Host Mode below), then [supabase/crew-balance.sql](supabase/crew-balance.sql) (see Crew Balances below), then [supabase/safe-saves.sql](supabase/safe-saves.sql) (see Safe Saves below). All three are safe to run more than once, and they must be run in that order.
 
 ## Run Locally
 
@@ -86,6 +86,20 @@ An ended *host* night behaves differently: it only ends once every guest tab is 
 **The client goes first on purpose.** The new client sends no crew-balance column and no write-off author until it sees that the migration has run, so it behaves exactly like the old one against a database that has not had it yet. The other order is the one that breaks: the migrated `rnmb_close_tab` refuses a write-off that names nobody, an un-upgraded phone never sends an author, and a host night cannot end while a tab is still open — so one stale device could be stuck mid-service. Running the client first means that pairing never happens.
 
 Until the SQL has been run the app still works: the Ledger names the file to run and shows no balances rather than wrong ones, payments and ending a crew night are refused, pours save without their cost stamp, and a guest tab is written off plainly — no author is asked for and nothing claims a charge, because there is nowhere to record one. Pours logged before the migration carry no cost, so they charge nobody.
+
+## Safe Saves
+
+[supabase/safe-saves.sql](supabase/safe-saves.sql) protects the shared database in two ways:
+
+- **Import, Reload Demo Data and Clear Dashboard replace everything in one transaction.** A failure part-way changes nothing.
+- **A menu item or the pricing is saved against the version it was opened at.** If another device saved it in between, the save is refused and the form shows the newer data, so nobody overwrites a change they never saw. A menu item and its recipe are saved together.
+
+Roll it out in the same order as crew balances:
+
+1. Deploy the client first. Until the SQL has run, it keeps the older save paths.
+2. Run [supabase/safe-saves.sql](supabase/safe-saves.sql) in the Supabase SQL editor. It needs `crew-balance.sql` first, and it is safe to run more than once.
+3. Run [supabase/checks/safe-saves-checks.sql](supabase/checks/safe-saves-checks.sql). It returns one row with the number of checks passed (6), and it rolls everything back.
+4. Reload every crew device.
 
 ## Host Mode
 
@@ -156,10 +170,12 @@ Every quotebook used by the tests is made up (`tests/fixtures/parser/`). Never t
 
 ## Deploy on Vercel
 
-Import the repository into Vercel, add the Supabase env vars, and deploy. You can also deploy from the CLI:
+The Vercel project is connected to this repository. **A push to `main` deploys production**, and a push to any other branch makes a preview deployment. No build command is required.
+
+Vercel blocks a deployment whose commit author it cannot match to a member of the Vercel team. Commit as the team member's GitHub identity, with a real email address (a GitHub `noreply` address is refused).
+
+You can still deploy from the CLI, for example from a branch:
 
 ```bash
-vercel
+vercel deploy --prod
 ```
-
-No build command is required.
