@@ -1816,3 +1816,148 @@ test("parseVolumeOunces reads a bare number in the unit picked beside the box", 
   assert.equal(D.parseVolumeOunces("-2", "ml"), null);
   assert.equal(D.parseVolumeOunces("5 gallons", "ml"), null);
 });
+
+// ---------- consumption chart: windows and series (6.9.14 to 6.9.18, 0.4.4 to 0.4.8) ----------
+
+// Tequila at 40%: 1.5 oz is exactly one US standard drink.
+const chartPour = (id, personId, ounces, at) => ({
+  id, personId, bottleId: "b-chart", ounces, abv: 40, timestamp: at, costCents: null, buyerId: null, buyerName: ""
+});
+const chartCrew = (id, nightId, personId, personName, ounces, extra = {}) => Object.assign({
+  id, nightId, kind: "crew", personId, personName, menuItemId: "m1", menuItemName: "Shot", rungAt: `${nightId}-at`, voidedAt: null,
+  lines: [{ typeId: "t-tequila", amount: ounces, abv: 40, costCents: null, buyerId: null, buyerName: "" }]
+}, extra);
+
+// Today is 2026-10-01 in every test below unless a test says otherwise.
+const CHART_TODAY = "2026-10-01";
+
+function chartState() {
+  return {
+    people: [...people, { id: "p-casey", name: "Casey" }],
+    types,
+    bottles: [{ id: "b-chart", typeId: "t-tequila", size: 100, remaining: 50, price: 30, buyerId: "p-sam" }],
+    nights: [
+      { id: "n-old", name: "Old", date: "2026-08-01", kind: "crew", pours: [chartPour("q0", "p-alex", 15, "2026-08-01T21:00:00")] },
+      { id: "n0", name: "N0", date: "2026-09-02", kind: "crew", pours: [chartPour("q1", "p-jordan", 3, "2026-09-02T21:00:00")] },
+      { id: "n1", name: "N1", date: "2026-09-24", kind: "crew", pours: [chartPour("q2", "p-sam", 1.5, "2026-09-24T21:00:00")] },
+      {
+        id: "n2", name: "Friday", date: "2026-09-26", kind: "crew",
+        pours: [chartPour("q3", "p-sam", 3, "2026-09-26T20:00:00"), chartPour("q4", "p-alex", 1.5, "2026-09-27T01:10:00")]
+      },
+      { id: "n3", name: "Quiet", date: "2026-09-29", kind: "crew", pours: [] },
+      { id: "n4", name: "Host", date: "2026-09-30", kind: "host", pours: [chartPour("q5", "p-sam", 4.5, "2026-09-30T21:00:00"), chartPour("q6", "p-jordan", 1.5, "2026-09-30T22:00:00")] },
+      { id: "n-future", name: "Later", date: "2026-10-03", kind: "crew", pours: [chartPour("q7", "p-sam", 15, "2026-10-03T21:00:00")] }
+    ],
+    ringUps: [
+      // Riley has left the roster; the ring-up keeps the name.
+      chartCrew("r-riley", "n4", "p-riley", "Riley", 3),
+      chartCrew("r-void", "n4", "p-alex", "Alex", 30, { voidedAt: "2026-09-30T23:00:00Z" }),
+      { id: "r-guest", nightId: "n4", kind: "guest", tabId: "tab1", personId: null, personName: "", menuItemName: "Guest", rungAt: "x", voidedAt: null,
+        lines: [{ typeId: "t-tequila", amount: 30, abv: 40, costCents: null, buyerId: null, buyerName: "" }] }
+    ],
+    guestTabs: [],
+    payments: []
+  };
+}
+
+const totalsOf = (series) => series.parties.map((party) => [party.name, Math.round(party.total * 100) / 100]);
+
+test("consumptionSeries: One week counts nights dated today and the 6 days before (AE3), ranked highest first", () => {
+  const series = D.consumptionSeries(chartState(), "week", CHART_TODAY);
+  assert.deepEqual([series.window.start, series.window.end], ["2026-09-25", "2026-10-01"]);
+  assert.deepEqual(totalsOf(series), [["Sam", 5], ["Riley", 2], ["Alex", 1], ["Jordan", 1]]);
+  assert.deepEqual(series.parties.map((party) => party.rank), [1, 2, 3, 4]);
+});
+
+test("consumptionSeries: each window starts where the plan says (AE3, KTD3)", () => {
+  const state = chartState();
+  const start = (id) => D.consumptionSeries(state, id, CHART_TODAY).window.start;
+  assert.equal(start("days30"), "2026-09-02");
+  assert.equal(start("year"), "2026-01-01");
+  assert.equal(start("all"), "2026-08-01");
+  // The five most recent nights up to today include the quiet night with no drinks, so the 1 August night is not one of them.
+  assert.equal(start("nights5"), "2026-09-02");
+  assert.deepEqual(totalsOf(D.consumptionSeries(state, "nights5", CHART_TODAY)), [["Sam", 6], ["Jordan", 3], ["Riley", 2], ["Alex", 1]]);
+  assert.deepEqual(totalsOf(D.consumptionSeries(state, "year", CHART_TODAY)), [["Alex", 11], ["Sam", 6], ["Jordan", 3], ["Riley", 2]]);
+});
+
+test("consumptionSeries: a drink counts on its night's date, not the clock time it was logged (AE2, 0.4.6)", () => {
+  const alex = D.consumptionSeries(chartState(), "week", CHART_TODAY).parties.find((party) => party.name === "Alex");
+  assert.deepEqual(alex.steps, [{ date: "2026-09-26", add: 1, total: 1 }]);
+});
+
+test("consumptionSeries: steps climb on the nights a party drank, oldest first (AE1)", () => {
+  const sam = D.consumptionSeries(chartState(), "week", CHART_TODAY).parties.find((party) => party.name === "Sam");
+  assert.deepEqual(sam.steps.map((step) => [step.date, step.total]), [["2026-09-26", 2], ["2026-09-30", 5]]);
+  assert.equal(sam.total, 5);
+});
+
+test("consumptionSeries: a night dated after today is in no window", () => {
+  const state = chartState();
+  for (const id of D.CONSUMPTION_WINDOWS) {
+    const sam = D.consumptionSeries(state, id, CHART_TODAY).parties.find((party) => party.name === "Sam");
+    assert.ok(sam.steps.every((step) => step.date <= CHART_TODAY), `${id} kept a future night`);
+  }
+});
+
+test("consumptionSeries: crew ring-ups count on any night kind; guest and voided ring-ups count nothing (AE4, AE7, 0.4.4, 0.4.5)", () => {
+  const series = D.consumptionSeries(chartState(), "week", CHART_TODAY);
+  assert.equal(series.parties.find((party) => party.name === "Riley").total, 2, "a crew ring-up on a host night counts");
+  assert.equal(series.parties.find((party) => party.name === "Alex").total, 1, "the voided 30 oz ring-up adds nothing");
+  assert.equal(series.parties.length, 4, "no guest party appears");
+});
+
+test("consumptionSeries: someone who left the roster appears under their name (AE8, 0.4.7)", () => {
+  const riley = D.consumptionSeries(chartState(), "week", CHART_TODAY).parties.find((party) => party.name === "Riley");
+  assert.equal(riley.onRoster, false);
+  const sam = D.consumptionSeries(chartState(), "week", CHART_TODAY).parties.find((party) => party.name === "Sam");
+  assert.equal(sam.onRoster, true);
+  assert.equal(sam.personId, "p-sam");
+});
+
+test("consumptionSeries: the highest total leads, and a tie makes every tied party a leader (AE5, KTD8)", () => {
+  const solo = D.consumptionSeries(chartState(), "week", CHART_TODAY);
+  assert.deepEqual(solo.parties.filter((party) => party.leader).map((party) => party.name), ["Sam"]);
+
+  const state = chartState();
+  state.nights = [{ id: "t1", name: "Tie", date: "2026-09-30", kind: "crew",
+    pours: [chartPour("t-a", "p-alex", 4.5, "x"), chartPour("t-c", "p-casey", 4.5, "y"), chartPour("t-s", "p-sam", 1.5, "z")] }];
+  state.ringUps = [];
+  const tie = D.consumptionSeries(state, "week", CHART_TODAY);
+  assert.deepEqual(tie.parties.map((party) => [party.name, party.leader]), [["Alex", true], ["Casey", true], ["Sam", false]]);
+});
+
+test("consumptionSeries: a party with no drinks in the window is left out, and an empty window has no parties (6.9.19, KTD8)", () => {
+  const series = D.consumptionSeries(chartState(), "week", CHART_TODAY);
+  assert.equal(series.parties.some((party) => party.name === "Casey"), false);
+  const empty = D.consumptionSeries(chartState(), "week", "2027-06-01");
+  assert.deepEqual(empty.parties, []);
+  assert.deepEqual([empty.window.start, empty.window.end], ["2027-05-26", "2027-06-01"]);
+});
+
+test("consumptionSeries: a window may start and end on the same day", () => {
+  const state = chartState();
+  state.nights = [{ id: "t1", name: "Tonight", date: CHART_TODAY, kind: "crew", pours: [chartPour("t-a", "p-alex", 1.5, "x")] }];
+  state.ringUps = [];
+  const series = D.consumptionSeries(state, "all", CHART_TODAY);
+  assert.deepEqual([series.window.start, series.window.end], [CHART_TODAY, CHART_TODAY]);
+  assert.equal(series.parties[0].total, 1);
+});
+
+test("consumptionSeries: each night's step equals that party's standard drinks in the night recap (0.4.8)", () => {
+  const state = chartState();
+  const series = D.consumptionSeries(state, "all", CHART_TODAY);
+  for (const night of state.nights.filter((entry) => entry.date <= CHART_TODAY)) {
+    for (const entry of D.nightRecap(state, night.id)) {
+      if (!(entry.standardDrinks > 0)) continue;
+      const party = series.parties.find((candidate) => candidate.name === entry.name);
+      const step = party.steps.find((candidate) => candidate.date === night.date);
+      assert.ok(step, `${entry.name} has no step on ${night.date}`);
+      assert.equal(D.round6(step.add), D.round6(entry.standardDrinks), `${entry.name} on ${night.date}`);
+    }
+  }
+});
+
+test("consumptionSeries: an unknown window is refused", () => {
+  assert.throws(() => D.consumptionSeries(chartState(), "fortnight", CHART_TODAY), /window/i);
+});

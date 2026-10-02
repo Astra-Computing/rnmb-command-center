@@ -1340,6 +1340,104 @@ var RNMBDomain = (function () {
     return drinks;
   }
 
+  // ---------- consumption chart (6.9.12 to 6.9.18, 0.4.4 to 0.4.8) -----------------
+
+  // The windows the Overview chart offers, in the order its buttons show them.
+  var CONSUMPTION_WINDOWS = ["nights5", "week", "days30", "year", "all"];
+
+  /** A YYYY-MM-DD date moved by whole days, worked in UTC so no local offset can shift it. */
+  function addDays(isoDate, days) {
+    var parts = String(isoDate).split("-").map(Number);
+    return new Date(Date.UTC(parts[0], parts[1] - 1, parts[2] + days)).toISOString().slice(0, 10);
+  }
+
+  /**
+   * The dates a window covers and the nights inside it (KTD3). Every window ends
+   * on `today`, the browser's local date, and a night dated after today is in no
+   * window. Last 5 nights takes the five most recent nights up to today, a night
+   * nobody drank on included, and starts at the oldest of them.
+   */
+  function consumptionWindow(state, windowId, today) {
+    var past = listOf((state || {}).nights).filter(function (night) {
+      return night && typeof night.date === "string" && night.date <= today;
+    });
+    var newestFirst = past.slice().sort(function (a, b) {
+      return a.date < b.date ? 1 : a.date > b.date ? -1 : 0;
+    });
+    var start;
+    if (windowId === "week") start = addDays(today, -6);
+    else if (windowId === "days30") start = addDays(today, -29);
+    else if (windowId === "year") start = today.slice(0, 4) + "-01-01";
+    else if (windowId === "all") start = newestFirst.length ? newestFirst[newestFirst.length - 1].date : today;
+    else if (windowId === "nights5") start = newestFirst.length ? newestFirst.slice(0, 5)[Math.min(5, newestFirst.length) - 1].date : today;
+    else throw new RangeError("Unknown chart window: " + windowId);
+
+    var nights = windowId === "nights5" ? newestFirst.slice(0, 5) : past.filter(function (night) { return night.date >= start; });
+    nights.sort(function (a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : 0; });
+    return { id: windowId, start: start, end: today, nights: nights };
+  }
+
+  /**
+   * Each party's standard drinks across a window, for the Overview chart. Counts
+   * come only from nightRecap, night by night (KTD1), so a night's step always
+   * equals what the End of Night recap shows. A party is a crew member, or the
+   * name a departed one left on their drinks. Parties with nothing in the window
+   * are left out; the rest are ranked by total, then name, and every party on
+   * the highest total is a leader (KTD8).
+   *
+   * Returns { window: { id, start, end }, parties: [{ key, personId, name,
+   * onRoster, total, rank, leader, steps: [{ date, add, total }] }] }.
+   */
+  function consumptionSeries(state, windowId, today) {
+    var source = state || {};
+    var range = consumptionWindow(source, windowId, today);
+    var roster = new Map();
+    listOf(source.people).forEach(function (person) {
+      if (person && person.id) roster.set(person.id, person.name || "");
+    });
+
+    var parties = new Map();
+    range.nights.forEach(function (night) {
+      nightRecap(source, night.id).forEach(function (entry) {
+        var key = partyKey(entry.personId, entry.name);
+        if (key === null || !(entry.standardDrinks > 0)) return;
+        var party = parties.get(key);
+        if (!party) {
+          var onRoster = entry.personId !== null && roster.has(entry.personId);
+          party = {
+            key: key,
+            personId: entry.personId,
+            name: (onRoster ? roster.get(entry.personId) : entry.name) || entry.name || "Unknown",
+            onRoster: onRoster,
+            total: 0,
+            steps: []
+          };
+          parties.set(key, party);
+        }
+        // Two nights on one date make one step, so the line never doubles back.
+        var last = party.steps[party.steps.length - 1];
+        party.total = round6(party.total + entry.standardDrinks);
+        if (last && last.date === night.date) {
+          last.add = round6(last.add + entry.standardDrinks);
+          last.total = party.total;
+        } else {
+          party.steps.push({ date: night.date, add: round6(entry.standardDrinks), total: party.total });
+        }
+      });
+    });
+
+    var list = Array.from(parties.values()).sort(function (a, b) {
+      if (a.total !== b.total) return b.total - a.total;
+      return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+    });
+    var top = list.length ? list[0].total : 0;
+    list.forEach(function (party, index) {
+      party.rank = index + 1;
+      party.leader = top > 0 && party.total === top;
+    });
+    return { window: { id: range.id, start: range.start, end: range.end }, parties: list };
+  }
+
   function recentLogItems(state, personId, limit) {
     var source = state || {};
     var max = limit === undefined ? 8 : limit;
@@ -1718,6 +1816,8 @@ var RNMBDomain = (function () {
     recentLogItems: recentLogItems,
     nightRecap: nightRecap,
     crewDrinksOnNight: crewDrinksOnNight,
+    CONSUMPTION_WINDOWS: CONSUMPTION_WINDOWS,
+    consumptionSeries: consumptionSeries,
     normalizeNight: normalizeNight,
     normalizePour: normalizePour,
     normalizeMenuItem: normalizeMenuItem,
