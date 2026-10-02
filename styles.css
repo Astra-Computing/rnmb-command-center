@@ -385,6 +385,83 @@ small,
   stroke-linecap: round;
 }
 
+/* The leader's line is drawn last, so it sits on top, and thicker (6.9.17, KTD6). */
+.consumption-chart .chart-line.is-leader {
+  stroke-width: 6;
+}
+
+/* Lines on the left, the ranked list beside them; stacked on narrow screens (6.9.22). */
+.consumption-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 280px);
+  gap: 18px;
+  align-items: start;
+}
+
+.consumption-ranking {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.consumption-ranking:empty {
+  display: none;
+}
+
+.ranking-row {
+  display: grid;
+  grid-template-columns: 2ch 14px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 1.05rem;
+}
+
+.ranking-row.is-leader {
+  border-color: var(--person-color, var(--accent));
+  box-shadow: inset 4px 0 0 var(--person-color, var(--accent));
+}
+
+.ranking-place {
+  color: var(--muted);
+  font-weight: 800;
+  text-align: right;
+}
+
+.ranking-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--person-color, var(--muted));
+}
+
+.ranking-name {
+  overflow-wrap: anywhere;
+  font-weight: 700;
+}
+
+.ranking-leader {
+  margin-left: 8px;
+  color: var(--yellow);
+  font-size: 0.8rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.ranking-total {
+  font-size: 1.25rem;
+}
+
+@media (max-width: 980px) {
+  .consumption-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 .panel {
   padding: 18px;
 }

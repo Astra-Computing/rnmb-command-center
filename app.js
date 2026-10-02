@@ -1927,13 +1927,31 @@ function renderConsumptionChart() {
     button.setAttribute("aria-pressed", String(button.dataset.window === consumptionWindowId));
   });
   const target = document.querySelector("#consumptionChart");
+  const ranking = document.querySelector("#consumptionRanking");
   const series = RNMBDomain.consumptionSeries(state, consumptionWindowId, today());
   target.classList.toggle("empty-state", series.parties.length === 0);
   if (!series.parties.length) {
     target.textContent = CONSUMPTION_EMPTY[consumptionWindowId];
+    ranking.innerHTML = "";
     return;
   }
   target.innerHTML = consumptionSvg(series);
+  ranking.innerHTML = consumptionRankingRows(series);
+}
+
+/*
+ * The ranked list beside the lines (6.9.16): highest total first, every leader
+ * marked (6.9.17, 6.9.18). Tied totals share a place, so a tie for the lead
+ * reads 1, 1, 3.
+ */
+function consumptionRankingRows(series) {
+  return series.parties.map((party) => {
+    const place = series.parties.findIndex((other) => other.total === party.total) + 1;
+    return `<li class="ranking-row${party.leader ? " is-leader" : ""}" style="--person-color: ${partyColor(party)}">` +
+      `<span class="ranking-place">${place}</span><span class="ranking-swatch"></span>` +
+      `<span class="ranking-name">${escapeHtml(party.name)}${party.leader ? '<span class="ranking-leader">Leader</span>' : ""}</span>` +
+      `<strong class="ranking-total">${oneDecimal(party.total)}</strong></li>`;
+  }).join("");
 }
 
 /*
@@ -1969,7 +1987,9 @@ function consumptionSvg(series) {
     .map((date) => `<text class="chart-label" x="${xOf(date)}" y="${height - 8}" text-anchor="middle">${escapeHtml(shortDate(date))}</text>`)
     .join("");
 
-  const lines = series.parties.map((party) => {
+  // Leaders last, so their thicker lines sit on top (KTD6).
+  const drawOrder = [...series.parties.filter((party) => !party.leader), ...series.parties.filter((party) => party.leader)];
+  const lines = drawOrder.map((party) => {
     const points = [[xOfDay(start), yOf(0)]];
     let total = 0;
     party.steps.forEach((step) => {
@@ -1978,7 +1998,7 @@ function consumptionSvg(series) {
       points.push([xOf(step.date), yOf(total)]);
     });
     points.push([xOfDay(end), yOf(total)]);
-    return `<polyline class="chart-line" style="stroke: ${partyColor(party)}" points="${points.map((point) => point.join(",")).join(" ")}">` +
+    return `<polyline class="chart-line${party.leader ? " is-leader" : ""}" style="stroke: ${partyColor(party)}" points="${points.map((point) => point.join(",")).join(" ")}">` +
       `<title>${escapeHtml(party.name)}: ${oneDecimal(party.total)}</title></polyline>`;
   }).join("");
 

@@ -5016,6 +5016,114 @@ scenarios.push(
   }
 );
 
+/** Riley has left the roster: a crew ring-up of 3 oz rum (2 standard drinks) tonight keeps only the name. */
+function withRiley({ ids, seed, bottle }) {
+  seed.rnmb_ring_ups = [{
+    id: "c3000000-0000-4000-8000-000000000001", night_id: "c1000000-0000-4000-8000-000000000002", kind: "crew", tab_id: null,
+    person_id: null, person_name: "Riley", menu_item_id: null, menu_item_name: "Rum shot", price_cents: null,
+    rung_at: `${chartDay(0)}T21:00:00Z`, voided_at: null
+  }];
+  seed.rnmb_ring_up_lines = [{
+    id: "c4000000-0000-4000-8000-000000000001", ring_up_id: "c3000000-0000-4000-8000-000000000001", line_no: 1, bottle_id: bottle,
+    type_id: ids.rum, amount: 3, cost_cents: null, share_cents: null, buyer_id: null, buyer_name: null, abv_snapshot: 40
+  }];
+  return seed;
+}
+
+const rankingRows = (page) => page.evaluate(() => Array.from(document.querySelectorAll("#consumptionRanking .ranking-row")).map((row) => ({
+  place: row.querySelector(".ranking-place").textContent,
+  name: row.querySelector(".ranking-name").firstChild.textContent,
+  total: row.querySelector(".ranking-total").textContent,
+  leader: row.classList.contains("is-leader") && Boolean(row.querySelector(".ranking-leader")),
+  style: row.getAttribute("style")
+})));
+
+const chartLines = (page) => page.evaluate(() => Array.from(document.querySelectorAll("#consumptionChart svg polyline")).map((line) => ({
+  title: line.querySelector("title").textContent,
+  leader: line.classList.contains("is-leader"),
+  style: line.getAttribute("style")
+})));
+
+scenarios.push(
+  {
+    name: "Consumption chart: the ranked list puts the highest total first and marks the leader, whose line is drawn last; someone who left appears by name in the muted colour (6.9.16, 6.9.17, AE8)",
+    async run({ browser }) {
+      const stub = hostModeStub(withRiley(chartSeed()));
+      const session = await openPage(browser, { routes: stub.routes });
+      const { page } = session;
+      try {
+        await session.waitForToast("Connected to Supabase.");
+        const rows = await rankingRows(page);
+        assert.deepEqual(rows.map((row) => [row.place, row.name, row.total, row.leader]),
+          [["1", "Sam", "5.0", true], ["2", "Riley", "2.0", false], ["3", "Alex", "1.0", false]]);
+        assert.match(rows[1].style, /var\(--muted\)/, "a departed crew member's swatch is muted");
+        const lines = await chartLines(page);
+        assert.deepEqual(lines.map((line) => line.leader), [false, false, true], "only the leader's line is marked, and it is drawn last");
+        assert.equal(lines[lines.length - 1].title, "Sam: 5.0");
+        assert.match(lines.find((line) => line.title.startsWith("Riley")).style, /var\(--muted\)/);
+        assert.deepEqual(stub.unexpected, []);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Consumption chart: a tie for the highest total marks both as leaders and gives them the same place (AE5, 6.9.18)",
+    async run({ browser }) {
+      const { seed, alex, pour } = chartSeed();
+      // 6 oz more for Alex: 1 + 4 = 5 standard drinks, level with Sam.
+      seed.rnmb_pours.push(pour("c2000000-0000-4000-8000-000000000008", "c1000000-0000-4000-8000-000000000002", alex, 6));
+      const stub = hostModeStub(seed);
+      const session = await openPage(browser, { routes: stub.routes });
+      const { page } = session;
+      try {
+        await session.waitForToast("Connected to Supabase.");
+        const rows = await rankingRows(page);
+        assert.deepEqual(rows.map((row) => [row.place, row.name, row.leader]), [["1", "Alex", true], ["1", "Sam", true]]);
+        const lines = await chartLines(page);
+        assert.deepEqual(lines.map((line) => line.leader), [true, true]);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Consumption chart: at 1440 and 400 px wide every control has a size and stays inside the panel; the list sits beside the lines when wide and below them when narrow (6.9.22)",
+    async run({ browser }) {
+      for (const [width, layout] of [[1440, "beside"], [400, "below"]]) {
+        const stub = hostModeStub(withRiley(chartSeed()));
+        const session = await openPage(browser, { routes: stub.routes, viewport: { width, height: 900 } });
+        const { page } = session;
+        try {
+          await session.waitForToast("Connected to Supabase.");
+          const boxes = await page.evaluate(() => {
+            const rect = (element) => { const box = element.getBoundingClientRect(); return { x: box.x, y: box.y, right: box.right, bottom: box.bottom, width: box.width, height: box.height }; };
+            return {
+              panel: rect(document.querySelector(".consumption-panel")),
+              svg: rect(document.querySelector("#consumptionChart svg")),
+              ranking: rect(document.querySelector("#consumptionRanking")),
+              parts: [...document.querySelectorAll("#consumptionWindows button, #consumptionChart svg, #consumptionRanking .ranking-row")].map(rect)
+            };
+          });
+          boxes.parts.forEach((box, index) => {
+            assert.ok(box.width > 0 && box.height > 0, `${width}px: part ${index} has no size`);
+            assert.ok(box.x >= boxes.panel.x - 1 && box.right <= boxes.panel.right + 1, `${width}px: part ${index} spills out of the panel`);
+          });
+          if (layout === "beside") assert.ok(boxes.ranking.x >= boxes.svg.right - 1, `${width}px: the list should sit beside the lines`);
+          else assert.ok(boxes.ranking.y >= boxes.svg.bottom - 1, `${width}px: the list should sit below the lines`);
+          session.assertClean();
+        } finally {
+          await session.close();
+        }
+      }
+    }
+  }
+);
+
 module.exports = { scenarios, openPage, resourceStatusError, startLocalHostNightWithTab };
 
 if (require.main === module) {
