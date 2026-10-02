@@ -1364,15 +1364,17 @@ var RNMBDomain = (function () {
     var newestFirst = past.slice().sort(function (a, b) {
       return a.date < b.date ? 1 : a.date > b.date ? -1 : 0;
     });
+    var lastFive = newestFirst.slice(0, 5);
+    var oldestDate = function (nights) { return nights.length ? nights[nights.length - 1].date : today; };
     var start;
     if (windowId === "week") start = addDays(today, -6);
     else if (windowId === "days30") start = addDays(today, -29);
     else if (windowId === "year") start = today.slice(0, 4) + "-01-01";
-    else if (windowId === "all") start = newestFirst.length ? newestFirst[newestFirst.length - 1].date : today;
-    else if (windowId === "nights5") start = newestFirst.length ? newestFirst.slice(0, 5)[Math.min(5, newestFirst.length) - 1].date : today;
+    else if (windowId === "all") start = oldestDate(newestFirst);
+    else if (windowId === "nights5") start = oldestDate(lastFive);
     else throw new RangeError("Unknown chart window: " + windowId);
 
-    var nights = windowId === "nights5" ? newestFirst.slice(0, 5) : past.filter(function (night) { return night.date >= start; });
+    var nights = windowId === "nights5" ? lastFive : past.filter(function (night) { return night.date >= start; });
     nights.sort(function (a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : 0; });
     return { id: windowId, start: start, end: today, nights: nights };
   }
