@@ -83,6 +83,25 @@
           </div>
 
           <div class="dashboard-grid">
+            <!-- The consumption chart (6.9.12, KTD7): who has drunk the most over the chosen window. -->
+            <section class="panel consumption-panel" aria-labelledby="consumptionTitle">
+              <div class="panel-heading">
+                <div>
+                  <span class="eyebrow">Standard Drinks</span>
+                  <h3 id="consumptionTitle">The Race</h3>
+                </div>
+              </div>
+              <div id="consumptionWindows" class="window-buttons" role="group" aria-label="Chart window">
+                <button type="button" data-window="nights5" aria-pressed="false">Last 5 nights</button>
+                <button type="button" data-window="week" aria-pressed="true">One week</button>
+                <button type="button" data-window="days30" aria-pressed="false">Last 30 days</button>
+                <button type="button" data-window="year" aria-pressed="false">This year</button>
+                <button type="button" data-window="all" aria-pressed="false">All time</button>
+              </div>
+              <div class="consumption-body">
+                <div id="consumptionChart" class="consumption-chart"></div>
+              </div>
+            </section>
             <section class="panel wide">
               <div class="panel-heading">
                 <div>

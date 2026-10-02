@@ -135,6 +135,9 @@ let quotebook = quotebookStore.load();
 // or null. Only pickQuote() chooses it; render() paints it and never chooses, so
 // a save, a void or a 15-second poll cannot swap the quote someone is reading.
 let heldQuote = null;
+// The consumption chart's window (KTD5). It lives here, not in storage, so a
+// refresh keeps it and a reload starts again on One week (6.9.15, 6.9.21).
+let consumptionWindowId = "week";
 
 function draftId(drafts, key) {
   if (!drafts.has(key)) drafts.set(key, uid());
@@ -1873,9 +1876,114 @@ function renderOverview() {
   document.querySelector("#metricInventory").textContent = state.bottles.length;
   document.querySelector("#metricInventoryMeta").textContent = `${oneDecimal(totalRemainingStandardDrinks())} standard drinks remaining`;
   paintQuoteCard();
+  renderConsumptionChart();
   renderSpendBars();
   renderLowSupply();
   renderRecentNights();
+}
+
+// ---- Overview: the consumption chart (6.9.12 to 6.9.22, KTD4 to KTD7) ----
+
+const CONSUMPTION_LABELS = {
+  nights5: "Last 5 nights",
+  week: "One week",
+  days30: "Last 30 days",
+  year: "This year",
+  all: "All time"
+};
+
+// What an empty window says instead of drawing an empty frame (6.9.19).
+const CONSUMPTION_EMPTY = {
+  nights5: "No drinks logged in the last 5 nights.",
+  week: "No drinks logged in the last 7 days.",
+  days30: "No drinks logged in the last 30 days.",
+  year: "No drinks logged this year.",
+  all: "No drinks logged yet."
+};
+
+/** A YYYY-MM-DD date as a whole day count, so dates space out by the calendar. */
+function dayNumber(isoDate) {
+  const [year, month, day] = isoDate.split("-").map(Number);
+  return Date.UTC(year, month - 1, day) / 86400000;
+}
+
+/** "Sep 26" for an axis label; local noon, so no offset can move it to another day. */
+function shortDate(isoDate) {
+  return new Date(`${isoDate}T12:00:00`).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+/** A crew member's roster colour; someone who has left draws in the muted colour (KTD6). */
+function partyColor(party) {
+  const person = party.onRoster ? state.people.find((entry) => entry.id === party.personId) : null;
+  return person ? safeColor(person.color) : "var(--muted)";
+}
+
+/**
+ * The race: one step line per party who drank in the chosen window. The window
+ * never changes on its own, even when it is empty (6.9.20).
+ */
+function renderConsumptionChart() {
+  document.querySelectorAll("#consumptionWindows button[data-window]").forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.window === consumptionWindowId));
+  });
+  const target = document.querySelector("#consumptionChart");
+  const series = RNMBDomain.consumptionSeries(state, consumptionWindowId, today());
+  target.classList.toggle("empty-state", series.parties.length === 0);
+  if (!series.parties.length) {
+    target.textContent = CONSUMPTION_EMPTY[consumptionWindowId];
+    return;
+  }
+  target.innerHTML = consumptionSvg(series);
+}
+
+/*
+ * Hand-drawn SVG (KTD4): calendar dates across, standard drinks up (6.9.13).
+ * Each line starts at 0 on the window's first day, steps up on each night the
+ * party drank, and runs flat to today. Names reach the markup only escaped.
+ */
+function consumptionSvg(series) {
+  const width = 720;
+  const height = 280;
+  const left = 40;
+  const right = 16;
+  const top = 14;
+  const bottom = 30;
+  const round1 = (value) => Math.round(value * 10) / 10;
+  const end = dayNumber(series.window.end);
+  // A window that starts and ends on the same day still needs a width to draw across.
+  const start = Math.min(dayNumber(series.window.start), end - 1);
+  const xOfDay = (day) => round1(left + ((day - start) / (end - start)) * (width - left - right));
+  const xOf = (isoDate) => xOfDay(dayNumber(isoDate));
+  const maxY = Math.max(1, Math.ceil(series.parties[0].total));
+  const yOf = (value) => round1(top + (1 - value / maxY) * (height - top - bottom));
+
+  const grid = [0, maxY / 2, maxY].map((value) => `
+    <line class="chart-grid" x1="${left}" x2="${width - right}" y1="${yOf(value)}" y2="${yOf(value)}"></line>
+    <text class="chart-label" x="${left - 6}" y="${yOf(value) + 4}" text-anchor="end">${oneDecimal(value)}</text>`).join("");
+
+  // Label the nights that moved a line, thinned so that labels never overlap.
+  const dates = [...new Set(series.parties.flatMap((party) => party.steps.map((step) => step.date)))].sort();
+  const every = Math.ceil(dates.length / 6);
+  const labels = dates
+    .filter((_, index) => index % every === 0)
+    .map((date) => `<text class="chart-label" x="${xOf(date)}" y="${height - 8}" text-anchor="middle">${escapeHtml(shortDate(date))}</text>`)
+    .join("");
+
+  const lines = series.parties.map((party) => {
+    const points = [[xOfDay(start), yOf(0)]];
+    let total = 0;
+    party.steps.forEach((step) => {
+      points.push([xOf(step.date), yOf(total)]);
+      total = step.total;
+      points.push([xOf(step.date), yOf(total)]);
+    });
+    points.push([xOfDay(end), yOf(total)]);
+    return `<polyline class="chart-line" style="stroke: ${partyColor(party)}" points="${points.map((point) => point.join(",")).join(" ")}">` +
+      `<title>${escapeHtml(party.name)}: ${oneDecimal(party.total)}</title></polyline>`;
+  }).join("");
+
+  const label = escapeHtml(`Standard drinks per crew member, ${CONSUMPTION_LABELS[series.window.id]}`);
+  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${label}">${grid}${labels}${lines}</svg>`;
 }
 
 // KTD6: a quote starts at a size picked by its length, then steps down to the
@@ -4598,6 +4706,14 @@ document.querySelector("#quotebookClear").addEventListener("click", () => {
 
 // A tap (or Enter / Space: it is a real button, KTD8) shows another quote.
 document.querySelector("#quoteCard").addEventListener("click", pickQuote);
+
+// Choosing a window redraws the chart only; nothing is saved (KTD5).
+document.querySelector("#consumptionWindows").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-window]");
+  if (!button) return;
+  consumptionWindowId = button.dataset.window;
+  renderConsumptionChart();
+});
 
 // Rotating a phone changes the card's room; keep the same quote, re-fitted.
 let quoteResizeFrame = 0;

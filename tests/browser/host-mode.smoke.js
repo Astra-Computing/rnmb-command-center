@@ -4881,6 +4881,141 @@ scenarios.push(
   }
 );
 
+// ---------- consumption chart (crew consumption chart plan, U2 and U3) ----------------
+
+/** A YYYY-MM-DD local date `offset` days from today, as the page's own today() computes it. */
+function chartDay(offset = 0) {
+  const date = new Date();
+  date.setDate(date.getDate() + offset);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+/**
+ * hostModeSeed plus rum stock and recent nights. Rum is 40%, so 1.5 oz is one
+ * standard drink: Sam has 2 yesterday and 3 today (5), Alex 1 today.
+ */
+function chartSeed(extraPeople = []) {
+  const { ids, seed } = hostModeSeed();
+  const alex = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const bottle = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  seed.rnmb_people = [...seed.rnmb_people, { id: alex, name: "Alex", color: "#22c55e" }, ...extraPeople];
+  seed.rnmb_bottles = [{ id: bottle, type_id: ids.rum, nickname: "Rum", size_oz: 100, remaining_oz: 80, price: 30, buyer_id: ids.sam, purchase_date: "2026-09-01" }];
+  seed.rnmb_nights = [
+    ...seed.rnmb_nights,
+    { id: "c1000000-0000-4000-8000-000000000001", name: "Yesterday", date: chartDay(-1), kind: "crew", ended_at: null },
+    { id: "c1000000-0000-4000-8000-000000000002", name: "Tonight", date: chartDay(0), kind: "crew", ended_at: null }
+  ];
+  const pour = (id, night, person, ounces) => ({ id, night_id: night, person_id: person, bottle_id: bottle, ounces, abv_snapshot: 40, poured_at: `${chartDay(0)}T20:00:00Z` });
+  seed.rnmb_pours = [
+    pour("c2000000-0000-4000-8000-000000000001", "c1000000-0000-4000-8000-000000000001", ids.sam, 3),
+    pour("c2000000-0000-4000-8000-000000000002", "c1000000-0000-4000-8000-000000000002", ids.sam, 4.5),
+    pour("c2000000-0000-4000-8000-000000000003", "c1000000-0000-4000-8000-000000000002", alex, 1.5)
+  ];
+  return { ids, seed, alex, bottle, pour };
+}
+
+const chartState = (page) => page.evaluate(() => ({
+  pressed: Array.from(document.querySelectorAll("#consumptionWindows button[aria-pressed='true']")).map((button) => button.dataset.window),
+  titles: Array.from(document.querySelectorAll("#consumptionChart svg polyline title")).map((title) => title.textContent),
+  points: Array.from(document.querySelectorAll("#consumptionChart svg polyline")).map((line) => line.getAttribute("points")),
+  text: document.querySelector("#consumptionChart").textContent.trim(),
+  empty: document.querySelector("#consumptionChart").classList.contains("empty-state"),
+  svg: Boolean(document.querySelector("#consumptionChart svg"))
+}));
+
+scenarios.push(
+  {
+    name: "Consumption chart: opens on One week with one line per person who drank; a chosen window survives a refresh and a reload starts on One week (AE1, 6.9.12, 6.9.15, 6.9.21)",
+    async run({ browser }) {
+      const { seed, alex, pour } = chartSeed();
+      const stub = hostModeStub(seed);
+      const session = await openPage(browser, { routes: stub.routes });
+      const { page } = session;
+      try {
+        await session.waitForToast("Connected to Supabase.");
+        let chart = await chartState(page);
+        assert.deepEqual(chart.pressed, ["week"], "the chart opens on One week");
+        assert.deepEqual(chart.titles.sort(), ["Alex: 1.0", "Sam: 5.0"], "one line per person who drank, with their totals");
+
+        await page.click("#consumptionWindows button[data-window='days30']");
+        chart = await chartState(page);
+        assert.deepEqual(chart.pressed, ["days30"], "only the chosen window is pressed");
+
+        // Another phone logs a drink for Alex; the next refresh redraws without changing the window.
+        stub.store.rnmb_pours.push(pour("c2000000-0000-4000-8000-000000000004", "c1000000-0000-4000-8000-000000000002", alex, 1.5));
+        await actionForToast(session, () => page.evaluate(() => refreshFromServer()), "Updated from the shared dashboard.");
+        chart = await chartState(page);
+        assert.deepEqual(chart.pressed, ["days30"], "a refresh keeps the chosen window");
+        assert.ok(chart.titles.includes("Alex: 2.0"), `the refresh redrew the lines (got ${chart.titles})`);
+
+        await page.reload({ waitUntil: "domcontentloaded" });
+        await page.waitForFunction(() => window.__toasts && window.__toasts.includes("Connected to Supabase."), null, { timeout: 15000 });
+        chart = await chartState(page);
+        assert.deepEqual(chart.pressed, ["week"], "a reload starts again on One week");
+        assert.deepEqual(stub.unexpected, []);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Consumption chart: an empty window says so in words and keeps the chosen window (AE6, 6.9.19, 6.9.20)",
+    async run({ browser }) {
+      // hostModeSeed has two old nights and no pours, so every window is empty.
+      const { seed } = hostModeSeed();
+      const stub = hostModeStub(seed);
+      const session = await openPage(browser, { routes: stub.routes });
+      const { page } = session;
+      try {
+        await session.waitForToast("Connected to Supabase.");
+        let chart = await chartState(page);
+        assert.equal(chart.text, "No drinks logged in the last 7 days.");
+        assert.equal(chart.empty, true);
+        assert.equal(chart.svg, false, "no empty frame is drawn");
+        assert.deepEqual(chart.pressed, ["week"], "the window did not switch itself");
+
+        await page.click("#consumptionWindows button[data-window='all']");
+        chart = await chartState(page);
+        assert.equal(chart.text, "No drinks logged yet.");
+        assert.deepEqual(chart.pressed, ["all"]);
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  },
+
+  {
+    name: "Consumption chart: a name with markup stays text, and a window that starts and ends today still draws finite lines (KTD4)",
+    async run({ browser }) {
+      const ivy = { id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", name: "<i>Ivy</i>", color: "#c084fc" };
+      const { seed, pour } = chartSeed([ivy]);
+      // Only tonight's night: All time starts and ends today.
+      seed.rnmb_nights = seed.rnmb_nights.filter((night) => night.date === chartDay(0));
+      seed.rnmb_pours = [...seed.rnmb_pours.filter((row) => row.night_id === "c1000000-0000-4000-8000-000000000002"),
+        pour("c2000000-0000-4000-8000-000000000009", "c1000000-0000-4000-8000-000000000002", ivy.id, 1.5)];
+      const stub = hostModeStub(seed);
+      const session = await openPage(browser, { routes: stub.routes });
+      const { page } = session;
+      try {
+        await session.waitForToast("Connected to Supabase.");
+        await page.click("#consumptionWindows button[data-window='all']");
+        const chart = await chartState(page);
+        assert.ok(chart.titles.includes("<i>Ivy</i>: 1.0"), `the name is shown as text (got ${chart.titles})`);
+        assert.equal(await page.locator("#consumptionChart svg i").count(), 0, "no markup was injected");
+        assert.ok(chart.points.length > 0);
+        chart.points.forEach((points) => assert.ok(!/NaN|Infinity/.test(points), `finite coordinates (got ${points})`));
+        session.assertClean();
+      } finally {
+        await session.close();
+      }
+    }
+  }
+);
+
 module.exports = { scenarios, openPage, resourceStatusError, startLocalHostNightWithTab };
 
 if (require.main === module) {

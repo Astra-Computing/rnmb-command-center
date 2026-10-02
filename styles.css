@@ -332,6 +332,59 @@ small,
   grid-row: span 2;
 }
 
+/* The consumption chart (6.9.12, KTD7): full width, above the other Overview
+   panels. `.wide` would make it taller, not wider, and push the Contribution
+   Board into the narrow column. */
+.consumption-panel {
+  grid-column: 1 / -1;
+}
+
+.window-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.window-buttons button {
+  min-height: 40px;
+  padding: 8px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #11161b;
+  color: var(--text);
+  font-weight: 700;
+}
+
+.window-buttons button[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: rgba(249, 115, 22, 0.18);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.consumption-chart svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.consumption-chart .chart-grid {
+  stroke: var(--line);
+  stroke-width: 1;
+}
+
+.consumption-chart .chart-label {
+  fill: var(--muted);
+  font-size: 13px;
+}
+
+.consumption-chart .chart-line {
+  fill: none;
+  stroke-width: 3;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
 .panel {
   padding: 18px;
 }
